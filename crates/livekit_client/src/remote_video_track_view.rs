@@ -22,7 +22,7 @@ pub enum RemoteVideoTrackViewEvent {
 impl RemoteVideoTrackView {
     pub fn new(track: RemoteVideoTrack, window: &mut Window, cx: &mut Context<Self>) -> Self {
         cx.focus_handle();
-        let frames = crate::play_remote_video_track(&track);
+        let frames = crate::play_remote_video_track(&track, cx.background_executor());
 
         #[cfg(not(target_os = "macos"))]
         {
@@ -97,8 +97,10 @@ impl Render for RemoteVideoTrackView {
                 self.previous_rendered_frame = Some(current_rendered_frame)
             }
             self.current_rendered_frame = Some(latest_frame.clone());
-            return gpui::img(latest_frame.clone())
+            use gpui::ParentElement;
+            return ui::h_flex()
                 .size_full()
+                .child(gpui::img(latest_frame.clone()).size_full())
                 .into_any_element();
         }
 

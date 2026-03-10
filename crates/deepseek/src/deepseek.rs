@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::convert::TryFrom;
 
-pub const DEEPSEEK_API_URL: &str = "https://api.deepseek.com";
+pub const DEEPSEEK_API_URL: &str = "https://api.deepseek.com/v1";
 
 #[derive(Clone, Copy, Serialize, Deserialize, Debug, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -96,15 +96,16 @@ impl Model {
 
     pub fn max_token_count(&self) -> u64 {
         match self {
-            Self::Chat | Self::Reasoner => 64_000,
+            Self::Chat | Self::Reasoner => 128_000,
             Self::Custom { max_tokens, .. } => *max_tokens,
         }
     }
 
     pub fn max_output_tokens(&self) -> Option<u64> {
         match self {
-            Self::Chat => Some(8_192),
-            Self::Reasoner => Some(8_192),
+            // Their API treats this max against the context window, which means we hit the limit a lot
+            // Using the default value of None in the API instead
+            Self::Chat | Self::Reasoner => None,
             Self::Custom {
                 max_output_tokens, ..
             } => *max_output_tokens,
@@ -155,6 +156,8 @@ pub enum RequestMessage {
         content: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ToolCall>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<String>,
     },
     User {
         content: String,
@@ -263,12 +266,12 @@ pub async fn stream_completion(
     api_key: &str,
     request: Request,
 ) -> Result<BoxStream<'static, Result<StreamResponse>>> {
-    let uri = format!("{api_url}/v1/chat/completions");
+    let uri = format!("{api_url}/chat/completions");
     let request_builder = HttpRequest::builder()
         .method(Method::POST)
         .uri(uri)
         .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {}", api_key));
+        .header("Authorization", format!("Bearer {}", api_key.trim()));
 
     let request = request_builder.body(AsyncBody::from(serde_json::to_string(&request)?))?;
     let mut response = client.send(request).await?;

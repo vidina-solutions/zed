@@ -6,7 +6,6 @@ use gpui::{
 use project::ProjectItem as _;
 use ui::{ButtonLike, ElevationIndex, KeyBinding, prelude::*};
 use util::ResultExt as _;
-use workspace::WorkspaceId;
 use workspace::item::ItemEvent;
 use workspace::{Workspace, item::Item};
 
@@ -22,6 +21,8 @@ actions!(
         RunInPlace,
         /// Clears all outputs in the REPL.
         ClearOutputs,
+        /// Clears the output of the cell at the current cursor position.
+        ClearCurrentOutput,
         /// Opens the REPL sessions panel.
         Sessions,
         /// Interrupts the currently running kernel.
@@ -79,16 +80,18 @@ pub fn init(cx: &mut App) {
                 return;
             }
 
-            cx.defer_in(window, |editor, window, cx| {
-                let workspace = Workspace::for_window(window, cx);
-                let project = workspace.map(|workspace| workspace.read(cx).project().clone());
+            cx.defer_in(window, |editor, _window, cx| {
+                let project = editor.project().cloned();
 
-                let is_local_project = project
+                let is_valid_project = project
                     .as_ref()
-                    .map(|project| project.read(cx).is_local())
+                    .map(|project| {
+                        let p = project.read(cx);
+                        !p.is_via_collab()
+                    })
                     .unwrap_or(false);
 
-                if !is_local_project {
+                if !is_valid_project {
                     return;
                 }
 
@@ -102,21 +105,16 @@ pub fn init(cx: &mut App) {
 
                 let editor_handle = cx.entity().downgrade();
 
-                if let Some(language) = language {
-                    if language.name() == "Python".into() {
-                        if let (Some(project_path), Some(project)) = (project_path, project) {
-                            let store = ReplStore::global(cx);
-                            store.update(cx, |store, cx| {
-                                store
-                                    .refresh_python_kernelspecs(
-                                        project_path.worktree_id,
-                                        &project,
-                                        cx,
-                                    )
-                                    .detach_and_log_err(cx);
-                            });
-                        }
-                    }
+                if let Some(language) = language
+                    && language.name() == "Python"
+                    && let (Some(project_path), Some(project)) = (project_path, project)
+                {
+                    let store = ReplStore::global(cx);
+                    store.update(cx, |store, cx| {
+                        store
+                            .refresh_python_kernelspecs(project_path.worktree_id, &project, cx)
+                            .detach_and_log_err(cx);
+                    });
                 }
 
                 editor
@@ -134,7 +132,6 @@ pub fn init(cx: &mut App) {
 
                 editor
                     .register_action({
-                        let editor_handle = editor_handle.clone();
                         move |_: &RunInPlace, window, cx| {
                             if !JupyterSettings::enabled(cx) {
                                 return;
@@ -198,25 +195,17 @@ impl Item for ReplSessionsPage {
         false
     }
 
-    fn clone_on_split(
-        &self,
-        _workspace_id: Option<WorkspaceId>,
-        _window: &mut Window,
-        _: &mut Context<Self>,
-    ) -> Option<Entity<Self>> {
-        None
-    }
-
-    fn to_item_events(event: &Self::Event, mut f: impl FnMut(workspace::item::ItemEvent)) {
+    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(workspace::item::ItemEvent)) {
         f(*event)
     }
 }
 
 impl Render for ReplSessionsPage {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let store = ReplStore::global(cx);
 
-        let (kernel_specifications, sessions) = store.update(cx, |store, _cx| {
+        let (kernel_specifications, sessions) = store.update(cx, |store, cx| {
+            store.ensure_kernelspecs(cx);
             (
                 store
                     .pure_jupyter_kernel_specifications()
@@ -257,7 +246,7 @@ impl Render for ReplSessionsPage {
             return ReplSessionsContainer::new("No Jupyter Kernel Sessions").child(
                 v_flex()
                     .child(Label::new(instructions))
-                    .children(KeyBinding::for_action(&Run, window, cx)),
+                    .child(KeyBinding::for_action(&Run, cx)),
             );
         }
 

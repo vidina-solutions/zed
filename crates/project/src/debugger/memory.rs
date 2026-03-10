@@ -3,6 +3,7 @@
 //! Each byte in memory can either be mapped or unmapped. We try to mimic that twofold:
 //! - We assume that the memory is divided into pages of a fixed size.
 //! - We assume that each page can be either mapped or unmapped.
+//!
 //! These two assumptions drive the shape of the memory representation.
 //! In particular, we want the unmapped pages to be represented without allocating any memory, as *most*
 //! of the memory in a program space is usually unmapped.
@@ -22,15 +23,15 @@ const PAGE_SIZE: u64 = 4096;
 /// Represents the contents of a single page. We special-case unmapped pages to be allocation-free,
 /// since they're going to make up the majority of the memory in a program space (even though the user might not even get to see them - ever).
 #[derive(Clone, Debug)]
-pub(super) enum PageContents {
+pub enum PageContents {
     /// Whole page is unreadable.
     Unmapped,
     Mapped(Arc<MappedPageContents>),
 }
 
 impl PageContents {
-    #[cfg(test)]
-    fn mapped(contents: Vec<u8>) -> Self {
+    #[cfg(feature = "test-support")]
+    pub fn mapped(contents: Vec<u8>) -> Self {
         PageContents::Mapped(Arc::new(MappedPageContents(
             vec![PageChunk::Mapped(contents.into())].into(),
         )))
@@ -67,7 +68,7 @@ impl MappedPageContents {
 /// of the memory of a debuggee.
 
 #[derive(Default, Debug)]
-pub(super) struct MappedPageContents(
+pub struct MappedPageContents(
     /// Most of the time there should be only one chunk (either mapped or unmapped),
     /// but we do leave the possibility open of having multiple regions of memory in a single page.
     SmallVec<[PageChunk; 1]>,
@@ -76,7 +77,7 @@ pub(super) struct MappedPageContents(
 type MemoryAddress = u64;
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Ord, Eq)]
 #[repr(transparent)]
-pub(super) struct PageAddress(u64);
+pub struct PageAddress(pub u64);
 
 impl PageAddress {
     pub(super) fn iter_range(
@@ -165,8 +166,8 @@ impl Memory {
 /// - If it succeeds/fails wholesale, cool; we have no unknown memory regions in this page.
 /// - If it succeeds partially, we know # of mapped bytes.
 ///   We might also know the # of unmapped bytes.
-/// However, we're still unsure about what's *after* the unreadable region.
 ///
+/// However, we're still unsure about what's *after* the unreadable region.
 /// This is where this builder comes in. It lets us track the state of figuring out contents of a single page.
 pub(super) struct MemoryPageBuilder {
     chunks: MappedPageContents,
@@ -272,7 +273,7 @@ pub struct MemoryIterator {
 }
 
 impl MemoryIterator {
-    fn new(
+    pub fn new(
         range: RangeInclusive<MemoryAddress>,
         pages: std::vec::IntoIter<(PageAddress, PageContents)>,
     ) -> Self {
@@ -318,67 +319,20 @@ impl Iterator for MemoryIterator {
             return None;
         }
         if let Some((current_page_address, current_memory_chunk)) = self.current_known_page.as_mut()
+            && current_page_address.0 <= self.start
         {
-            if current_page_address.0 <= self.start {
-                if let Some(next_cell) = current_memory_chunk.next() {
-                    self.start += 1;
-                    return Some(next_cell);
-                } else {
-                    self.current_known_page.take();
-                }
+            if let Some(next_cell) = current_memory_chunk.next() {
+                self.start += 1;
+                return Some(next_cell);
+            } else {
+                self.current_known_page.take();
             }
         }
         if !self.fetch_next_page() {
             self.start += 1;
-            return Some(MemoryCell(None));
+            Some(MemoryCell(None))
         } else {
             self.next()
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::debugger::{
-        MemoryCell,
-        memory::{MemoryIterator, PageAddress, PageContents},
-    };
-
-    #[test]
-    fn iterate_over_unmapped_memory() {
-        let empty_iterator = MemoryIterator::new(0..=127, Default::default());
-        let actual = empty_iterator.collect::<Vec<_>>();
-        let expected = vec![MemoryCell(None); 128];
-        assert_eq!(actual.len(), expected.len());
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn iterate_over_partially_mapped_memory() {
-        let it = MemoryIterator::new(
-            0..=127,
-            vec![(PageAddress(5), PageContents::mapped(vec![1]))].into_iter(),
-        );
-        let actual = it.collect::<Vec<_>>();
-        let expected = std::iter::repeat_n(MemoryCell(None), 5)
-            .chain(std::iter::once(MemoryCell(Some(1))))
-            .chain(std::iter::repeat_n(MemoryCell(None), 122))
-            .collect::<Vec<_>>();
-        assert_eq!(actual.len(), expected.len());
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn reads_from_the_middle_of_a_page() {
-        let partial_iter = MemoryIterator::new(
-            20..=30,
-            vec![(PageAddress(0), PageContents::mapped((0..255).collect()))].into_iter(),
-        );
-        let actual = partial_iter.collect::<Vec<_>>();
-        let expected = (20..=30)
-            .map(|val| MemoryCell(Some(val)))
-            .collect::<Vec<_>>();
-        assert_eq!(actual.len(), expected.len());
-        assert_eq!(actual, expected);
     }
 }

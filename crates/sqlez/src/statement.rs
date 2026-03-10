@@ -44,41 +44,41 @@ impl<'a> Statement<'a> {
             connection,
             phantom: PhantomData,
         };
-        unsafe {
-            let sql = CString::new(query.as_ref()).context("Error creating cstr")?;
-            let mut remaining_sql = sql.as_c_str();
-            while {
-                let remaining_sql_str = remaining_sql
-                    .to_str()
-                    .context("Parsing remaining sql")?
-                    .trim();
-                remaining_sql_str != ";" && !remaining_sql_str.is_empty()
-            } {
-                let mut raw_statement = ptr::null_mut::<sqlite3_stmt>();
-                let mut remaining_sql_ptr = ptr::null();
+        let sql = CString::new(query.as_ref()).context("Error creating cstr")?;
+        let mut remaining_sql = sql.as_c_str();
+        while {
+            let remaining_sql_str = remaining_sql
+                .to_str()
+                .context("Parsing remaining sql")?
+                .trim();
+            remaining_sql_str != ";" && !remaining_sql_str.is_empty()
+        } {
+            let mut raw_statement = ptr::null_mut::<sqlite3_stmt>();
+            let mut remaining_sql_ptr = ptr::null();
+            unsafe {
                 sqlite3_prepare_v2(
                     connection.sqlite3,
                     remaining_sql.as_ptr(),
                     -1,
                     &mut raw_statement,
                     &mut remaining_sql_ptr,
-                );
+                )
+            };
 
-                connection.last_error().with_context(|| {
-                    format!("Prepare call failed for query:\n{}", query.as_ref())
-                })?;
+            connection
+                .last_error()
+                .with_context(|| format!("Prepare call failed for query:\n{}", query.as_ref()))?;
 
-                remaining_sql = CStr::from_ptr(remaining_sql_ptr);
-                statement.raw_statements.push(raw_statement);
+            remaining_sql = unsafe { CStr::from_ptr(remaining_sql_ptr) };
+            statement.raw_statements.push(raw_statement);
 
-                if !connection.can_write() && sqlite3_stmt_readonly(raw_statement) == 0 {
-                    let sql = CStr::from_ptr(sqlite3_sql(raw_statement));
+            if !connection.can_write() && unsafe { sqlite3_stmt_readonly(raw_statement) == 0 } {
+                let sql = unsafe { CStr::from_ptr(sqlite3_sql(raw_statement)) };
 
-                    bail!(
-                        "Write statement prepared with connection that is not write capable. SQL:\n{} ",
-                        sql.to_str()?
-                    )
-                }
+                bail!(
+                    "Write statement prepared with connection that is not write capable. SQL:\n{} ",
+                    sql.to_str()?
+                )
             }
         }
 
@@ -108,7 +108,7 @@ impl<'a> Statement<'a> {
         }
     }
 
-    fn bind_index_with(&self, index: i32, bind: impl Fn(&*mut sqlite3_stmt)) -> Result<()> {
+    fn bind_index_with(&self, index: i32, bind: &dyn Fn(&*mut sqlite3_stmt)) -> Result<()> {
         let mut any_succeed = false;
         unsafe {
             for raw_statement in self.raw_statements.iter() {
@@ -135,7 +135,7 @@ impl<'a> Statement<'a> {
         let blob_pointer = blob.as_ptr() as *const _;
         let len = blob.len() as c_int;
 
-        self.bind_index_with(index, |raw_statement| unsafe {
+        self.bind_index_with(index, &|raw_statement| unsafe {
             sqlite3_bind_blob(*raw_statement, index, blob_pointer, len, SQLITE_TRANSIENT());
         })
     }
@@ -161,7 +161,7 @@ impl<'a> Statement<'a> {
     pub fn bind_double(&self, index: i32, double: f64) -> Result<()> {
         let index = index as c_int;
 
-        self.bind_index_with(index, |raw_statement| unsafe {
+        self.bind_index_with(index, &|raw_statement| unsafe {
             sqlite3_bind_double(*raw_statement, index, double);
         })
     }
@@ -177,7 +177,7 @@ impl<'a> Statement<'a> {
 
     pub fn bind_int(&self, index: i32, int: i32) -> Result<()> {
         let index = index as c_int;
-        self.bind_index_with(index, |raw_statement| unsafe {
+        self.bind_index_with(index, &|raw_statement| unsafe {
             sqlite3_bind_int(*raw_statement, index, int);
         })
     }
@@ -193,7 +193,7 @@ impl<'a> Statement<'a> {
 
     pub fn bind_int64(&self, index: i32, int: i64) -> Result<()> {
         let index = index as c_int;
-        self.bind_index_with(index, |raw_statement| unsafe {
+        self.bind_index_with(index, &|raw_statement| unsafe {
             sqlite3_bind_int64(*raw_statement, index, int);
         })
     }
@@ -209,7 +209,7 @@ impl<'a> Statement<'a> {
 
     pub fn bind_null(&self, index: i32) -> Result<()> {
         let index = index as c_int;
-        self.bind_index_with(index, |raw_statement| unsafe {
+        self.bind_index_with(index, &|raw_statement| unsafe {
             sqlite3_bind_null(*raw_statement, index);
         })
     }
@@ -219,7 +219,7 @@ impl<'a> Statement<'a> {
         let text_pointer = text.as_ptr() as *const _;
         let len = text.len() as c_int;
 
-        self.bind_index_with(index, |raw_statement| unsafe {
+        self.bind_index_with(index, &|raw_statement| unsafe {
             sqlite3_bind_text(*raw_statement, index, text_pointer, len, SQLITE_TRANSIENT());
         })
     }
@@ -271,22 +271,20 @@ impl<'a> Statement<'a> {
     }
 
     fn step(&mut self) -> Result<StepResult> {
-        unsafe {
-            match sqlite3_step(self.current_statement()) {
-                SQLITE_ROW => Ok(StepResult::Row),
-                SQLITE_DONE => {
-                    if self.current_statement >= self.raw_statements.len() - 1 {
-                        Ok(StepResult::Done)
-                    } else {
-                        self.current_statement += 1;
-                        self.step()
-                    }
+        match unsafe { sqlite3_step(self.current_statement()) } {
+            SQLITE_ROW => Ok(StepResult::Row),
+            SQLITE_DONE => {
+                if self.current_statement >= self.raw_statements.len() - 1 {
+                    Ok(StepResult::Done)
+                } else {
+                    self.current_statement += 1;
+                    self.step()
                 }
-                SQLITE_MISUSE => anyhow::bail!("Statement step returned SQLITE_MISUSE"),
-                _other_error => {
-                    self.connection.last_error()?;
-                    unreachable!("Step returned error code and last error failed to catch it");
-                }
+            }
+            SQLITE_MISUSE => anyhow::bail!("Statement step returned SQLITE_MISUSE"),
+            _other_error => {
+                self.connection.last_error()?;
+                unreachable!("Step returned error code and last error failed to catch it");
             }
         }
     }

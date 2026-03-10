@@ -1,12 +1,16 @@
 use anyhow::Result;
 use db::{
-    define_connection, query,
-    sqlez::{bindable::Column, statement::Statement},
+    query,
+    sqlez::{
+        bindable::Column, domain::Domain, statement::Statement,
+        thread_safe_connection::ThreadSafeConnection,
+    },
     sqlez_macros::sql,
 };
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+#[cfg(test)]
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub(crate) struct SerializedCommandInvocation {
     pub(crate) command_name: String,
@@ -36,6 +40,7 @@ impl Column for SerializedCommandUsage {
     }
 }
 
+#[cfg(test)]
 impl Column for SerializedCommandInvocation {
     fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
         let (command_name, next_index): (String, i32) = Column::column(statement, start_index)?;
@@ -50,8 +55,11 @@ impl Column for SerializedCommandInvocation {
     }
 }
 
-define_connection!(pub static ref COMMAND_PALETTE_HISTORY: CommandPaletteDB<()> =
-    &[sql!(
+pub struct CommandPaletteDB(ThreadSafeConnection);
+
+impl Domain for CommandPaletteDB {
+    const NAME: &str = stringify!(CommandPaletteDB);
+    const MIGRATIONS: &[&str] = &[sql!(
         CREATE TABLE IF NOT EXISTS command_invocations(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             command_name TEXT NOT NULL,
@@ -59,7 +67,9 @@ define_connection!(pub static ref COMMAND_PALETTE_HISTORY: CommandPaletteDB<()> 
             last_invoked INTEGER DEFAULT (unixepoch())  NOT NULL
         ) STRICT;
     )];
-);
+}
+
+db::static_connection!(COMMAND_PALETTE_HISTORY, CommandPaletteDB, []);
 
 impl CommandPaletteDB {
     pub async fn write_command_invocation(
@@ -76,8 +86,9 @@ impl CommandPaletteDB {
             .await
     }
 
+    #[cfg(test)]
     query! {
-        pub fn get_last_invoked(command: &str) -> Result<Option<SerializedCommandInvocation>> {
+        pub(crate) fn get_last_invoked(command: &str) -> Result<Option<SerializedCommandInvocation>> {
             SELECT
             command_name,
             user_query,
@@ -85,6 +96,13 @@ impl CommandPaletteDB {
             WHERE command_name=(?)
             ORDER BY last_invoked DESC
             LIMIT 1
+        }
+    }
+
+    #[cfg(test)]
+    query! {
+        pub(crate) async fn clear_all() -> Result<()> {
+            DELETE FROM command_invocations
         }
     }
 
@@ -110,6 +128,16 @@ impl CommandPaletteDB {
             FROM command_invocations
             GROUP BY command_name
             ORDER BY COUNT(1) DESC
+        }
+    }
+
+    query! {
+        pub fn list_recent_queries() -> Result<Vec<String>> {
+            SELECT user_query
+            FROM command_invocations
+            WHERE user_query != ""
+            GROUP BY user_query
+            ORDER BY MAX(last_invoked) ASC
         }
     }
 }

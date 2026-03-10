@@ -3,9 +3,9 @@ use std::sync::Arc;
 use gpui::{FontStyle, FontWeight, HighlightStyle, Hsla, WindowBackgroundAppearance, hsla};
 
 use crate::{
-    AccentColors, Appearance, PlayerColors, StatusColors, StatusColorsRefinement, SyntaxTheme,
-    SystemColors, Theme, ThemeColors, ThemeColorsRefinement, ThemeFamily, ThemeStyles,
-    default_color_scales,
+    AccentColors, Appearance, DEFAULT_DARK_THEME, PlayerColors, StatusColors,
+    StatusColorsRefinement, SyntaxTheme, SystemColors, Theme, ThemeColors, ThemeColorsRefinement,
+    ThemeFamily, ThemeStyles, default_color_scales,
 };
 
 /// The default theme family for Zed.
@@ -34,10 +34,10 @@ pub(crate) fn apply_status_color_defaults(status: &mut StatusColorsRefinement) {
         (&status.error, &mut status.error_background),
         (&status.hidden, &mut status.hidden_background),
     ] {
-        if bg_color.is_none() {
-            if let Some(fg_color) = fg_color {
-                *bg_color = Some(fg_color.opacity(0.25));
-            }
+        if bg_color.is_none()
+            && let Some(fg_color) = fg_color
+        {
+            *bg_color = Some(fg_color.opacity(0.25));
         }
     }
 }
@@ -59,6 +59,7 @@ pub(crate) fn zed_default_dark() -> Theme {
     let bg = hsla(215. / 360., 12. / 100., 15. / 100., 1.);
     let editor = hsla(220. / 360., 12. / 100., 18. / 100., 1.);
     let elevated_surface = hsla(225. / 360., 12. / 100., 17. / 100., 1.);
+    let hover = hsla(225.0 / 360., 11.8 / 100., 26.7 / 100., 1.0);
 
     let blue = hsla(207.8 / 360., 81. / 100., 66. / 100., 1.0);
     let gray = hsla(218.8 / 360., 10. / 100., 40. / 100., 1.0);
@@ -70,10 +71,16 @@ pub(crate) fn zed_default_dark() -> Theme {
     let yellow = hsla(39. / 360., 67. / 100., 69. / 100., 1.0);
 
     const ADDED_COLOR: Hsla = Hsla {
-        h: 142. / 360.,
-        s: 0.68,
-        l: 0.45,
+        h: 134. / 360.,
+        s: 0.55,
+        l: 0.40,
         a: 1.0,
+    };
+    const WORD_ADDED_COLOR: Hsla = Hsla {
+        h: 134. / 360.,
+        s: 0.55,
+        l: 0.40,
+        a: 0.35,
     };
     const MODIFIED_COLOR: Hsla = Hsla {
         h: 48. / 360.,
@@ -82,21 +89,29 @@ pub(crate) fn zed_default_dark() -> Theme {
         a: 1.0,
     };
     const REMOVED_COLOR: Hsla = Hsla {
-        h: 355. / 360.,
-        s: 0.65,
-        l: 0.65,
+        h: 350. / 360.,
+        s: 0.88,
+        l: 0.25,
         a: 1.0,
+    };
+    const WORD_DELETED_COLOR: Hsla = Hsla {
+        h: 350. / 360.,
+        s: 0.88,
+        l: 0.25,
+        a: 0.80,
     };
 
     let player = PlayerColors::dark();
     Theme {
         id: "one_dark".to_string(),
-        name: "One Dark".into(),
+        name: DEFAULT_DARK_THEME.into(),
         appearance: Appearance::Dark,
         styles: ThemeStyles {
             window_background_appearance: WindowBackgroundAppearance::Opaque,
             system: SystemColors::default(),
-            accents: AccentColors(vec![blue, orange, purple, teal, red, green, yellow]),
+            accents: AccentColors(Arc::from(vec![
+                blue, orange, purple, teal, red, green, yellow,
+            ])),
             colors: ThemeColors {
                 border: hsla(225. / 360., 13. / 100., 12. / 100., 1.),
                 border_variant: hsla(228. / 360., 8. / 100., 25. / 100., 1.),
@@ -108,14 +123,15 @@ pub(crate) fn zed_default_dark() -> Theme {
                 surface_background: bg,
                 background: bg,
                 element_background: hsla(223.0 / 360., 13. / 100., 21. / 100., 1.0),
-                element_hover: hsla(225.0 / 360., 11.8 / 100., 26.7 / 100., 1.0),
+                element_hover: hover,
                 element_active: hsla(220.0 / 360., 11.8 / 100., 20.0 / 100., 1.0),
                 element_selected: hsla(224.0 / 360., 11.3 / 100., 26.1 / 100., 1.0),
                 element_disabled: SystemColors::default().transparent,
                 element_selection_background: player.local().selection.alpha(0.25),
                 drop_target_background: hsla(220.0 / 360., 8.3 / 100., 21.4 / 100., 1.0),
+                drop_target_border: hsla(221. / 360., 11. / 100., 86. / 100., 1.0),
                 ghost_element_background: SystemColors::default().transparent,
-                ghost_element_hover: hsla(225.0 / 360., 11.8 / 100., 26.7 / 100., 1.0),
+                ghost_element_hover: hover,
                 ghost_element_active: hsla(220.0 / 360., 11.8 / 100., 20.0 / 100., 1.0),
                 ghost_element_selected: hsla(224.0 / 360., 11.3 / 100., 26.1 / 100., 1.0),
                 ghost_element_disabled: SystemColors::default().transparent,
@@ -138,6 +154,7 @@ pub(crate) fn zed_default_dark() -> Theme {
                 tab_inactive_background: bg,
                 tab_active_background: editor,
                 search_match_background: bg,
+                search_active_match_background: bg,
 
                 editor_background: editor,
                 editor_gutter_background: editor,
@@ -202,10 +219,12 @@ pub(crate) fn zed_default_dark() -> Theme {
                 panel_indent_guide: hsla(228. / 360., 8. / 100., 25. / 100., 1.),
                 panel_indent_guide_hover: hsla(225. / 360., 13. / 100., 12. / 100., 1.),
                 panel_indent_guide_active: hsla(225. / 360., 13. / 100., 12. / 100., 1.),
+                panel_overlay_background: bg,
+                panel_overlay_hover: hover,
                 pane_focused_border: blue,
                 pane_group_border: hsla(225. / 360., 13. / 100., 12. / 100., 1.),
                 scrollbar_thumb_background: gpui::transparent_black(),
-                scrollbar_thumb_hover_background: hsla(225.0 / 360., 11.8 / 100., 26.7 / 100., 1.0),
+                scrollbar_thumb_hover_background: hover,
                 scrollbar_thumb_active_background: hsla(
                     225.0 / 360.,
                     11.8 / 100.,
@@ -227,8 +246,28 @@ pub(crate) fn zed_default_dark() -> Theme {
                 version_control_renamed: MODIFIED_COLOR,
                 version_control_conflict: crate::orange().light().step_12(),
                 version_control_ignored: crate::gray().light().step_12(),
+                version_control_word_added: WORD_ADDED_COLOR,
+                version_control_word_deleted: WORD_DELETED_COLOR,
                 version_control_conflict_marker_ours: crate::green().light().step_12().alpha(0.5),
                 version_control_conflict_marker_theirs: crate::blue().light().step_12().alpha(0.5),
+
+                vim_normal_background: SystemColors::default().transparent,
+                vim_insert_background: SystemColors::default().transparent,
+                vim_replace_background: SystemColors::default().transparent,
+                vim_visual_background: SystemColors::default().transparent,
+                vim_visual_line_background: SystemColors::default().transparent,
+                vim_visual_block_background: SystemColors::default().transparent,
+                vim_yank_background: hsla(207.8 / 360., 81. / 100., 66. / 100., 0.2),
+                vim_helix_normal_background: SystemColors::default().transparent,
+                vim_helix_select_background: SystemColors::default().transparent,
+                vim_normal_foreground: SystemColors::default().transparent,
+                vim_insert_foreground: SystemColors::default().transparent,
+                vim_replace_foreground: SystemColors::default().transparent,
+                vim_visual_foreground: SystemColors::default().transparent,
+                vim_visual_line_foreground: SystemColors::default().transparent,
+                vim_visual_block_foreground: SystemColors::default().transparent,
+                vim_helix_normal_foreground: SystemColors::default().transparent,
+                vim_helix_select_foreground: SystemColors::default().transparent,
             },
             status: StatusColors {
                 conflict: yellow,
@@ -298,7 +337,7 @@ pub(crate) fn zed_default_dark() -> Theme {
                             ..HighlightStyle::default()
                         },
                     ),
-                    ("enum".into(), HighlightStyle::default()),
+                    ("enum".into(), teal.into()),
                     ("function".into(), blue.into()),
                     ("function.method".into(), blue.into()),
                     ("function.definition".into(), blue.into()),

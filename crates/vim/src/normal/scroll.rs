@@ -1,7 +1,6 @@
-use crate::Vim;
+use crate::{Vim, state::Mode};
 use editor::{
-    DisplayPoint, Editor, EditorSettings, SelectionEffects,
-    display_map::{DisplayRow, ToDisplayPoint},
+    DisplayPoint, Editor, EditorSettings, SelectionEffects, display_map::DisplayRow,
     scroll::ScrollAmount,
 };
 use gpui::{Context, Window, actions};
@@ -95,23 +94,28 @@ impl Vim {
         by: fn(c: Option<f32>) -> ScrollAmount,
     ) {
         let amount = by(Vim::take_count(cx).map(|c| c as f32));
+        let mode = self.mode;
         Vim::take_forced_motion(cx);
         self.exit_temporary_normal(window, cx);
-        self.update_editor(window, cx, |_, editor, window, cx| {
-            scroll_editor(editor, move_cursor, &amount, window, cx)
+        self.update_editor(cx, |_, editor, cx| {
+            scroll_editor(editor, mode, move_cursor, amount, window, cx)
         });
     }
 }
 
 fn scroll_editor(
     editor: &mut Editor,
+    mode: Mode,
     preserve_cursor_position: bool,
-    amount: &ScrollAmount,
+    amount: ScrollAmount,
     window: &mut Window,
     cx: &mut Context<Editor>,
 ) {
     let should_move_cursor = editor.newest_selection_on_screen(cx).is_eq();
-    let old_top_anchor = editor.scroll_manager.anchor().anchor;
+    let display_snapshot = editor.display_map.update(cx, |map, cx| map.snapshot(cx));
+    let old_top = editor
+        .scroll_manager
+        .scroll_top_display_point(&display_snapshot, cx);
 
     if editor.scroll_hover(amount, window, cx) {
         return;
@@ -121,12 +125,12 @@ fn scroll_editor(
     let amount = match (amount.is_full_page(), editor.visible_line_count()) {
         (true, Some(visible_line_count)) => {
             if amount.direction().is_upwards() {
-                ScrollAmount::Line(amount.lines(visible_line_count) + 1.0)
+                ScrollAmount::Line((amount.lines(visible_line_count) + 1.0) as f32)
             } else {
-                ScrollAmount::Line(amount.lines(visible_line_count) - 1.0)
+                ScrollAmount::Line((amount.lines(visible_line_count) - 1.0) as f32)
             }
         }
-        _ => amount.clone(),
+        _ => amount,
     };
 
     editor.scroll_screen(&amount, window, cx);
@@ -142,7 +146,10 @@ fn scroll_editor(
         return;
     };
 
-    let top_anchor = editor.scroll_manager.anchor().anchor;
+    let display_snapshot = editor.display_map.update(cx, |map, cx| map.snapshot(cx));
+    let top = editor
+        .scroll_manager
+        .scroll_top_display_point(&display_snapshot, cx);
     let vertical_scroll_margin = EditorSettings::get_global(cx).vertical_scroll_margin;
 
     editor.change_selections(
@@ -150,14 +157,13 @@ fn scroll_editor(
         window,
         cx,
         |s| {
-            s.move_with(|map, selection| {
+            s.move_with(&mut |map, selection| {
                 // TODO: Improve the logic and function calls below to be dependent on
                 // the `amount`. If the amount is vertical, we don't care about
                 // columns, while if it's horizontal, we don't care about rows,
                 // so we don't need to calculate both and deal with logic for
                 // both.
                 let mut head = selection.head();
-                let top = top_anchor.to_display_point(map);
                 let max_point = map.max_point();
                 let starting_column = head.column();
 
@@ -165,7 +171,6 @@ fn scroll_editor(
                     (vertical_scroll_margin as u32).min(visible_line_count as u32 / 2);
 
                 if preserve_cursor_position {
-                    let old_top = old_top_anchor.to_display_point(map);
                     let new_row = if old_top.row() == top.row() {
                         DisplayRow(
                             head.row()
@@ -173,7 +178,9 @@ fn scroll_editor(
                                 .saturating_add_signed(amount.lines(visible_line_count) as i32),
                         )
                     } else {
-                        DisplayRow(top.row().0 + selection.head().row().0 - old_top.row().0)
+                        DisplayRow(top.row().0.saturating_add_signed(
+                            selection.head().row().0 as i32 - old_top.row().0 as i32,
+                        ))
                     };
                     head = map.clip_point(DisplayPoint::new(new_row, head.column()), Bias::Left)
                 }
@@ -220,7 +227,7 @@ fn scroll_editor(
                 // maximum column for the current line, so the minimum column
                 // would end up being the same as the maximum column.
                 let min_column = match preserve_cursor_position {
-                    true => old_top_anchor.to_display_point(map).column(),
+                    true => old_top.column(),
                     false => top.column(),
                 };
 
@@ -255,7 +262,7 @@ fn scroll_editor(
                     _ => selection.goal,
                 };
 
-                if selection.is_empty() {
+                if selection.is_empty() || !mode.is_visual() {
                     selection.collapse_to(new_head, goal)
                 } else {
                     selection.set_head(new_head, goal)
@@ -271,7 +278,7 @@ mod test {
         state::Mode,
         test::{NeovimBackedTestContext, VimTestContext},
     };
-    use editor::{EditorSettings, ScrollBeyondLastLine};
+    use editor::ScrollBeyondLastLine;
     use gpui::{AppContext as _, point, px, size};
     use indoc::indoc;
     use language::Point;
@@ -294,11 +301,10 @@ mod test {
     async fn test_scroll(cx: &mut gpui::TestAppContext) {
         let mut cx = VimTestContext::new(cx, true).await;
 
-        let (line_height, visible_line_count) = cx.editor(|editor, window, _cx| {
+        let (line_height, visible_line_count) = cx.update_editor(|editor, window, cx| {
             (
                 editor
-                    .style()
-                    .unwrap()
+                    .style(cx)
                     .text
                     .line_height_in_pixels(window.rem_size()),
                 editor.visible_line_count().unwrap(),
@@ -308,7 +314,7 @@ mod test {
         let window = cx.window;
         let margin = cx
             .update_window(window, |_, window, _cx| {
-                window.viewport_size().height - line_height * visible_line_count
+                window.viewport_size().height - line_height * visible_line_count as f32
             })
             .unwrap();
         cx.simulate_window_resize(
@@ -363,7 +369,10 @@ mod test {
                 point(0., 3.0)
             );
             assert_eq!(
-                editor.selections.newest(cx).range(),
+                editor
+                    .selections
+                    .newest(&editor.display_snapshot(cx))
+                    .range(),
                 Point::new(6, 0)..Point::new(6, 0)
             )
         });
@@ -380,7 +389,10 @@ mod test {
                 point(0., 3.0)
             );
             assert_eq!(
-                editor.selections.newest(cx).range(),
+                editor
+                    .selections
+                    .newest(&editor.display_snapshot(cx))
+                    .range(),
                 Point::new(0, 0)..Point::new(6, 1)
             )
         });
@@ -427,9 +439,7 @@ mod test {
         // First test without vertical scroll margin
         cx.neovim.set_option(&format!("scrolloff={}", 0)).await;
         cx.update_global(|store: &mut SettingsStore, cx| {
-            store.update_user_settings::<EditorSettings>(cx, |s| {
-                s.vertical_scroll_margin = Some(0.0)
-            });
+            store.update_user_settings(cx, |s| s.editor.vertical_scroll_margin = Some(0.0));
         });
 
         let content = "ˇ".to_owned() + &sample_text(26, 2, 'a');
@@ -455,9 +465,7 @@ mod test {
 
         cx.neovim.set_option(&format!("scrolloff={}", 3)).await;
         cx.update_global(|store: &mut SettingsStore, cx| {
-            store.update_user_settings::<EditorSettings>(cx, |s| {
-                s.vertical_scroll_margin = Some(3.0)
-            });
+            store.update_user_settings(cx, |s| s.editor.vertical_scroll_margin = Some(3.0));
         });
 
         // scroll down: ctrl-f
@@ -485,9 +493,8 @@ mod test {
         cx.set_shared_state(&content).await;
 
         cx.update_global(|store: &mut SettingsStore, cx| {
-            store.update_user_settings::<EditorSettings>(cx, |s| {
-                s.scroll_beyond_last_line = Some(ScrollBeyondLastLine::Off);
-                // s.vertical_scroll_margin = Some(0.);
+            store.update_user_settings(cx, |s| {
+                s.editor.scroll_beyond_last_line = Some(ScrollBeyondLastLine::Off);
             });
         });
 
@@ -549,7 +556,7 @@ mod test {
         cx.set_neovim_option("nowrap").await;
 
         let content = "ˇ01234567890123456789";
-        cx.set_shared_state(&content).await;
+        cx.set_shared_state(content).await;
 
         cx.simulate_shared_keystrokes("z shift-l").await;
         cx.shared_state().await.assert_eq("012345ˇ67890123456789");
@@ -560,7 +567,7 @@ mod test {
         cx.shared_state().await.assert_eq("012345ˇ67890123456789");
 
         let content = "ˇ01234567890123456789";
-        cx.set_shared_state(&content).await;
+        cx.set_shared_state(content).await;
 
         cx.simulate_shared_keystrokes("z l").await;
         cx.shared_state().await.assert_eq("0ˇ1234567890123456789");

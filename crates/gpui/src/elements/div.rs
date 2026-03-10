@@ -16,17 +16,20 @@
 //! constructed by combining these two systems into an all-in-one element.
 
 use crate::{
-    Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, DispatchPhase,
-    Element, ElementId, Entity, FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior,
-    HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent,
-    LayoutId, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    AbsoluteLength, Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent,
+    DispatchPhase, Display, Element, ElementId, Entity, FocusHandle, Global, GlobalElementId,
+    Hitbox, HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext,
+    KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, ModifiersChangedEvent,
+    MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
     Overflow, ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
     StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
     size,
 };
 use collections::HashMap;
+use gpui_util::ResultExt;
 use refineable::Refineable;
 use smallvec::SmallVec;
+use stacksafe::{StackSafe, stacksafe};
 use std::{
     any::{Any, TypeId},
     cell::RefCell,
@@ -38,7 +41,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use util::ResultExt;
 
 use super::ImageCacheProvider;
 
@@ -112,8 +114,8 @@ impl Interactivity {
         }
     }
 
-    /// Bind the given callback to the mouse down event for the given mouse button, during the bubble phase
-    /// The imperative API equivalent of [`InteractiveElement::on_mouse_down`]
+    /// Bind the given callback to the mouse down event for the given mouse button, during the bubble phase.
+    /// The imperative API equivalent of [`InteractiveElement::on_mouse_down`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to the view state from this callback.
     pub fn on_mouse_down(
@@ -132,8 +134,8 @@ impl Interactivity {
             }));
     }
 
-    /// Bind the given callback to the mouse down event for any button, during the capture phase
-    /// The imperative API equivalent of [`InteractiveElement::capture_any_mouse_down`]
+    /// Bind the given callback to the mouse down event for any button, during the capture phase.
+    /// The imperative API equivalent of [`InteractiveElement::capture_any_mouse_down`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn capture_any_mouse_down(
@@ -148,8 +150,8 @@ impl Interactivity {
             }));
     }
 
-    /// Bind the given callback to the mouse down event for any button, during the bubble phase
-    /// the imperative API equivalent to [`InteractiveElement::on_any_mouse_down`]
+    /// Bind the given callback to the mouse down event for any button, during the bubble phase.
+    /// The imperative API equivalent to [`InteractiveElement::on_any_mouse_down`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn on_any_mouse_down(
@@ -164,8 +166,40 @@ impl Interactivity {
             }));
     }
 
-    /// Bind the given callback to the mouse up event for the given button, during the bubble phase
-    /// the imperative API equivalent to [`InteractiveElement::on_mouse_up`]
+    /// Bind the given callback to the mouse pressure event, during the bubble phase
+    /// the imperative API equivalent to [`InteractiveElement::on_mouse_pressure`].
+    ///
+    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    pub fn on_mouse_pressure(
+        &mut self,
+        listener: impl Fn(&MousePressureEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.mouse_pressure_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                    (listener)(event, window, cx)
+                }
+            }));
+    }
+
+    /// Bind the given callback to the mouse pressure event, during the capture phase
+    /// the imperative API equivalent to [`InteractiveElement::on_mouse_pressure`].
+    ///
+    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    pub fn capture_mouse_pressure(
+        &mut self,
+        listener: impl Fn(&MousePressureEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.mouse_pressure_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Capture && hitbox.is_hovered(window) {
+                    (listener)(event, window, cx)
+                }
+            }));
+    }
+
+    /// Bind the given callback to the mouse up event for the given button, during the bubble phase.
+    /// The imperative API equivalent to [`InteractiveElement::on_mouse_up`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn on_mouse_up(
@@ -184,8 +218,8 @@ impl Interactivity {
             }));
     }
 
-    /// Bind the given callback to the mouse up event for any button, during the capture phase
-    /// the imperative API equivalent to [`InteractiveElement::capture_any_mouse_up`]
+    /// Bind the given callback to the mouse up event for any button, during the capture phase.
+    /// The imperative API equivalent to [`InteractiveElement::capture_any_mouse_up`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn capture_any_mouse_up(
@@ -200,8 +234,8 @@ impl Interactivity {
             }));
     }
 
-    /// Bind the given callback to the mouse up event for any button, during the bubble phase
-    /// the imperative API equivalent to [`Interactivity::on_any_mouse_up`]
+    /// Bind the given callback to the mouse up event for any button, during the bubble phase.
+    /// The imperative API equivalent to [`Interactivity::on_any_mouse_up`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn on_any_mouse_up(
@@ -218,7 +252,7 @@ impl Interactivity {
 
     /// Bind the given callback to the mouse down event, on any button, during the capture phase,
     /// when the mouse is outside of the bounds of this element.
-    /// The imperative API equivalent to [`InteractiveElement::on_mouse_down_out`]
+    /// The imperative API equivalent to [`InteractiveElement::on_mouse_down_out`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn on_mouse_down_out(
@@ -235,7 +269,7 @@ impl Interactivity {
 
     /// Bind the given callback to the mouse up event, for the given button, during the capture phase,
     /// when the mouse is outside of the bounds of this element.
-    /// The imperative API equivalent to [`InteractiveElement::on_mouse_up_out`]
+    /// The imperative API equivalent to [`InteractiveElement::on_mouse_up_out`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn on_mouse_up_out(
@@ -254,8 +288,8 @@ impl Interactivity {
             }));
     }
 
-    /// Bind the given callback to the mouse move event, during the bubble phase
-    /// The imperative API equivalent to [`InteractiveElement::on_mouse_move`]
+    /// Bind the given callback to the mouse move event, during the bubble phase.
+    /// The imperative API equivalent to [`InteractiveElement::on_mouse_move`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn on_mouse_move(
@@ -274,7 +308,7 @@ impl Interactivity {
     /// will be called for all move events, inside or outside of this element, as long as the
     /// drag was started with this element under the mouse. Useful for implementing draggable
     /// UIs that don't conform to a drag and drop style interaction, like resizing.
-    /// The imperative API equivalent to [`InteractiveElement::on_drag_move`]
+    /// The imperative API equivalent to [`InteractiveElement::on_drag_move`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn on_drag_move<T>(
@@ -285,27 +319,26 @@ impl Interactivity {
     {
         self.mouse_move_listeners
             .push(Box::new(move |event, phase, hitbox, window, cx| {
-                if phase == DispatchPhase::Capture {
-                    if let Some(drag) = &cx.active_drag {
-                        if drag.value.as_ref().type_id() == TypeId::of::<T>() {
-                            (listener)(
-                                &DragMoveEvent {
-                                    event: event.clone(),
-                                    bounds: hitbox.bounds,
-                                    drag: PhantomData,
-                                    dragged_item: Arc::clone(&drag.value),
-                                },
-                                window,
-                                cx,
-                            );
-                        }
-                    }
+                if phase == DispatchPhase::Capture
+                    && let Some(drag) = &cx.active_drag
+                    && drag.value.as_ref().type_id() == TypeId::of::<T>()
+                {
+                    (listener)(
+                        &DragMoveEvent {
+                            event: event.clone(),
+                            bounds: hitbox.bounds,
+                            drag: PhantomData,
+                            dragged_item: Arc::clone(&drag.value),
+                        },
+                        window,
+                        cx,
+                    );
                 }
             }));
     }
 
-    /// Bind the given callback to scroll wheel events during the bubble phase
-    /// The imperative API equivalent to [`InteractiveElement::on_scroll_wheel`]
+    /// Bind the given callback to scroll wheel events during the bubble phase.
+    /// The imperative API equivalent to [`InteractiveElement::on_scroll_wheel`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn on_scroll_wheel(
@@ -320,8 +353,8 @@ impl Interactivity {
             }));
     }
 
-    /// Bind the given callback to an action dispatch during the capture phase
-    /// The imperative API equivalent to [`InteractiveElement::capture_action`]
+    /// Bind the given callback to an action dispatch during the capture phase.
+    /// The imperative API equivalent to [`InteractiveElement::capture_action`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn capture_action<A: Action>(
@@ -341,8 +374,8 @@ impl Interactivity {
         ));
     }
 
-    /// Bind the given callback to an action dispatch during the bubble phase
-    /// The imperative API equivalent to [`InteractiveElement::on_action`]
+    /// Bind the given callback to an action dispatch during the bubble phase.
+    /// The imperative API equivalent to [`InteractiveElement::on_action`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn on_action<A: Action>(&mut self, listener: impl Fn(&A, &mut Window, &mut App) + 'static) {
@@ -360,7 +393,7 @@ impl Interactivity {
     /// Bind the given callback to an action dispatch, based on a dynamic action parameter
     /// instead of a type parameter. Useful for component libraries that want to expose
     /// action bindings to their users.
-    /// The imperative API equivalent to [`InteractiveElement::on_boxed_action`]
+    /// The imperative API equivalent to [`InteractiveElement::on_boxed_action`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn on_boxed_action(
@@ -379,8 +412,8 @@ impl Interactivity {
         ));
     }
 
-    /// Bind the given callback to key down events during the bubble phase
-    /// The imperative API equivalent to [`InteractiveElement::on_key_down`]
+    /// Bind the given callback to key down events during the bubble phase.
+    /// The imperative API equivalent to [`InteractiveElement::on_key_down`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn on_key_down(
@@ -395,8 +428,8 @@ impl Interactivity {
             }));
     }
 
-    /// Bind the given callback to key down events during the capture phase
-    /// The imperative API equivalent to [`InteractiveElement::capture_key_down`]
+    /// Bind the given callback to key down events during the capture phase.
+    /// The imperative API equivalent to [`InteractiveElement::capture_key_down`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn capture_key_down(
@@ -411,8 +444,8 @@ impl Interactivity {
             }));
     }
 
-    /// Bind the given callback to key up events during the bubble phase
-    /// The imperative API equivalent to [`InteractiveElement::on_key_up`]
+    /// Bind the given callback to key up events during the bubble phase.
+    /// The imperative API equivalent to [`InteractiveElement::on_key_up`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn on_key_up(&mut self, listener: impl Fn(&KeyUpEvent, &mut Window, &mut App) + 'static) {
@@ -424,8 +457,8 @@ impl Interactivity {
             }));
     }
 
-    /// Bind the given callback to key up events during the capture phase
-    /// The imperative API equivalent to [`InteractiveElement::on_key_up`]
+    /// Bind the given callback to key up events during the capture phase.
+    /// The imperative API equivalent to [`InteractiveElement::on_key_up`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn capture_key_up(
@@ -441,7 +474,7 @@ impl Interactivity {
     }
 
     /// Bind the given callback to modifiers changing events.
-    /// The imperative API equivalent to [`InteractiveElement::on_modifiers_changed`]
+    /// The imperative API equivalent to [`InteractiveElement::on_modifiers_changed`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn on_modifiers_changed(
@@ -454,8 +487,8 @@ impl Interactivity {
             }));
     }
 
-    /// Bind the given callback to drop events of the given type, whether or not the drag started on this element
-    /// The imperative API equivalent to [`InteractiveElement::on_drop`]
+    /// Bind the given callback to drop events of the given type, whether or not the drag started on this element.
+    /// The imperative API equivalent to [`InteractiveElement::on_drop`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn on_drop<T: 'static>(&mut self, listener: impl Fn(&T, &mut Window, &mut App) + 'static) {
@@ -467,8 +500,8 @@ impl Interactivity {
         ));
     }
 
-    /// Use the given predicate to determine whether or not a drop event should be dispatched to this element
-    /// The imperative API equivalent to [`InteractiveElement::can_drop`]
+    /// Use the given predicate to determine whether or not a drop event should be dispatched to this element.
+    /// The imperative API equivalent to [`InteractiveElement::can_drop`].
     pub fn can_drop(
         &mut self,
         predicate: impl Fn(&dyn Any, &mut Window, &mut App) -> bool + 'static,
@@ -476,24 +509,37 @@ impl Interactivity {
         self.can_drop_predicate = Some(Box::new(predicate));
     }
 
-    /// Bind the given callback to click events of this element
-    /// The imperative API equivalent to [`StatefulInteractiveElement::on_click`]
+    /// Bind the given callback to click events of this element.
+    /// The imperative API equivalent to [`StatefulInteractiveElement::on_click`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn on_click(&mut self, listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static)
     where
         Self: Sized,
     {
-        self.click_listeners
-            .push(Box::new(move |event, window, cx| {
+        self.click_listeners.push(Rc::new(move |event, window, cx| {
+            listener(event, window, cx)
+        }));
+    }
+
+    /// Bind the given callback to non-primary click events of this element.
+    /// The imperative API equivalent to [`StatefulInteractiveElement::on_aux_click`].
+    ///
+    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    pub fn on_aux_click(&mut self, listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static)
+    where
+        Self: Sized,
+    {
+        self.aux_click_listeners
+            .push(Rc::new(move |event, window, cx| {
                 listener(event, window, cx)
             }));
     }
 
     /// On drag initiation, this callback will be used to create a new view to render the dragged value for a
     /// drag and drop operation. This API should also be used as the equivalent of 'on drag start' with
-    /// the [`Self::on_drag_move`] API
-    /// The imperative API equivalent to [`StatefulInteractiveElement::on_drag`]
+    /// the [`Self::on_drag_move`] API.
+    /// The imperative API equivalent to [`StatefulInteractiveElement::on_drag`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn on_drag<T, W>(
@@ -519,7 +565,7 @@ impl Interactivity {
 
     /// Bind the given callback on the hover start and end events of this element. Note that the boolean
     /// passed to the callback is true when the hover starts and false when it ends.
-    /// The imperative API equivalent to [`StatefulInteractiveElement::on_hover`]
+    /// The imperative API equivalent to [`StatefulInteractiveElement::on_hover`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     pub fn on_hover(&mut self, listener: impl Fn(&bool, &mut Window, &mut App) + 'static)
@@ -534,7 +580,7 @@ impl Interactivity {
     }
 
     /// Use the given callback to construct a new tooltip view when the mouse hovers over this element.
-    /// The imperative API equivalent to [`InteractiveElement::tooltip`]
+    /// The imperative API equivalent to [`StatefulInteractiveElement::tooltip`].
     pub fn tooltip(&mut self, build_tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static)
     where
         Self: Sized,
@@ -551,7 +597,7 @@ impl Interactivity {
 
     /// Use the given callback to construct a new tooltip view when the mouse hovers over this element.
     /// The tooltip itself is also hoverable and won't disappear when the user moves the mouse into
-    /// the tooltip. The imperative API equivalent to [`InteractiveElement::hoverable_tooltip`]
+    /// the tooltip. The imperative API equivalent to [`StatefulInteractiveElement::hoverable_tooltip`].
     pub fn hoverable_tooltip(
         &mut self,
         build_tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static,
@@ -582,10 +628,10 @@ impl Interactivity {
         self.window_control = Some(area);
     }
 
-    /// Block non-scroll mouse interactions with elements behind this element's hitbox. See
-    /// [`Hitbox::is_hovered`] for details.
+    /// Block non-scroll mouse interactions with elements behind this element's hitbox.
+    /// The imperative API equivalent to [`InteractiveElement::block_mouse_except_scroll`].
     ///
-    /// The imperative API equivalent to [`InteractiveElement::block_mouse_except_scroll`]
+    /// See [`Hitbox::is_hovered`] for details.
     pub fn block_mouse_except_scroll(&mut self) {
         self.hitbox_behavior = HitboxBehavior::BlockMouseExceptScroll;
     }
@@ -616,6 +662,40 @@ pub trait InteractiveElement: Sized {
     fn track_focus(mut self, focus_handle: &FocusHandle) -> Self {
         self.interactivity().focusable = true;
         self.interactivity().tracked_focus_handle = Some(focus_handle.clone());
+        self
+    }
+
+    /// Set whether this element is a tab stop.
+    ///
+    /// When false, the element remains in tab-index order but cannot be reached via keyboard navigation.
+    /// Useful for container elements: focus the container, then call `window.focus_next(cx)` to focus
+    /// the first tab stop inside it while having the container element itself be unreachable via the keyboard.
+    /// Should only be used with `tab_index`.
+    fn tab_stop(mut self, tab_stop: bool) -> Self {
+        self.interactivity().tab_stop = tab_stop;
+        self
+    }
+
+    /// Set index of the tab stop order, and set this node as a tab stop.
+    /// This will default the element to being a tab stop. See [`Self::tab_stop`] for more information.
+    /// This should only be used in conjunction with `tab_group`
+    /// in order to not interfere with the tab index of other elements.
+    fn tab_index(mut self, index: isize) -> Self {
+        self.interactivity().focusable = true;
+        self.interactivity().tab_index = Some(index);
+        self.interactivity().tab_stop = true;
+        self
+    }
+
+    /// Designate this div as a "tab group". Tab groups have their own location in the tab-index order,
+    /// but for children of the tab group, the tab index is reset to 0. This can be useful for swapping
+    /// the order of tab stops within the group, without having to renumber all the tab stops in the whole
+    /// application.
+    fn tab_group(mut self) -> Self {
+        self.interactivity().tab_group = true;
+        if self.interactivity().tab_index.is_none() {
+            self.interactivity().tab_index = Some(0);
+        }
         self
     }
 
@@ -655,8 +735,8 @@ pub trait InteractiveElement: Sized {
         self
     }
 
-    /// Bind the given callback to the mouse down event for the given mouse button,
-    /// the fluent API equivalent to [`Interactivity::on_mouse_down`]
+    /// Bind the given callback to the mouse down event for the given mouse button.
+    /// The fluent API equivalent to [`Interactivity::on_mouse_down`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to the view state from this callback.
     fn on_mouse_down(
@@ -670,7 +750,7 @@ pub trait InteractiveElement: Sized {
 
     #[cfg(any(test, feature = "test-support"))]
     /// Set a key that can be used to look up this element's bounds
-    /// in the [`VisualTestContext::debug_bounds`] map
+    /// in the [`crate::VisualTestContext::debug_bounds`] map
     /// This is a noop in release builds
     fn debug_selector(mut self, f: impl FnOnce() -> String) -> Self {
         self.interactivity().debug_selector = Some(f());
@@ -679,15 +759,15 @@ pub trait InteractiveElement: Sized {
 
     #[cfg(not(any(test, feature = "test-support")))]
     /// Set a key that can be used to look up this element's bounds
-    /// in the [`VisualTestContext::debug_bounds`] map
+    /// in the [`crate::VisualTestContext::debug_bounds`] map
     /// This is a noop in release builds
     #[inline]
     fn debug_selector(self, _: impl FnOnce() -> String) -> Self {
         self
     }
 
-    /// Bind the given callback to the mouse down event for any button, during the capture phase
-    /// the fluent API equivalent to [`Interactivity::capture_any_mouse_down`]
+    /// Bind the given callback to the mouse down event for any button, during the capture phase.
+    /// The fluent API equivalent to [`Interactivity::capture_any_mouse_down`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     fn capture_any_mouse_down(
@@ -698,8 +778,8 @@ pub trait InteractiveElement: Sized {
         self
     }
 
-    /// Bind the given callback to the mouse down event for any button, during the capture phase
-    /// the fluent API equivalent to [`Interactivity::on_any_mouse_down`]
+    /// Bind the given callback to the mouse down event for any button, during the capture phase.
+    /// The fluent API equivalent to [`Interactivity::on_any_mouse_down`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     fn on_any_mouse_down(
@@ -710,8 +790,8 @@ pub trait InteractiveElement: Sized {
         self
     }
 
-    /// Bind the given callback to the mouse up event for the given button, during the bubble phase
-    /// the fluent API equivalent to [`Interactivity::on_mouse_up`]
+    /// Bind the given callback to the mouse up event for the given button, during the bubble phase.
+    /// The fluent API equivalent to [`Interactivity::on_mouse_up`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     fn on_mouse_up(
@@ -723,8 +803,8 @@ pub trait InteractiveElement: Sized {
         self
     }
 
-    /// Bind the given callback to the mouse up event for any button, during the capture phase
-    /// the fluent API equivalent to [`Interactivity::capture_any_mouse_up`]
+    /// Bind the given callback to the mouse up event for any button, during the capture phase.
+    /// The fluent API equivalent to [`Interactivity::capture_any_mouse_up`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     fn capture_any_mouse_up(
@@ -735,9 +815,33 @@ pub trait InteractiveElement: Sized {
         self
     }
 
+    /// Bind the given callback to the mouse pressure event, during the bubble phase
+    /// the fluent API equivalent to [`Interactivity::on_mouse_pressure`]
+    ///
+    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    fn on_mouse_pressure(
+        mut self,
+        listener: impl Fn(&MousePressureEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().on_mouse_pressure(listener);
+        self
+    }
+
+    /// Bind the given callback to the mouse pressure event, during the capture phase
+    /// the fluent API equivalent to [`Interactivity::on_mouse_pressure`]
+    ///
+    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    fn capture_mouse_pressure(
+        mut self,
+        listener: impl Fn(&MousePressureEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().capture_mouse_pressure(listener);
+        self
+    }
+
     /// Bind the given callback to the mouse down event, on any button, during the capture phase,
     /// when the mouse is outside of the bounds of this element.
-    /// The fluent API equivalent to [`Interactivity::on_mouse_down_out`]
+    /// The fluent API equivalent to [`Interactivity::on_mouse_down_out`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     fn on_mouse_down_out(
@@ -750,7 +854,7 @@ pub trait InteractiveElement: Sized {
 
     /// Bind the given callback to the mouse up event, for the given button, during the capture phase,
     /// when the mouse is outside of the bounds of this element.
-    /// The fluent API equivalent to [`Interactivity::on_mouse_up_out`]
+    /// The fluent API equivalent to [`Interactivity::on_mouse_up_out`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     fn on_mouse_up_out(
@@ -762,8 +866,8 @@ pub trait InteractiveElement: Sized {
         self
     }
 
-    /// Bind the given callback to the mouse move event, during the bubble phase
-    /// The fluent API equivalent to [`Interactivity::on_mouse_move`]
+    /// Bind the given callback to the mouse move event, during the bubble phase.
+    /// The fluent API equivalent to [`Interactivity::on_mouse_move`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     fn on_mouse_move(
@@ -778,7 +882,7 @@ pub trait InteractiveElement: Sized {
     /// will be called for all move events, inside or outside of this element, as long as the
     /// drag was started with this element under the mouse. Useful for implementing draggable
     /// UIs that don't conform to a drag and drop style interaction, like resizing.
-    /// The fluent API equivalent to [`Interactivity::on_drag_move`]
+    /// The fluent API equivalent to [`Interactivity::on_drag_move`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     fn on_drag_move<T: 'static>(
@@ -789,8 +893,8 @@ pub trait InteractiveElement: Sized {
         self
     }
 
-    /// Bind the given callback to scroll wheel events during the bubble phase
-    /// The fluent API equivalent to [`Interactivity::on_scroll_wheel`]
+    /// Bind the given callback to scroll wheel events during the bubble phase.
+    /// The fluent API equivalent to [`Interactivity::on_scroll_wheel`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     fn on_scroll_wheel(
@@ -801,8 +905,8 @@ pub trait InteractiveElement: Sized {
         self
     }
 
-    /// Capture the given action, before normal action dispatch can fire
-    /// The fluent API equivalent to [`Interactivity::on_scroll_wheel`]
+    /// Capture the given action, before normal action dispatch can fire.
+    /// The fluent API equivalent to [`Interactivity::capture_action`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     fn capture_action<A: Action>(
@@ -813,8 +917,8 @@ pub trait InteractiveElement: Sized {
         self
     }
 
-    /// Bind the given callback to an action dispatch during the bubble phase
-    /// The fluent API equivalent to [`Interactivity::on_action`]
+    /// Bind the given callback to an action dispatch during the bubble phase.
+    /// The fluent API equivalent to [`Interactivity::on_action`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     fn on_action<A: Action>(
@@ -828,7 +932,7 @@ pub trait InteractiveElement: Sized {
     /// Bind the given callback to an action dispatch, based on a dynamic action parameter
     /// instead of a type parameter. Useful for component libraries that want to expose
     /// action bindings to their users.
-    /// The fluent API equivalent to [`Interactivity::on_boxed_action`]
+    /// The fluent API equivalent to [`Interactivity::on_boxed_action`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     fn on_boxed_action(
@@ -840,8 +944,8 @@ pub trait InteractiveElement: Sized {
         self
     }
 
-    /// Bind the given callback to key down events during the bubble phase
-    /// The fluent API equivalent to [`Interactivity::on_key_down`]
+    /// Bind the given callback to key down events during the bubble phase.
+    /// The fluent API equivalent to [`Interactivity::on_key_down`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     fn on_key_down(
@@ -852,8 +956,8 @@ pub trait InteractiveElement: Sized {
         self
     }
 
-    /// Bind the given callback to key down events during the capture phase
-    /// The fluent API equivalent to [`Interactivity::capture_key_down`]
+    /// Bind the given callback to key down events during the capture phase.
+    /// The fluent API equivalent to [`Interactivity::capture_key_down`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     fn capture_key_down(
@@ -864,8 +968,8 @@ pub trait InteractiveElement: Sized {
         self
     }
 
-    /// Bind the given callback to key up events during the bubble phase
-    /// The fluent API equivalent to [`Interactivity::on_key_up`]
+    /// Bind the given callback to key up events during the bubble phase.
+    /// The fluent API equivalent to [`Interactivity::on_key_up`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     fn on_key_up(
@@ -876,8 +980,8 @@ pub trait InteractiveElement: Sized {
         self
     }
 
-    /// Bind the given callback to key up events during the capture phase
-    /// The fluent API equivalent to [`Interactivity::capture_key_up`]
+    /// Bind the given callback to key up events during the capture phase.
+    /// The fluent API equivalent to [`Interactivity::capture_key_up`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     fn capture_key_up(
@@ -889,7 +993,7 @@ pub trait InteractiveElement: Sized {
     }
 
     /// Bind the given callback to modifiers changing events.
-    /// The fluent API equivalent to [`Interactivity::on_modifiers_changed`]
+    /// The fluent API equivalent to [`Interactivity::on_modifiers_changed`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     fn on_modifiers_changed(
@@ -935,8 +1039,8 @@ pub trait InteractiveElement: Sized {
         self
     }
 
-    /// Bind the given callback to drop events of the given type, whether or not the drag started on this element
-    /// The fluent API equivalent to [`Interactivity::on_drop`]
+    /// Bind the given callback to drop events of the given type, whether or not the drag started on this element.
+    /// The fluent API equivalent to [`Interactivity::on_drop`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     fn on_drop<T: 'static>(
@@ -947,8 +1051,8 @@ pub trait InteractiveElement: Sized {
         self
     }
 
-    /// Use the given predicate to determine whether or not a drop event should be dispatched to this element
-    /// The fluent API equivalent to [`Interactivity::can_drop`]
+    /// Use the given predicate to determine whether or not a drop event should be dispatched to this element.
+    /// The fluent API equivalent to [`Interactivity::can_drop`].
     fn can_drop(
         mut self,
         predicate: impl Fn(&dyn Any, &mut Window, &mut App) -> bool + 'static,
@@ -959,23 +1063,23 @@ pub trait InteractiveElement: Sized {
 
     /// Block the mouse from all interactions with elements behind this element's hitbox. Typically
     /// `block_mouse_except_scroll` should be preferred.
-    /// The fluent API equivalent to [`Interactivity::occlude_mouse`]
+    /// The fluent API equivalent to [`Interactivity::occlude_mouse`].
     fn occlude(mut self) -> Self {
         self.interactivity().occlude_mouse();
         self
     }
 
     /// Set the bounds of this element as a window control area for the platform window.
-    /// The fluent API equivalent to [`Interactivity::window_control_area`]
+    /// The fluent API equivalent to [`Interactivity::window_control_area`].
     fn window_control_area(mut self, area: WindowControlArea) -> Self {
         self.interactivity().window_control_area(area);
         self
     }
 
-    /// Block non-scroll mouse interactions with elements behind this element's hitbox. See
-    /// [`Hitbox::is_hovered`] for details.
+    /// Block non-scroll mouse interactions with elements behind this element's hitbox.
+    /// The fluent API equivalent to [`Interactivity::block_mouse_except_scroll`].
     ///
-    /// The fluent API equivalent to [`Interactivity::block_mouse_except_scroll`]
+    /// See [`Hitbox::is_hovered`] for details.
     fn block_mouse_except_scroll(mut self) -> Self {
         self.interactivity().block_mouse_except_scroll();
         self
@@ -998,6 +1102,18 @@ pub trait InteractiveElement: Sized {
         Self: Sized,
     {
         self.interactivity().in_focus_style = Some(Box::new(f(StyleRefinement::default())));
+        self
+    }
+
+    /// Set the given styles to be applied when this element is focused via keyboard navigation.
+    /// This is similar to CSS's `:focus-visible` pseudo-class - it only applies when the element
+    /// is focused AND the user is navigating via keyboard (not mouse clicks).
+    /// Requires that the element is focusable. Elements can be made focusable using [`InteractiveElement::track_focus`].
+    fn focus_visible(mut self, f: impl FnOnce(StyleRefinement) -> StyleRefinement) -> Self
+    where
+        Self: Sized,
+    {
+        self.interactivity().focus_visible_style = Some(Box::new(f(StyleRefinement::default())));
         self
     }
 }
@@ -1027,6 +1143,15 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     /// Set the overflow y to scroll.
     fn overflow_y_scroll(mut self) -> Self {
         self.interactivity().base_style.overflow.y = Some(Overflow::Scroll);
+        self
+    }
+
+    /// Set the space to be reserved for rendering the scrollbar.
+    ///
+    /// This will only affect the layout of the element when overflow for this element is set to
+    /// `Overflow::Scroll`.
+    fn scrollbar_width(mut self, width: impl Into<AbsoluteLength>) -> Self {
+        self.interactivity().base_style.scrollbar_width = Some(width.into());
         self
     }
 
@@ -1067,8 +1192,8 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
-    /// Bind the given callback to click events of this element
-    /// The fluent API equivalent to [`Interactivity::on_click`]
+    /// Bind the given callback to click events of this element.
+    /// The fluent API equivalent to [`Interactivity::on_click`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     fn on_click(mut self, listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Self
@@ -1079,11 +1204,26 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Bind the given callback to non-primary click events of this element.
+    /// The fluent API equivalent to [`Interactivity::on_aux_click`].
+    ///
+    /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
+    fn on_aux_click(
+        mut self,
+        listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self
+    where
+        Self: Sized,
+    {
+        self.interactivity().on_aux_click(listener);
+        self
+    }
+
     /// On drag initiation, this callback will be used to create a new view to render the dragged value for a
     /// drag and drop operation. This API should also be used as the equivalent of 'on drag start' with
-    /// the [`Self::on_drag_move`] API.
+    /// the [`InteractiveElement::on_drag_move`] API.
     /// The callback also has access to the offset of triggering click from the origin of parent element.
-    /// The fluent API equivalent to [`Interactivity::on_drag`]
+    /// The fluent API equivalent to [`Interactivity::on_drag`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     fn on_drag<T, W>(
@@ -1102,7 +1242,7 @@ pub trait StatefulInteractiveElement: InteractiveElement {
 
     /// Bind the given callback on the hover start and end events of this element. Note that the boolean
     /// passed to the callback is true when the hover starts and false when it ends.
-    /// The fluent API equivalent to [`Interactivity::on_hover`]
+    /// The fluent API equivalent to [`Interactivity::on_hover`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
     fn on_hover(mut self, listener: impl Fn(&bool, &mut Window, &mut App) + 'static) -> Self
@@ -1114,7 +1254,7 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     }
 
     /// Use the given callback to construct a new tooltip view when the mouse hovers over this element.
-    /// The fluent API equivalent to [`Interactivity::tooltip`]
+    /// The fluent API equivalent to [`Interactivity::tooltip`].
     fn tooltip(mut self, build_tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static) -> Self
     where
         Self: Sized,
@@ -1125,7 +1265,7 @@ pub trait StatefulInteractiveElement: InteractiveElement {
 
     /// Use the given callback to construct a new tooltip view when the mouse hovers over this element.
     /// The tooltip itself is also hoverable and won't disappear when the user moves the mouse into
-    /// the tooltip. The fluent API equivalent to [`Interactivity::hoverable_tooltip`]
+    /// the tooltip. The fluent API equivalent to [`Interactivity::hoverable_tooltip`].
     fn hoverable_tooltip(
         mut self,
         build_tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static,
@@ -1142,14 +1282,15 @@ pub(crate) type MouseDownListener =
     Box<dyn Fn(&MouseDownEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
 pub(crate) type MouseUpListener =
     Box<dyn Fn(&MouseUpEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
-
+pub(crate) type MousePressureListener =
+    Box<dyn Fn(&MousePressureEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
 pub(crate) type MouseMoveListener =
     Box<dyn Fn(&MouseMoveEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
 
 pub(crate) type ScrollWheelListener =
     Box<dyn Fn(&ScrollWheelEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
 
-pub(crate) type ClickListener = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
+pub(crate) type ClickListener = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
 pub(crate) type DragListener =
     Box<dyn Fn(&dyn Any, Point<Pixels>, &mut Window, &mut App) -> AnyView + 'static>;
@@ -1183,15 +1324,17 @@ pub fn div() -> Div {
         children: SmallVec::default(),
         prepaint_listener: None,
         image_cache: None,
+        prepaint_order_fn: None,
     }
 }
 
 /// A [`Div`] element, the all-in-one element for building complex UIs in GPUI
 pub struct Div {
     interactivity: Interactivity,
-    children: SmallVec<[AnyElement; 2]>,
+    children: SmallVec<[StackSafe<AnyElement>; 2]>,
     prepaint_listener: Option<Box<dyn Fn(Vec<Bounds<Pixels>>, &mut Window, &mut App) + 'static>>,
     image_cache: Option<Box<dyn ImageCacheProvider>>,
+    prepaint_order_fn: Option<Box<dyn Fn(&mut Window, &mut App) -> SmallVec<[usize; 8]>>>,
 }
 
 impl Div {
@@ -1208,6 +1351,22 @@ impl Div {
     /// Add an image cache at the location of this div in the element tree.
     pub fn image_cache(mut self, cache: impl ImageCacheProvider) -> Self {
         self.image_cache = Some(Box::new(cache));
+        self
+    }
+
+    /// Specify a function that determines the order in which children are prepainted.
+    ///
+    /// The function is called at prepaint time and should return a vector of child indices
+    /// in the desired prepaint order. Each index should appear exactly once.
+    ///
+    /// This is useful when the prepaint of one child affects state that another child reads.
+    /// For example, in split editor views, the editor with an autoscroll request should
+    /// be prepainted first so its scroll position update is visible to the other editor.
+    pub fn with_dynamic_prepaint_order(
+        mut self,
+        order_fn: impl Fn(&mut Window, &mut App) -> SmallVec<[usize; 8]> + 'static,
+    ) -> Self {
+        self.prepaint_order_fn = Some(Box::new(order_fn));
         self
     }
 }
@@ -1250,7 +1409,8 @@ impl InteractiveElement for Div {
 
 impl ParentElement for Div {
     fn extend(&mut self, elements: impl IntoIterator<Item = AnyElement>) {
-        self.children.extend(elements)
+        self.children
+            .extend(elements.into_iter().map(StackSafe::new))
     }
 }
 
@@ -1266,6 +1426,7 @@ impl Element for Div {
         self.interactivity.source_location()
     }
 
+    #[stacksafe]
     fn request_layout(
         &mut self,
         global_id: Option<&GlobalElementId>,
@@ -1301,6 +1462,7 @@ impl Element for Div {
         (layout_id, DivFrameState { child_layout_ids })
     }
 
+    #[stacksafe]
     fn prepaint(
         &mut self,
         global_id: Option<&GlobalElementId>,
@@ -1310,6 +1472,11 @@ impl Element for Div {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Hitbox> {
+        let image_cache = self
+            .image_cache
+            .as_mut()
+            .map(|provider| provider.provide(window, cx));
+
         let has_prepaint_listener = self.prepaint_listener.is_some();
         let mut children_bounds = Vec::with_capacity(if has_prepaint_listener {
             request_layout.child_layout_ids.len()
@@ -1327,7 +1494,6 @@ impl Element for Div {
         } else if let Some(scroll_handle) = self.interactivity.tracked_scroll_handle.as_ref() {
             let mut state = scroll_handle.0.borrow_mut();
             state.child_bounds = Vec::with_capacity(request_layout.child_layout_ids.len());
-            state.bounds = bounds;
             for child_layout_id in &request_layout.child_layout_ids {
                 let child_bounds = window.layout_bounds(*child_layout_id);
                 child_min = child_min.min(&child_bounds.origin);
@@ -1348,6 +1514,10 @@ impl Element for Div {
             (child_max - child_min).into()
         };
 
+        if let Some(scroll_handle) = self.interactivity.tracked_scroll_handle.as_ref() {
+            scroll_handle.scroll_to_active_item();
+        }
+
         self.interactivity.prepaint(
             global_id,
             inspector_id,
@@ -1355,22 +1525,39 @@ impl Element for Div {
             content_size,
             window,
             cx,
-            |_style, scroll_offset, hitbox, window, cx| {
-                window.with_element_offset(scroll_offset, |window| {
-                    for child in &mut self.children {
-                        child.prepaint(window, cx);
+            |style, scroll_offset, hitbox, window, cx| {
+                // skip children
+                if style.display == Display::None {
+                    return hitbox;
+                }
+
+                window.with_image_cache(image_cache, |window| {
+                    window.with_element_offset(scroll_offset, |window| {
+                        if let Some(order_fn) = &self.prepaint_order_fn {
+                            let order = order_fn(window, cx);
+                            for idx in order {
+                                if let Some(child) = self.children.get_mut(idx) {
+                                    child.prepaint(window, cx);
+                                }
+                            }
+                        } else {
+                            for child in &mut self.children {
+                                child.prepaint(window, cx);
+                            }
+                        }
+                    });
+
+                    if let Some(listener) = self.prepaint_listener.as_ref() {
+                        listener(children_bounds, window, cx);
                     }
                 });
-
-                if let Some(listener) = self.prepaint_listener.as_ref() {
-                    listener(children_bounds, window, cx);
-                }
 
                 hitbox
             },
         )
     }
 
+    #[stacksafe]
     fn paint(
         &mut self,
         global_id: Option<&GlobalElementId>,
@@ -1394,7 +1581,12 @@ impl Element for Div {
                 hitbox.as_ref(),
                 window,
                 cx,
-                |_style, window, cx| {
+                |style, window, cx| {
+                    // skip children
+                    if style.display == Display::None {
+                        return;
+                    }
+
                     for child in &mut self.children {
                         child.paint(window, cx);
                     }
@@ -1437,6 +1629,7 @@ pub struct Interactivity {
     pub base_style: Box<StyleRefinement>,
     pub(crate) focus_style: Option<Box<StyleRefinement>>,
     pub(crate) in_focus_style: Option<Box<StyleRefinement>>,
+    pub(crate) focus_visible_style: Option<Box<StyleRefinement>>,
     pub(crate) hover_style: Option<Box<StyleRefinement>>,
     pub(crate) group_hover_style: Option<GroupStyle>,
     pub(crate) active_style: Option<Box<StyleRefinement>>,
@@ -1448,6 +1641,7 @@ pub struct Interactivity {
     pub(crate) group_drag_over_styles: Vec<(TypeId, GroupStyle)>,
     pub(crate) mouse_down_listeners: Vec<MouseDownListener>,
     pub(crate) mouse_up_listeners: Vec<MouseUpListener>,
+    pub(crate) mouse_pressure_listeners: Vec<MousePressureListener>,
     pub(crate) mouse_move_listeners: Vec<MouseMoveListener>,
     pub(crate) scroll_wheel_listeners: Vec<ScrollWheelListener>,
     pub(crate) key_down_listeners: Vec<KeyDownListener>,
@@ -1457,11 +1651,15 @@ pub struct Interactivity {
     pub(crate) drop_listeners: Vec<(TypeId, DropListener)>,
     pub(crate) can_drop_predicate: Option<CanDropPredicate>,
     pub(crate) click_listeners: Vec<ClickListener>,
+    pub(crate) aux_click_listeners: Vec<ClickListener>,
     pub(crate) drag_listener: Option<(Arc<dyn Any>, DragListener)>,
     pub(crate) hover_listener: Option<Box<dyn Fn(&bool, &mut Window, &mut App)>>,
     pub(crate) tooltip_builder: Option<TooltipBuilder>,
     pub(crate) window_control: Option<WindowControlArea>,
     pub(crate) hitbox_behavior: HitboxBehavior,
+    pub(crate) tab_index: Option<isize>,
+    pub(crate) tab_group: bool,
+    pub(crate) tab_stop: bool,
 
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) source_location: Option<&'static core::panic::Location<'static>>,
@@ -1503,15 +1701,14 @@ impl Interactivity {
                 let mut element_state =
                     element_state.map(|element_state| element_state.unwrap_or_default());
 
-                if let Some(element_state) = element_state.as_ref() {
-                    if cx.has_active_drag() {
-                        if let Some(pending_mouse_down) = element_state.pending_mouse_down.as_ref()
-                        {
-                            *pending_mouse_down.borrow_mut() = None;
-                        }
-                        if let Some(clicked_state) = element_state.clicked_state.as_ref() {
-                            *clicked_state.borrow_mut() = ElementClickedState::default();
-                        }
+                if let Some(element_state) = element_state.as_ref()
+                    && cx.has_active_drag()
+                {
+                    if let Some(pending_mouse_down) = element_state.pending_mouse_down.as_ref() {
+                        *pending_mouse_down.borrow_mut() = None;
+                    }
+                    if let Some(clicked_state) = element_state.clicked_state.as_ref() {
+                        *clicked_state.borrow_mut() = ElementClickedState::default();
                     }
                 }
 
@@ -1519,30 +1716,35 @@ impl Interactivity {
                 // If there's an explicit focus handle we're tracking, use that. Otherwise
                 // create a new handle and store it in the element state, which lives for as
                 // as frames contain an element with this id.
-                if self.focusable && self.tracked_focus_handle.is_none() {
-                    if let Some(element_state) = element_state.as_mut() {
-                        self.tracked_focus_handle = Some(
-                            element_state
-                                .focus_handle
-                                .get_or_insert_with(|| cx.focus_handle())
-                                .clone(),
-                        );
+                if self.focusable
+                    && self.tracked_focus_handle.is_none()
+                    && let Some(element_state) = element_state.as_mut()
+                {
+                    let mut handle = element_state
+                        .focus_handle
+                        .get_or_insert_with(|| cx.focus_handle())
+                        .clone()
+                        .tab_stop(self.tab_stop);
+
+                    if let Some(index) = self.tab_index {
+                        handle = handle.tab_index(index);
                     }
+
+                    self.tracked_focus_handle = Some(handle);
                 }
 
                 if let Some(scroll_handle) = self.tracked_scroll_handle.as_ref() {
                     self.scroll_offset = Some(scroll_handle.0.borrow().offset.clone());
-                } else if self.base_style.overflow.x == Some(Overflow::Scroll)
-                    || self.base_style.overflow.y == Some(Overflow::Scroll)
+                } else if (self.base_style.overflow.x == Some(Overflow::Scroll)
+                    || self.base_style.overflow.y == Some(Overflow::Scroll))
+                    && let Some(element_state) = element_state.as_mut()
                 {
-                    if let Some(element_state) = element_state.as_mut() {
-                        self.scroll_offset = Some(
-                            element_state
-                                .scroll_offset
-                                .get_or_insert_with(Rc::default)
-                                .clone(),
-                        );
-                    }
+                    self.scroll_offset = Some(
+                        element_state
+                            .scroll_offset
+                            .get_or_insert_with(Rc::default)
+                            .clone(),
+                    );
                 }
 
                 let style = self.compute_style_internal(None, element_state.as_mut(), window, cx);
@@ -1592,6 +1794,11 @@ impl Interactivity {
                         let clicked_state = clicked_state.borrow();
                         self.active = Some(clicked_state.element);
                     }
+                    if self.hover_style.is_some() || self.group_hover_style.is_some() {
+                        element_state
+                            .hover_state
+                            .get_or_insert_with(Default::default);
+                    }
                     if let Some(active_tooltip) = element_state.active_tooltip.as_ref() {
                         if self.tooltip_builder.is_some() {
                             self.tooltip_id = set_tooltip_on_window(active_tooltip, window);
@@ -1634,9 +1841,11 @@ impl Interactivity {
             || self.group_hover_style.is_some()
             || self.hover_listener.is_some()
             || !self.mouse_up_listeners.is_empty()
+            || !self.mouse_pressure_listeners.is_empty()
             || !self.mouse_down_listeners.is_empty()
             || !self.mouse_move_listeners.is_empty()
             || !self.click_listeners.is_empty()
+            || !self.aux_click_listeners.is_empty()
             || !self.scroll_wheel_listeners.is_empty()
             || self.drag_listener.is_some()
             || !self.drop_listeners.is_empty()
@@ -1651,6 +1860,11 @@ impl Interactivity {
         window: &mut Window,
         _cx: &mut App,
     ) -> Point<Pixels> {
+        fn round_to_two_decimals(pixels: Pixels) -> Pixels {
+            const ROUNDING_FACTOR: f32 = 100.0;
+            (pixels * ROUNDING_FACTOR).round() / ROUNDING_FACTOR
+        }
+
         if let Some(scroll_offset) = self.scroll_offset.as_ref() {
             let mut scroll_to_bottom = false;
             let mut tracked_scroll_handle = self
@@ -1665,21 +1879,30 @@ impl Interactivity {
             let rem_size = window.rem_size();
             let padding = style.padding.to_pixels(bounds.size.into(), rem_size);
             let padding_size = size(padding.left + padding.right, padding.top + padding.bottom);
+            // The floating point values produced by Taffy and ours often vary
+            // slightly after ~5 decimal places. This can lead to cases where after
+            // subtracting these, the container becomes scrollable for less than
+            // 0.00000x pixels. As we generally don't benefit from a precision that
+            // high for the maximum scroll, we round the scroll max to 2 decimal
+            // places here.
             let padded_content_size = self.content_size + padding_size;
-            let scroll_max = (padded_content_size - bounds.size).max(&Size::default());
+            let scroll_max = Point::from(padded_content_size - bounds.size)
+                .map(round_to_two_decimals)
+                .max(&Default::default());
             // Clamp scroll offset in case scroll max is smaller now (e.g., if children
             // were removed or the bounds became larger).
             let mut scroll_offset = scroll_offset.borrow_mut();
 
-            scroll_offset.x = scroll_offset.x.clamp(-scroll_max.width, px(0.));
+            scroll_offset.x = scroll_offset.x.clamp(-scroll_max.x, px(0.));
             if scroll_to_bottom {
-                scroll_offset.y = -scroll_max.height;
+                scroll_offset.y = -scroll_max.y;
             } else {
-                scroll_offset.y = scroll_offset.y.clamp(-scroll_max.height, px(0.));
+                scroll_offset.y = scroll_offset.y.clamp(-scroll_max.y, px(0.));
             }
 
             if let Some(mut scroll_handle_state) = tracked_scroll_handle {
-                scroll_handle_state.padded_content_size = padded_content_size;
+                scroll_handle_state.max_offset = scroll_max;
+                scroll_handle_state.bounds = bounds;
             }
 
             *scroll_offset
@@ -1729,61 +1952,73 @@ impl Interactivity {
                     return ((), element_state);
                 }
 
+                let mut tab_group = None;
+                if self.tab_group {
+                    tab_group = self.tab_index;
+                }
+                if let Some(focus_handle) = &self.tracked_focus_handle {
+                    window.next_frame.tab_stops.insert(focus_handle);
+                }
+
                 window.with_element_opacity(style.opacity, |window| {
                     style.paint(bounds, window, cx, |window: &mut Window, cx: &mut App| {
                         window.with_text_style(style.text_style().cloned(), |window| {
                             window.with_content_mask(
                                 style.overflow_mask(bounds, window.rem_size()),
                                 |window| {
-                                    if let Some(hitbox) = hitbox {
-                                        #[cfg(debug_assertions)]
-                                        self.paint_debug_info(
-                                            global_id, hitbox, &style, window, cx,
-                                        );
+                                    window.with_tab_group(tab_group, |window| {
+                                        if let Some(hitbox) = hitbox {
+                                            #[cfg(debug_assertions)]
+                                            self.paint_debug_info(
+                                                global_id, hitbox, &style, window, cx,
+                                            );
 
-                                        if let Some(drag) = cx.active_drag.as_ref() {
-                                            if let Some(mouse_cursor) = drag.cursor_style {
-                                                window.set_window_cursor_style(mouse_cursor);
+                                            if let Some(drag) = cx.active_drag.as_ref() {
+                                                if let Some(mouse_cursor) = drag.cursor_style {
+                                                    window.set_window_cursor_style(mouse_cursor);
+                                                }
+                                            } else {
+                                                if let Some(mouse_cursor) = style.mouse_cursor {
+                                                    window.set_cursor_style(mouse_cursor, hitbox);
+                                                }
                                             }
-                                        } else {
-                                            if let Some(mouse_cursor) = style.mouse_cursor {
-                                                window.set_cursor_style(mouse_cursor, hitbox);
+
+                                            if let Some(group) = self.group.clone() {
+                                                GroupHitboxes::push(group, hitbox.id, cx);
+                                            }
+
+                                            if let Some(area) = self.window_control {
+                                                window.insert_window_control_hitbox(
+                                                    area,
+                                                    hitbox.clone(),
+                                                );
+                                            }
+
+                                            self.paint_mouse_listeners(
+                                                hitbox,
+                                                element_state.as_mut(),
+                                                window,
+                                                cx,
+                                            );
+                                            self.paint_scroll_listener(hitbox, &style, window, cx);
+                                        }
+
+                                        self.paint_keyboard_listeners(window, cx);
+                                        f(&style, window, cx);
+
+                                        if let Some(_hitbox) = hitbox {
+                                            #[cfg(any(feature = "inspector", debug_assertions))]
+                                            window.insert_inspector_hitbox(
+                                                _hitbox.id,
+                                                _inspector_id,
+                                                cx,
+                                            );
+
+                                            if let Some(group) = self.group.as_ref() {
+                                                GroupHitboxes::pop(group, cx);
                                             }
                                         }
-
-                                        if let Some(group) = self.group.clone() {
-                                            GroupHitboxes::push(group, hitbox.id, cx);
-                                        }
-
-                                        if let Some(area) = self.window_control {
-                                            window
-                                                .insert_window_control_hitbox(area, hitbox.clone());
-                                        }
-
-                                        self.paint_mouse_listeners(
-                                            hitbox,
-                                            element_state.as_mut(),
-                                            window,
-                                            cx,
-                                        );
-                                        self.paint_scroll_listener(hitbox, &style, window, cx);
-                                    }
-
-                                    self.paint_keyboard_listeners(window, cx);
-                                    f(&style, window, cx);
-
-                                    if let Some(_hitbox) = hitbox {
-                                        #[cfg(any(feature = "inspector", debug_assertions))]
-                                        window.insert_inspector_hitbox(
-                                            _hitbox.id,
-                                            _inspector_id,
-                                            cx,
-                                        );
-
-                                        if let Some(group) = self.group.as_ref() {
-                                            GroupHitboxes::pop(group, cx);
-                                        }
-                                    }
+                                    })
                                 },
                             );
                         });
@@ -1806,12 +2041,12 @@ impl Interactivity {
     ) {
         use crate::{BorderStyle, TextAlign};
 
-        if global_id.is_some()
+        if let Some(global_id) = global_id
             && (style.debug || style.debug_below || cx.has_global::<crate::DebugBelow>())
             && hitbox.is_hovered(window)
         {
             const FONT_SIZE: crate::Pixels = crate::Pixels(10.);
-            let element_id = format!("{:?}", global_id.unwrap());
+            let element_id = format!("{global_id:?}");
             let str_len = element_id.len();
 
             let render_debug_text = |window: &mut Window| {
@@ -1834,7 +2069,7 @@ impl Interactivity {
                         origin: hitbox.origin,
                         size: text.size(FONT_SIZE),
                     };
-                    if self.source_location.is_some()
+                    if let Some(source_location) = self.source_location
                         && text_bounds.contains(&window.mouse_position())
                         && window.modifiers().secondary()
                     {
@@ -1865,7 +2100,6 @@ impl Interactivity {
 
                         window.on_mouse_event({
                             let hitbox = hitbox.clone();
-                            let location = self.source_location.unwrap();
                             move |e: &crate::MouseDownEvent, phase, window, cx| {
                                 if text_bounds.contains(&e.position)
                                     && phase.capture()
@@ -1878,9 +2112,9 @@ impl Interactivity {
 
                                     eprintln!(
                                         "This element was created at:\n{}:{}:{}",
-                                        dir.join(location.file()).to_string_lossy(),
-                                        location.line(),
-                                        location.column()
+                                        dir.join(source_location.file()).to_string_lossy(),
+                                        source_location.line(),
+                                        source_location.column()
                                     );
                                 }
                             }
@@ -1920,17 +2154,23 @@ impl Interactivity {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let is_focused = self
+            .tracked_focus_handle
+            .as_ref()
+            .map(|handle| handle.is_focused(window))
+            .unwrap_or(false);
+
         // If this element can be focused, register a mouse down listener
         // that will automatically transfer focus when hitting the element.
         // This behavior can be suppressed by using `cx.prevent_default()`.
         if let Some(focus_handle) = self.tracked_focus_handle.clone() {
             let hitbox = hitbox.clone();
-            window.on_mouse_event(move |_: &MouseDownEvent, phase, window, _| {
+            window.on_mouse_event(move |_: &MouseDownEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble
                     && hitbox.is_hovered(window)
                     && !window.default_prevented()
                 {
-                    window.focus(&focus_handle);
+                    window.focus(&focus_handle, cx);
                     // If there is a parent that is also focusable, prevent it
                     // from transferring focus because we already did so.
                     window.prevent_default();
@@ -1948,6 +2188,13 @@ impl Interactivity {
         for listener in self.mouse_up_listeners.drain(..) {
             let hitbox = hitbox.clone();
             window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+                listener(event, phase, &hitbox, window, cx);
+            })
+        }
+
+        for listener in self.mouse_pressure_listeners.drain(..) {
+            let hitbox = hitbox.clone();
+            window.on_mouse_event(move |event: &MousePressureEvent, phase, window, cx| {
                 listener(event, phase, &hitbox, window, cx);
             })
         }
@@ -1971,46 +2218,84 @@ impl Interactivity {
             || cx.active_drag.is_some() && !self.drag_over_styles.is_empty()
         {
             let hitbox = hitbox.clone();
-            let was_hovered = hitbox.is_hovered(window);
+            let hover_state = self.hover_style.as_ref().and_then(|_| {
+                element_state
+                    .as_ref()
+                    .and_then(|state| state.hover_state.as_ref())
+                    .cloned()
+            });
             let current_view = window.current_view();
+
             window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
                 let hovered = hitbox.is_hovered(window);
+                let was_hovered = hover_state
+                    .as_ref()
+                    .is_some_and(|state| state.borrow().element);
                 if phase == DispatchPhase::Capture && hovered != was_hovered {
-                    cx.notify(current_view);
+                    if let Some(hover_state) = &hover_state {
+                        hover_state.borrow_mut().element = hovered;
+                        cx.notify(current_view);
+                    }
                 }
             });
         }
+
+        if let Some(group_hover) = self.group_hover_style.as_ref() {
+            if let Some(group_hitbox_id) = GroupHitboxes::get(&group_hover.group, cx) {
+                let hover_state = element_state
+                    .as_ref()
+                    .and_then(|element| element.hover_state.as_ref())
+                    .cloned();
+                let current_view = window.current_view();
+
+                window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
+                    let group_hovered = group_hitbox_id.is_hovered(window);
+                    let was_group_hovered = hover_state
+                        .as_ref()
+                        .is_some_and(|state| state.borrow().group);
+                    if phase == DispatchPhase::Capture && group_hovered != was_group_hovered {
+                        if let Some(hover_state) = &hover_state {
+                            hover_state.borrow_mut().group = group_hovered;
+                        }
+                        cx.notify(current_view);
+                    }
+                });
+            }
+        }
+
         let drag_cursor_style = self.base_style.as_ref().mouse_cursor;
 
         let mut drag_listener = mem::take(&mut self.drag_listener);
         let drop_listeners = mem::take(&mut self.drop_listeners);
         let click_listeners = mem::take(&mut self.click_listeners);
+        let aux_click_listeners = mem::take(&mut self.aux_click_listeners);
         let can_drop_predicate = mem::take(&mut self.can_drop_predicate);
 
         if !drop_listeners.is_empty() {
             let hitbox = hitbox.clone();
             window.on_mouse_event({
                 move |_: &MouseUpEvent, phase, window, cx| {
-                    if let Some(drag) = &cx.active_drag {
-                        if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
-                            let drag_state_type = drag.value.as_ref().type_id();
-                            for (drop_state_type, listener) in &drop_listeners {
-                                if *drop_state_type == drag_state_type {
-                                    let drag = cx
-                                        .active_drag
-                                        .take()
-                                        .expect("checked for type drag state type above");
+                    if let Some(drag) = &cx.active_drag
+                        && phase == DispatchPhase::Bubble
+                        && hitbox.is_hovered(window)
+                    {
+                        let drag_state_type = drag.value.as_ref().type_id();
+                        for (drop_state_type, listener) in &drop_listeners {
+                            if *drop_state_type == drag_state_type {
+                                let drag = cx
+                                    .active_drag
+                                    .take()
+                                    .expect("checked for type drag state type above");
 
-                                    let mut can_drop = true;
-                                    if let Some(predicate) = &can_drop_predicate {
-                                        can_drop = predicate(drag.value.as_ref(), window, cx);
-                                    }
+                                let mut can_drop = true;
+                                if let Some(predicate) = &can_drop_predicate {
+                                    can_drop = predicate(drag.value.as_ref(), window, cx);
+                                }
 
-                                    if can_drop {
-                                        listener(drag.value.as_ref(), window, cx);
-                                        window.refresh();
-                                        cx.stop_propagation();
-                                    }
+                                if can_drop {
+                                    listener(drag.value.as_ref(), window, cx);
+                                    window.refresh();
+                                    cx.stop_propagation();
                                 }
                             }
                         }
@@ -2020,7 +2305,10 @@ impl Interactivity {
         }
 
         if let Some(element_state) = element_state {
-            if !click_listeners.is_empty() || drag_listener.is_some() {
+            if !click_listeners.is_empty()
+                || !aux_click_listeners.is_empty()
+                || drag_listener.is_some()
+            {
                 let pending_mouse_down = element_state
                     .pending_mouse_down
                     .get_or_insert_with(Default::default)
@@ -2034,9 +2322,10 @@ impl Interactivity {
                 window.on_mouse_event({
                     let pending_mouse_down = pending_mouse_down.clone();
                     let hitbox = hitbox.clone();
+                    let has_aux_click_listeners = !aux_click_listeners.is_empty();
                     move |event: &MouseDownEvent, phase, window, _cx| {
                         if phase == DispatchPhase::Bubble
-                            && event.button == MouseButton::Left
+                            && (event.button == MouseButton::Left || has_aux_click_listeners)
                             && hitbox.is_hovered(window)
                         {
                             *pending_mouse_down.borrow_mut() = Some(event.clone());
@@ -2054,34 +2343,61 @@ impl Interactivity {
                         }
 
                         let mut pending_mouse_down = pending_mouse_down.borrow_mut();
-                        if let Some(mouse_down) = pending_mouse_down.clone() {
-                            if !cx.has_active_drag()
-                                && (event.position - mouse_down.position).magnitude()
-                                    > DRAG_THRESHOLD
-                            {
-                                if let Some((drag_value, drag_listener)) = drag_listener.take() {
-                                    *clicked_state.borrow_mut() = ElementClickedState::default();
-                                    let cursor_offset = event.position - hitbox.origin;
-                                    let drag = (drag_listener)(
-                                        drag_value.as_ref(),
-                                        cursor_offset,
-                                        window,
-                                        cx,
-                                    );
-                                    cx.active_drag = Some(AnyDrag {
-                                        view: drag,
-                                        value: drag_value,
-                                        cursor_offset,
-                                        cursor_style: drag_cursor_style,
-                                    });
-                                    pending_mouse_down.take();
-                                    window.refresh();
-                                    cx.stop_propagation();
-                                }
-                            }
+                        if let Some(mouse_down) = pending_mouse_down.clone()
+                            && !cx.has_active_drag()
+                            && (event.position - mouse_down.position).magnitude() > DRAG_THRESHOLD
+                            && let Some((drag_value, drag_listener)) = drag_listener.take()
+                            && mouse_down.button == MouseButton::Left
+                        {
+                            *clicked_state.borrow_mut() = ElementClickedState::default();
+                            let cursor_offset = event.position - hitbox.origin;
+                            let drag =
+                                (drag_listener)(drag_value.as_ref(), cursor_offset, window, cx);
+                            cx.active_drag = Some(AnyDrag {
+                                view: drag,
+                                value: drag_value,
+                                cursor_offset,
+                                cursor_style: drag_cursor_style,
+                            });
+                            pending_mouse_down.take();
+                            window.refresh();
+                            cx.stop_propagation();
                         }
                     }
                 });
+
+                if is_focused {
+                    // Press enter, space to trigger click, when the element is focused.
+                    window.on_key_event({
+                        let click_listeners = click_listeners.clone();
+                        let hitbox = hitbox.clone();
+                        move |event: &KeyUpEvent, phase, window, cx| {
+                            if phase.bubble() && !window.default_prevented() {
+                                let stroke = &event.keystroke;
+                                let keyboard_button = if stroke.key.eq("enter") {
+                                    Some(KeyboardButton::Enter)
+                                } else if stroke.key.eq("space") {
+                                    Some(KeyboardButton::Space)
+                                } else {
+                                    None
+                                };
+
+                                if let Some(button) = keyboard_button
+                                    && !stroke.modifiers.modified()
+                                {
+                                    let click_event = ClickEvent::Keyboard(KeyboardClickEvent {
+                                        button,
+                                        bounds: hitbox.bounds,
+                                    });
+
+                                    for listener in &click_listeners {
+                                        listener(&click_event, window, cx);
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
 
                 window.on_mouse_event({
                     let mut captured_mouse_down = None;
@@ -2108,12 +2424,24 @@ impl Interactivity {
                         // Fire click handlers during the bubble phase.
                         DispatchPhase::Bubble => {
                             if let Some(mouse_down) = captured_mouse_down.take() {
-                                let mouse_click = ClickEvent {
+                                let btn = mouse_down.button;
+
+                                let mouse_click = ClickEvent::Mouse(MouseClickEvent {
                                     down: mouse_down,
                                     up: event.clone(),
-                                };
-                                for listener in &click_listeners {
-                                    listener(&mouse_click, window, cx);
+                                });
+
+                                match btn {
+                                    MouseButton::Left => {
+                                        for listener in &click_listeners {
+                                            listener(&mouse_click, window, cx);
+                                        }
+                                    }
+                                    _ => {
+                                        for listener in &aux_click_listeners {
+                                            listener(&mouse_click, window, cx);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2124,7 +2452,7 @@ impl Interactivity {
             if let Some(hover_listener) = self.hover_listener.take() {
                 let hitbox = hitbox.clone();
                 let was_hovered = element_state
-                    .hover_state
+                    .hover_listener_state
                     .get_or_insert_with(Default::default)
                     .clone();
                 let has_mouse_down = element_state
@@ -2189,18 +2517,24 @@ impl Interactivity {
                 );
             }
 
+            // We unconditionally bind both the mouse up and mouse down active state handlers
+            // Because we might not get a chance to render a frame before the mouse up event arrives.
             let active_state = element_state
                 .clicked_state
                 .get_or_insert_with(Default::default)
                 .clone();
-            if active_state.borrow().is_clicked() {
+
+            {
+                let active_state = active_state.clone();
                 window.on_mouse_event(move |_: &MouseUpEvent, phase, window, _cx| {
-                    if phase == DispatchPhase::Capture {
+                    if phase == DispatchPhase::Capture && active_state.borrow().is_clicked() {
                         *active_state.borrow_mut() = ElementClickedState::default();
                         window.refresh();
                     }
                 });
-            } else {
+            }
+
+            {
                 let active_group_hitbox = self
                     .group_active_style
                     .as_ref()
@@ -2209,7 +2543,7 @@ impl Interactivity {
                 window.on_mouse_event(move |_: &MouseDownEvent, phase, window, _cx| {
                     if phase == DispatchPhase::Bubble && !window.default_prevented() {
                         let group_hovered = active_group_hitbox
-                            .map_or(false, |group_hitbox_id| group_hitbox_id.is_hovered(window));
+                            .is_some_and(|group_hitbox_id| group_hitbox_id.is_hovered(window));
                         let element_hovered = hitbox.is_hovered(window);
                         if group_hovered || element_hovered {
                             *active_state.borrow_mut() = ElementClickedState {
@@ -2355,36 +2689,66 @@ impl Interactivity {
         style.refine(&self.base_style);
 
         if let Some(focus_handle) = self.tracked_focus_handle.as_ref() {
-            if let Some(in_focus_style) = self.in_focus_style.as_ref() {
-                if focus_handle.within_focused(window, cx) {
-                    style.refine(in_focus_style);
+            if let Some(in_focus_style) = self.in_focus_style.as_ref()
+                && focus_handle.within_focused(window, cx)
+            {
+                style.refine(in_focus_style);
+            }
+
+            if let Some(focus_style) = self.focus_style.as_ref()
+                && focus_handle.is_focused(window)
+            {
+                style.refine(focus_style);
+            }
+
+            if let Some(focus_visible_style) = self.focus_visible_style.as_ref()
+                && focus_handle.is_focused(window)
+                && window.last_input_was_keyboard()
+            {
+                style.refine(focus_visible_style);
+            }
+        }
+
+        if !cx.has_active_drag() {
+            if let Some(group_hover) = self.group_hover_style.as_ref() {
+                let is_group_hovered =
+                    if let Some(group_hitbox_id) = GroupHitboxes::get(&group_hover.group, cx) {
+                        group_hitbox_id.is_hovered(window)
+                    } else if let Some(element_state) = element_state.as_ref() {
+                        element_state
+                            .hover_state
+                            .as_ref()
+                            .map(|state| state.borrow().group)
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
+
+                if is_group_hovered {
+                    style.refine(&group_hover.style);
                 }
             }
 
-            if let Some(focus_style) = self.focus_style.as_ref() {
-                if focus_handle.is_focused(window) {
-                    style.refine(focus_style);
+            if let Some(hover_style) = self.hover_style.as_ref() {
+                let is_hovered = if let Some(hitbox) = hitbox {
+                    hitbox.is_hovered(window)
+                } else if let Some(element_state) = element_state.as_ref() {
+                    element_state
+                        .hover_state
+                        .as_ref()
+                        .map(|state| state.borrow().element)
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+
+                if is_hovered {
+                    style.refine(hover_style);
                 }
             }
         }
 
         if let Some(hitbox) = hitbox {
-            if !cx.has_active_drag() {
-                if let Some(group_hover) = self.group_hover_style.as_ref() {
-                    if let Some(group_hitbox_id) = GroupHitboxes::get(&group_hover.group, cx) {
-                        if group_hitbox_id.is_hovered(window) {
-                            style.refine(&group_hover.style);
-                        }
-                    }
-                }
-
-                if let Some(hover_style) = self.hover_style.as_ref() {
-                    if hitbox.is_hovered(window) {
-                        style.refine(hover_style);
-                    }
-                }
-            }
-
             if let Some(drag) = cx.active_drag.take() {
                 let mut can_drop = true;
                 if let Some(can_drop_predicate) = &self.can_drop_predicate {
@@ -2395,12 +2759,10 @@ impl Interactivity {
                     for (state_type, group_drag_style) in &self.group_drag_over_styles {
                         if let Some(group_hitbox_id) =
                             GroupHitboxes::get(&group_drag_style.group, cx)
+                            && *state_type == drag.value.as_ref().type_id()
+                            && group_hitbox_id.is_hovered(window)
                         {
-                            if *state_type == drag.value.as_ref().type_id()
-                                && group_hitbox_id.is_hovered(window)
-                            {
-                                style.refine(&group_drag_style.style);
-                            }
+                            style.refine(&group_drag_style.style);
                         }
                     }
 
@@ -2422,16 +2784,16 @@ impl Interactivity {
                 .clicked_state
                 .get_or_insert_with(Default::default)
                 .borrow();
-            if clicked_state.group {
-                if let Some(group) = self.group_active_style.as_ref() {
-                    style.refine(&group.style)
-                }
+            if clicked_state.group
+                && let Some(group) = self.group_active_style.as_ref()
+            {
+                style.refine(&group.style)
             }
 
-            if let Some(active_style) = self.active_style.as_ref() {
-                if clicked_state.element {
-                    style.refine(active_style)
-                }
+            if let Some(active_style) = self.active_style.as_ref()
+                && clicked_state.element
+            {
+                style.refine(active_style)
             }
         }
 
@@ -2445,7 +2807,8 @@ impl Interactivity {
 pub struct InteractiveElementState {
     pub(crate) focus_handle: Option<FocusHandle>,
     pub(crate) clicked_state: Option<Rc<RefCell<ElementClickedState>>>,
-    pub(crate) hover_state: Option<Rc<RefCell<bool>>>,
+    pub(crate) hover_state: Option<Rc<RefCell<ElementHoverState>>>,
+    pub(crate) hover_listener_state: Option<Rc<RefCell<bool>>>,
     pub(crate) pending_mouse_down: Option<Rc<RefCell<Option<MouseDownEvent>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
@@ -2465,6 +2828,16 @@ impl ElementClickedState {
     fn is_clicked(&self) -> bool {
         self.group || self.element
     }
+}
+
+/// Whether or not the element or a group that contains it is hovered.
+#[derive(Copy, Clone, Default, Eq, PartialEq)]
+pub struct ElementHoverState {
+    /// True if this element's group is hovered, false otherwise
+    pub group: bool,
+
+    /// True if this element is hovered, false otherwise
+    pub element: bool,
 }
 
 pub(crate) enum ActiveTooltip {
@@ -2552,7 +2925,7 @@ pub(crate) fn register_tooltip_mouse_handlers(
     window.on_mouse_event({
         let active_tooltip = active_tooltip.clone();
         move |_: &MouseDownEvent, _phase, window: &mut Window, _cx| {
-            if !tooltip_id.map_or(false, |tooltip_id| tooltip_id.is_hovered(window)) {
+            if !tooltip_id.is_some_and(|tooltip_id| tooltip_id.is_hovered(window)) {
                 clear_active_tooltip_if_not_hoverable(&active_tooltip, window);
             }
         }
@@ -2561,7 +2934,7 @@ pub(crate) fn register_tooltip_mouse_handlers(
     window.on_mouse_event({
         let active_tooltip = active_tooltip.clone();
         move |_: &ScrollWheelEvent, _phase, window: &mut Window, _cx| {
-            if !tooltip_id.map_or(false, |tooltip_id| tooltip_id.is_hovered(window)) {
+            if !tooltip_id.is_some_and(|tooltip_id| tooltip_id.is_hovered(window)) {
                 clear_active_tooltip_if_not_hoverable(&active_tooltip, window);
             }
         }
@@ -2717,7 +3090,7 @@ fn handle_tooltip_check_visible_and_update(
 
     match action {
         Action::None => {}
-        Action::Hide => clear_active_tooltip(&active_tooltip, window),
+        Action::Hide => clear_active_tooltip(active_tooltip, window),
         Action::ScheduleHide(tooltip) => {
             let delayed_hide_task = window.spawn(cx, {
                 let active_tooltip = active_tooltip.clone();
@@ -2887,8 +3260,7 @@ where
 }
 
 /// Represents an element that can be scrolled *to* in its parent element.
-///
-/// Contrary to [ScrollHandle::scroll_to_item], an anchored element does not have to be an immediate child of the parent.
+/// Contrary to [ScrollHandle::scroll_to_active_item], an anchored element does not have to be an immediate child of the parent.
 #[derive(Clone)]
 pub struct ScrollAnchor {
     handle: ScrollHandle,
@@ -2919,10 +3291,24 @@ impl ScrollAnchor {
 struct ScrollHandleState {
     offset: Rc<RefCell<Point<Pixels>>>,
     bounds: Bounds<Pixels>,
-    padded_content_size: Size<Pixels>,
+    max_offset: Point<Pixels>,
     child_bounds: Vec<Bounds<Pixels>>,
     scroll_to_bottom: bool,
     overflow: Point<Overflow>,
+    active_item: Option<ScrollActiveItem>,
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+struct ScrollActiveItem {
+    index: usize,
+    strategy: ScrollStrategy,
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+enum ScrollStrategy {
+    #[default]
+    FirstVisible,
+    Top,
 }
 
 /// A handle to the scrollable aspects of an element.
@@ -2948,6 +3334,11 @@ impl ScrollHandle {
         *self.0.borrow().offset.borrow()
     }
 
+    /// Get the maximum scroll offset.
+    pub fn max_offset(&self) -> Point<Pixels> {
+        self.0.borrow().max_offset
+    }
+
     /// Get the top child that's scrolled into view.
     pub fn top_item(&self) -> usize {
         let state = self.0.borrow();
@@ -2967,14 +3358,28 @@ impl ScrollHandle {
         }
     }
 
+    /// Get the bottom child that's scrolled into view.
+    pub fn bottom_item(&self) -> usize {
+        let state = self.0.borrow();
+        let bottom = state.bounds.bottom() - state.offset.borrow().y;
+
+        match state.child_bounds.binary_search_by(|bounds| {
+            if bottom < bounds.top() {
+                Ordering::Greater
+            } else if bottom > bounds.bottom() {
+                Ordering::Less
+            } else {
+                Ordering::Equal
+            }
+        }) {
+            Ok(ix) => ix,
+            Err(ix) => ix.min(state.child_bounds.len().saturating_sub(1)),
+        }
+    }
+
     /// Return the bounds into which this child is painted
     pub fn bounds(&self) -> Bounds<Pixels> {
         self.0.borrow().bounds
-    }
-
-    /// Set the bounds into which this child is painted
-    pub(super) fn set_bounds(&self, bounds: Bounds<Pixels>) {
-        self.0.borrow_mut().bounds = bounds;
     }
 
     /// Get the bounds for a specific child.
@@ -2982,37 +3387,74 @@ impl ScrollHandle {
         self.0.borrow().child_bounds.get(ix).cloned()
     }
 
-    /// Get the size of the content with padding of the container.
-    pub fn padded_content_size(&self) -> Size<Pixels> {
-        self.0.borrow().padded_content_size
+    /// Update [ScrollHandleState]'s active item for scrolling to in prepaint
+    pub fn scroll_to_item(&self, ix: usize) {
+        let mut state = self.0.borrow_mut();
+        state.active_item = Some(ScrollActiveItem {
+            index: ix,
+            strategy: ScrollStrategy::default(),
+        });
     }
 
-    /// scroll_to_item scrolls the minimal amount to ensure that the child is
-    /// fully visible
-    pub fn scroll_to_item(&self, ix: usize) {
-        let state = self.0.borrow();
+    /// Update [ScrollHandleState]'s active item for scrolling to in prepaint
+    /// This scrolls the minimal amount to ensure that the child is the first visible element
+    pub fn scroll_to_top_of_item(&self, ix: usize) {
+        let mut state = self.0.borrow_mut();
+        state.active_item = Some(ScrollActiveItem {
+            index: ix,
+            strategy: ScrollStrategy::Top,
+        });
+    }
 
-        let Some(bounds) = state.child_bounds.get(ix) else {
+    /// Scrolls the minimal amount to either ensure that the child is
+    /// fully visible or the top element of the view depends on the
+    /// scroll strategy
+    fn scroll_to_active_item(&self) {
+        let mut state = self.0.borrow_mut();
+
+        let Some(active_item) = state.active_item else {
             return;
         };
 
-        let mut scroll_offset = state.offset.borrow_mut();
+        let active_item = match state.child_bounds.get(active_item.index) {
+            Some(bounds) => {
+                let mut scroll_offset = state.offset.borrow_mut();
 
-        if state.overflow.y == Overflow::Scroll {
-            if bounds.top() + scroll_offset.y < state.bounds.top() {
-                scroll_offset.y = state.bounds.top() - bounds.top();
-            } else if bounds.bottom() + scroll_offset.y > state.bounds.bottom() {
-                scroll_offset.y = state.bounds.bottom() - bounds.bottom();
-            }
-        }
+                match active_item.strategy {
+                    ScrollStrategy::FirstVisible => {
+                        if state.overflow.y == Overflow::Scroll {
+                            let child_height = bounds.size.height;
+                            let viewport_height = state.bounds.size.height;
+                            if child_height > viewport_height {
+                                scroll_offset.y = state.bounds.top() - bounds.top();
+                            } else if bounds.top() + scroll_offset.y < state.bounds.top() {
+                                scroll_offset.y = state.bounds.top() - bounds.top();
+                            } else if bounds.bottom() + scroll_offset.y > state.bounds.bottom() {
+                                scroll_offset.y = state.bounds.bottom() - bounds.bottom();
+                            }
+                        }
+                    }
+                    ScrollStrategy::Top => {
+                        scroll_offset.y = state.bounds.top() - bounds.top();
+                    }
+                }
 
-        if state.overflow.x == Overflow::Scroll {
-            if bounds.left() + scroll_offset.x < state.bounds.left() {
-                scroll_offset.x = state.bounds.left() - bounds.left();
-            } else if bounds.right() + scroll_offset.x > state.bounds.right() {
-                scroll_offset.x = state.bounds.right() - bounds.right();
+                if state.overflow.x == Overflow::Scroll {
+                    let child_width = bounds.size.width;
+                    let viewport_width = state.bounds.size.width;
+                    if child_width > viewport_width {
+                        scroll_offset.x = state.bounds.left() - bounds.left();
+                    } else if bounds.left() + scroll_offset.x < state.bounds.left() {
+                        scroll_offset.x = state.bounds.left() - bounds.left();
+                    } else if bounds.right() + scroll_offset.x > state.bounds.right() {
+                        scroll_offset.x = state.bounds.right() - bounds.right();
+                    }
+                }
+                None
             }
-        }
+            None => Some(active_item),
+        };
+        state.active_item = active_item;
     }
 
     /// Scrolls to the bottom.
@@ -3044,8 +3486,66 @@ impl ScrollHandle {
         }
     }
 
+    /// Get the logical scroll bottom, based on a child index and a pixel offset.
+    pub fn logical_scroll_bottom(&self) -> (usize, Pixels) {
+        let ix = self.bottom_item();
+        let state = self.0.borrow();
+
+        if let Some(child_bounds) = state.child_bounds.get(ix) {
+            (
+                ix,
+                child_bounds.bottom() + state.offset.borrow().y - state.bounds.bottom(),
+            )
+        } else {
+            (ix, px(0.))
+        }
+    }
+
     /// Get the count of children for scrollable item.
     pub fn children_count(&self) -> usize {
         self.0.borrow().child_bounds.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scroll_handle_aligns_wide_children_to_left_edge() {
+        let handle = ScrollHandle::new();
+        {
+            let mut state = handle.0.borrow_mut();
+            state.bounds = Bounds::new(point(px(0.), px(0.)), size(px(80.), px(20.)));
+            state.child_bounds = vec![Bounds::new(point(px(25.), px(0.)), size(px(200.), px(20.)))];
+            state.overflow.x = Overflow::Scroll;
+            state.active_item = Some(ScrollActiveItem {
+                index: 0,
+                strategy: ScrollStrategy::default(),
+            });
+        }
+
+        handle.scroll_to_active_item();
+
+        assert_eq!(handle.offset().x, px(-25.));
+    }
+
+    #[test]
+    fn scroll_handle_aligns_tall_children_to_top_edge() {
+        let handle = ScrollHandle::new();
+        {
+            let mut state = handle.0.borrow_mut();
+            state.bounds = Bounds::new(point(px(0.), px(0.)), size(px(20.), px(80.)));
+            state.child_bounds = vec![Bounds::new(point(px(0.), px(25.)), size(px(20.), px(200.)))];
+            state.overflow.y = Overflow::Scroll;
+            state.active_item = Some(ScrollActiveItem {
+                index: 0,
+                strategy: ScrollStrategy::default(),
+            });
+        }
+
+        handle.scroll_to_active_item();
+
+        assert_eq!(handle.offset().y, px(-25.));
     }
 }

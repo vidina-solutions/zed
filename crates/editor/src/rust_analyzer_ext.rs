@@ -22,10 +22,21 @@ use crate::{
 };
 
 fn is_rust_language(language: &Language) -> bool {
-    language.name() == "Rust".into()
+    language.name() == "Rust"
 }
 
 pub fn apply_related_actions(editor: &Entity<Editor>, window: &mut Window, cx: &mut App) {
+    if editor.read(cx).project().is_some_and(|project| {
+        project
+            .read(cx)
+            .language_server_statuses(cx)
+            .any(|(_, status)| status.name == RUST_ANALYZER_NAME)
+    }) {
+        register_action(editor, window, cancel_flycheck_action);
+        register_action(editor, window, run_flycheck_action);
+        register_action(editor, window, clear_flycheck_action);
+    }
+
     if editor
         .read(cx)
         .buffer()
@@ -35,12 +46,9 @@ pub fn apply_related_actions(editor: &Entity<Editor>, window: &mut Window, cx: &
         .filter_map(|buffer| buffer.read(cx).language())
         .any(|language| is_rust_language(language))
     {
-        register_action(&editor, window, go_to_parent_module);
-        register_action(&editor, window, expand_macro_recursively);
-        register_action(&editor, window, open_docs);
-        register_action(&editor, window, cancel_flycheck_action);
-        register_action(&editor, window, run_flycheck_action);
-        register_action(&editor, window, clear_flycheck_action);
+        register_action(editor, window, go_to_parent_module);
+        register_action(editor, window, expand_macro_recursively);
+        register_action(editor, window, open_docs);
     }
 }
 
@@ -57,23 +65,25 @@ pub fn go_to_parent_module(
         return;
     };
 
-    let server_lookup = find_specific_language_server_in_selection(
-        editor,
-        cx,
-        is_rust_language,
-        RUST_ANALYZER_NAME,
-    );
+    let Some((trigger_anchor, _, server_to_query, buffer)) =
+        find_specific_language_server_in_selection(
+            editor,
+            cx,
+            is_rust_language,
+            RUST_ANALYZER_NAME,
+        )
+    else {
+        return;
+    };
+
+    let nav_entry = editor.navigation_entry(editor.selections.newest_anchor().head(), cx);
 
     let project = project.clone();
     let lsp_store = project.read(cx).lsp_store();
     let upstream_client = lsp_store.read(cx).upstream_client();
     cx.spawn_in(window, async move |editor, cx| {
-        let Some((trigger_anchor, _, server_to_query, buffer)) = server_lookup.await else {
-            return anyhow::Ok(());
-        };
-
         let location_links = if let Some((client, project_id)) = upstream_client {
-            let buffer_id = buffer.read_with(cx, |buffer, _| buffer.remote_id())?;
+            let buffer_id = buffer.read_with(cx, |buffer, _| buffer.remote_id());
 
             let request = proto::LspExtGoToParentModule {
                 project_id,
@@ -95,7 +105,7 @@ pub fn go_to_parent_module(
             .collect::<anyhow::Result<_>>()
             .context("go to parent module via collab")?
         } else {
-            let buffer_snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot())?;
+            let buffer_snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
             let position = trigger_anchor.text_anchor.to_point_utf16(&buffer_snapshot);
             project
                 .update(cx, |project, cx| {
@@ -105,7 +115,7 @@ pub fn go_to_parent_module(
                         project::lsp_store::lsp_ext_command::GoToParentModule { position },
                         cx,
                     )
-                })?
+                })
                 .await
                 .context("go to parent module")?
         };
@@ -115,13 +125,14 @@ pub fn go_to_parent_module(
                 editor.navigate_to_hover_links(
                     Some(GotoDefinitionKind::Declaration),
                     location_links.into_iter().map(HoverLink::Text).collect(),
+                    nav_entry,
                     false,
                     window,
                     cx,
                 )
             })?
             .await?;
-        Ok(())
+        anyhow::Ok(())
     })
     .detach_and_log_err(cx);
 }
@@ -139,23 +150,21 @@ pub fn expand_macro_recursively(
         return;
     };
 
-    let server_lookup = find_specific_language_server_in_selection(
-        editor,
-        cx,
-        is_rust_language,
-        RUST_ANALYZER_NAME,
-    );
-
+    let Some((trigger_anchor, rust_language, server_to_query, buffer)) =
+        find_specific_language_server_in_selection(
+            editor,
+            cx,
+            is_rust_language,
+            RUST_ANALYZER_NAME,
+        )
+    else {
+        return;
+    };
     let project = project.clone();
     let upstream_client = project.read(cx).lsp_store().read(cx).upstream_client();
     cx.spawn_in(window, async move |_editor, cx| {
-        let Some((trigger_anchor, rust_language, server_to_query, buffer)) = server_lookup.await
-        else {
-            return Ok(());
-        };
-
         let macro_expansion = if let Some((client, project_id)) = upstream_client {
-            let buffer_id = buffer.update(cx, |buffer, _| buffer.remote_id())?;
+            let buffer_id = buffer.update(cx, |buffer, _| buffer.remote_id());
             let request = proto::LspExtExpandMacro {
                 project_id,
                 buffer_id: buffer_id.to_proto(),
@@ -170,7 +179,7 @@ pub fn expand_macro_recursively(
                 expansion: response.expansion,
             }
         } else {
-            let buffer_snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot())?;
+            let buffer_snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
             let position = trigger_anchor.text_anchor.to_point_utf16(&buffer_snapshot);
             project
                 .update(cx, |project, cx| {
@@ -180,7 +189,7 @@ pub fn expand_macro_recursively(
                         ExpandMacro { position },
                         cx,
                     )
-                })?
+                })
                 .await
                 .context("expand macro")?
         };
@@ -194,12 +203,13 @@ pub fn expand_macro_recursively(
         }
 
         let buffer = project
-            .update(cx, |project, cx| project.create_buffer(cx))?
+            .update(cx, |project, cx| {
+                project.create_buffer(Some(rust_language), false, cx)
+            })
             .await?;
         workspace.update_in(cx, |workspace, window, cx| {
             buffer.update(cx, |buffer, cx| {
                 buffer.set_text(macro_expansion.expansion, cx);
-                buffer.set_language(Some(rust_language), cx);
                 buffer.set_capability(Capability::ReadOnly, cx);
             });
             let multibuffer =
@@ -231,22 +241,22 @@ pub fn open_docs(editor: &mut Editor, _: &OpenDocs, window: &mut Window, cx: &mu
         return;
     };
 
-    let server_lookup = find_specific_language_server_in_selection(
-        editor,
-        cx,
-        is_rust_language,
-        RUST_ANALYZER_NAME,
-    );
+    let Some((trigger_anchor, _, server_to_query, buffer)) =
+        find_specific_language_server_in_selection(
+            editor,
+            cx,
+            is_rust_language,
+            RUST_ANALYZER_NAME,
+        )
+    else {
+        return;
+    };
 
     let project = project.clone();
     let upstream_client = project.read(cx).lsp_store().read(cx).upstream_client();
     cx.spawn_in(window, async move |_editor, cx| {
-        let Some((trigger_anchor, _, server_to_query, buffer)) = server_lookup.await else {
-            return Ok(());
-        };
-
         let docs_urls = if let Some((client, project_id)) = upstream_client {
-            let buffer_id = buffer.read_with(cx, |buffer, _| buffer.remote_id())?;
+            let buffer_id = buffer.read_with(cx, |buffer, _| buffer.remote_id());
             let request = proto::LspExtOpenDocs {
                 project_id,
                 buffer_id: buffer_id.to_proto(),
@@ -261,7 +271,7 @@ pub fn open_docs(editor: &mut Editor, _: &OpenDocs, window: &mut Window, cx: &mu
                 local: response.local,
             }
         } else {
-            let buffer_snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot())?;
+            let buffer_snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
             let position = trigger_anchor.text_anchor.to_point_utf16(&buffer_snapshot);
             project
                 .update(cx, |project, cx| {
@@ -271,7 +281,7 @@ pub fn open_docs(editor: &mut Editor, _: &OpenDocs, window: &mut Window, cx: &mu
                         project::lsp_store::lsp_ext_command::OpenDocs { position },
                         cx,
                     )
-                })?
+                })
                 .await
                 .context("open docs")?
         };
@@ -287,17 +297,18 @@ pub fn open_docs(editor: &mut Editor, _: &OpenDocs, window: &mut Window, cx: &mu
         workspace.update(cx, |_workspace, cx| {
             // Check if the local document exists, otherwise fallback to the online document.
             // Open with the default browser.
-            if let Some(local_url) = docs_urls.local {
-                if fs::metadata(Path::new(&local_url[8..])).is_ok() {
-                    cx.open_url(&local_url);
-                    return;
-                }
+            if let Some(local_url) = docs_urls.local
+                && fs::metadata(Path::new(&local_url[8..])).is_ok()
+            {
+                cx.open_url(&local_url);
+                return;
             }
 
             if let Some(web_url) = docs_urls.web {
                 cx.open_url(&web_url);
             }
-        })
+        });
+        anyhow::Ok(())
     })
     .detach_and_log_err(cx);
 }
@@ -311,22 +322,23 @@ fn cancel_flycheck_action(
     let Some(project) = &editor.project else {
         return;
     };
-    let Some(buffer_id) = editor
+    let buffer_id = editor
         .selections
-        .disjoint_anchors()
+        .disjoint_anchors_arc()
         .iter()
         .find_map(|selection| {
-            let buffer_id = selection.start.buffer_id.or(selection.end.buffer_id)?;
+            let buffer_id = selection
+                .start
+                .text_anchor
+                .buffer_id
+                .or(selection.end.text_anchor.buffer_id)?;
             let project = project.read(cx);
             let entry_id = project
                 .buffer_for_id(buffer_id, cx)?
                 .read(cx)
                 .entry_id(cx)?;
             project.path_for_entry(entry_id, cx)
-        })
-    else {
-        return;
-    };
+        });
     cancel_flycheck(project.clone(), buffer_id, cx).detach_and_log_err(cx);
 }
 
@@ -339,22 +351,23 @@ fn run_flycheck_action(
     let Some(project) = &editor.project else {
         return;
     };
-    let Some(buffer_id) = editor
+    let buffer_id = editor
         .selections
-        .disjoint_anchors()
+        .disjoint_anchors_arc()
         .iter()
         .find_map(|selection| {
-            let buffer_id = selection.start.buffer_id.or(selection.end.buffer_id)?;
+            let buffer_id = selection
+                .start
+                .text_anchor
+                .buffer_id
+                .or(selection.end.text_anchor.buffer_id)?;
             let project = project.read(cx);
             let entry_id = project
                 .buffer_for_id(buffer_id, cx)?
                 .read(cx)
                 .entry_id(cx)?;
             project.path_for_entry(entry_id, cx)
-        })
-    else {
-        return;
-    };
+        });
     run_flycheck(project.clone(), buffer_id, cx).detach_and_log_err(cx);
 }
 
@@ -367,21 +380,22 @@ fn clear_flycheck_action(
     let Some(project) = &editor.project else {
         return;
     };
-    let Some(buffer_id) = editor
+    let buffer_id = editor
         .selections
-        .disjoint_anchors()
+        .disjoint_anchors_arc()
         .iter()
         .find_map(|selection| {
-            let buffer_id = selection.start.buffer_id.or(selection.end.buffer_id)?;
+            let buffer_id = selection
+                .start
+                .text_anchor
+                .buffer_id
+                .or(selection.end.text_anchor.buffer_id)?;
             let project = project.read(cx);
             let entry_id = project
                 .buffer_for_id(buffer_id, cx)?
                 .read(cx)
                 .entry_id(cx)?;
             project.path_for_entry(entry_id, cx)
-        })
-    else {
-        return;
-    };
+        });
     clear_flycheck(project.clone(), buffer_id, cx).detach_and_log_err(cx);
 }

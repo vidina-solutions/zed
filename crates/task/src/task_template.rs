@@ -4,7 +4,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
-use util::schemars::DefaultDenyUnknownFields;
+use util::schemars::{AllowTrailingCommas, DefaultDenyUnknownFields};
 use util::serde::default_true;
 use util::{ResultExt, truncate_and_remove_front};
 
@@ -114,21 +114,21 @@ pub enum HideStrategy {
 pub struct TaskTemplates(pub Vec<TaskTemplate>);
 
 impl TaskTemplates {
+    pub const FILE_NAME: &str = "tasks.json";
     /// Generates JSON schema of Tasks JSON template format.
-    pub fn generate_json_schema() -> serde_json_lenient::Value {
+    pub fn generate_json_schema() -> serde_json::Value {
         let schema = schemars::generate::SchemaSettings::draft2019_09()
             .with_transform(DefaultDenyUnknownFields)
+            .with_transform(AllowTrailingCommas)
             .into_generator()
             .root_schema_for::<Self>();
 
-        serde_json_lenient::to_value(schema).unwrap()
+        serde_json::to_value(schema).unwrap()
     }
 }
 
 impl TaskTemplate {
     /// Replaces all `VariableName` task variables in the task template string fields.
-    /// If any replacement fails or the new string substitutions still have [`ZED_VARIABLE_NAME_PREFIX`],
-    /// `None` is returned.
     ///
     /// Every [`ResolvedTask`] gets a [`TaskId`], based on the `id_base` (to avoid collision with various task sources),
     /// and hashes of its template and [`TaskContext`], see [`ResolvedTask`] fields' documentation for more details.
@@ -183,6 +183,10 @@ impl TaskTemplate {
                 &mut substituted_variables,
             )?
         } else {
+            #[allow(
+                clippy::redundant_clone,
+                reason = "We want to clone the full_label to avoid borrowing it in the fold closure"
+            )]
             full_label.clone()
         }
         .lines()
@@ -270,6 +274,53 @@ impl TaskTemplate {
             },
         })
     }
+
+    /// Validates that all `$ZED_*` variables used in this template are known
+    /// variable names, returning a vector with all of the unique unknown
+    /// variables.
+    ///
+    /// Note that `$ZED_CUSTOM_*` variables are never considered to be invalid
+    /// since those are provided dynamically by extensions.
+    pub fn unknown_variables(&self) -> Vec<String> {
+        let mut variables = HashSet::default();
+
+        Self::collect_unknown_variables(&self.label, &mut variables);
+        Self::collect_unknown_variables(&self.command, &mut variables);
+
+        self.args
+            .iter()
+            .for_each(|arg| Self::collect_unknown_variables(arg, &mut variables));
+
+        self.env
+            .values()
+            .for_each(|value| Self::collect_unknown_variables(value, &mut variables));
+
+        if let Some(cwd) = &self.cwd {
+            Self::collect_unknown_variables(cwd, &mut variables);
+        }
+
+        variables.into_iter().collect()
+    }
+
+    fn collect_unknown_variables(template: &str, unknown: &mut HashSet<String>) {
+        shellexpand::env_with_context_no_errors(template, |variable| {
+            // It's possible that the variable has a default defined, which is
+            // separated by a `:`, for example, `${ZED_FILE:default_value} so we
+            // ensure that we're only looking at the variable name itself.
+            let colon_position = variable.find(':').unwrap_or(variable.len());
+            let variable_name = &variable[..colon_position];
+
+            if variable_name.starts_with(ZED_VARIABLE_NAME_PREFIX)
+                && let without_prefix = &variable_name[ZED_VARIABLE_NAME_PREFIX.len()..]
+                && !without_prefix.starts_with("CUSTOM_")
+                && variable_name.parse::<VariableName>().is_err()
+            {
+                unknown.insert(variable_name.to_string());
+            }
+
+            None::<&str>
+        });
+    }
 }
 
 const MAX_DISPLAY_VARIABLE_LENGTH: usize = 15;
@@ -322,33 +373,40 @@ fn substitute_all_template_variables_in_str<A: AsRef<str>>(
     substituted_variables: &mut HashSet<VariableName>,
 ) -> Option<String> {
     let substituted_string = shellexpand::env_with_context(template_str, |var| {
-        // Colons denote a default value in case the variable is not set. We want to preserve that default, as otherwise shellexpand will substitute it for us.
+        // Colons denote a default value in case the variable is not set. We
+        // want to preserve that default, as otherwise shellexpand will
+        // substitute it for us.
         let colon_position = var.find(':').unwrap_or(var.len());
         let (variable_name, default) = var.split_at(colon_position);
         if let Some(name) = task_variables.get(variable_name) {
             if let Some(substituted_variable) = variable_names.get(variable_name) {
                 substituted_variables.insert(substituted_variable.clone());
             }
-
-            let mut name = name.as_ref().to_owned();
-            // Got a task variable hit
-            if !default.is_empty() {
-                name.push_str(default);
-            }
-            return Ok(Some(name));
+            // Got a task variable hit - use the variable value, ignore default
+            return Ok(Some(name.as_ref().to_owned()));
         } else if variable_name.starts_with(ZED_VARIABLE_NAME_PREFIX) {
-            bail!("Unknown variable name: {variable_name}");
+            // Unknown ZED variable - use default if available
+            if !default.is_empty() {
+                // Strip the colon and return the default value
+                return Ok(Some(default[1..].to_owned()));
+            } else {
+                bail!("Unknown variable name: {variable_name}");
+            }
         }
         // This is an unknown variable.
-        // We should not error out, as they may come from user environment (e.g. $PATH). That means that the variable substitution might not be perfect.
-        // If there's a default, we need to return the string verbatim as otherwise shellexpand will apply that default for us.
+        // We should not error out, as they may come from user environment (e.g.
+        // $PATH). That means that the variable substitution might not be
+        // perfect. If there's a default, we need to return the string verbatim
+        // as otherwise shellexpand will apply that default for us.
         if !default.is_empty() {
             return Ok(Some(format!("${{{var}}}")));
         }
+
         // Else we can just return None and that variable will be left as is.
         Ok(None)
     })
     .ok()?;
+
     Some(substituted_string.into_owned())
 }
 
@@ -368,6 +426,7 @@ fn substitute_all_template_variables_in_vec(
         )?;
         expanded.push(new_value);
     }
+
     Some(expanded)
 }
 
@@ -418,6 +477,7 @@ fn substitute_all_template_variables_in_map(
         )?;
         new_map.insert(new_key, new_value);
     }
+
     Some(new_map)
 }
 
@@ -453,7 +513,7 @@ mod tests {
             TaskTemplate {
                 label: "".to_string(),
                 command: "".to_string(),
-                ..task_with_all_properties.clone()
+                ..task_with_all_properties
             },
         ] {
             assert_eq!(
@@ -521,7 +581,7 @@ mod tests {
         );
 
         let cx = TaskContext {
-            cwd: Some(context_cwd.clone()),
+            cwd: Some(context_cwd),
             task_variables: TaskVariables::default(),
             project_env: HashMap::default(),
         };
@@ -690,8 +750,8 @@ mod tests {
                     project_env: HashMap::default(),
                 },
             );
-            assert_eq!(
-                resolved_task_attempt, None,
+            assert!(
+                matches!(resolved_task_attempt, None),
                 "If any of the Zed task variables is not substituted, the task should not be resolved, but got some resolution without the variable {removed_variable:?} (index {i})"
             );
         }
@@ -768,7 +828,7 @@ mod tests {
                     "test_env_key".to_string(),
                     format!("test_env_var_{}", VariableName::Symbol.template_value()),
                 )]),
-                ..task_with_all_properties.clone()
+                ..task_with_all_properties
             },
         ]
         .into_iter()
@@ -871,7 +931,7 @@ mod tests {
 
         let context = TaskContext {
             cwd: None,
-            task_variables: TaskVariables::from_iter(all_variables.clone()),
+            task_variables: TaskVariables::from_iter(all_variables),
             project_env,
         };
 
@@ -887,5 +947,132 @@ mod tests {
             resolved.env["PROJECT_ENV_WILL_BE_OVERWRITTEN"],
             "overwritten"
         );
+    }
+
+    #[test]
+    fn test_variable_default_values() {
+        let task_with_defaults = TaskTemplate {
+            label: "test with defaults".to_string(),
+            command: format!(
+                "echo ${{{}}}",
+                VariableName::File.to_string() + ":fallback.txt"
+            ),
+            args: vec![
+                "${ZED_MISSING_VAR:default_value}".to_string(),
+                format!("${{{}}}", VariableName::Row.to_string() + ":42"),
+            ],
+            ..TaskTemplate::default()
+        };
+
+        // Test 1: When ZED_FILE exists, should use actual value and ignore default
+        let context_with_file = TaskContext {
+            cwd: None,
+            task_variables: TaskVariables::from_iter(vec![
+                (VariableName::File, "actual_file.rs".to_string()),
+                (VariableName::Row, "123".to_string()),
+            ]),
+            project_env: HashMap::default(),
+        };
+
+        let resolved = task_with_defaults
+            .resolve_task(TEST_ID_BASE, &context_with_file)
+            .expect("Should resolve task with existing variables");
+
+        assert_eq!(
+            resolved.resolved.command.unwrap(),
+            "echo actual_file.rs",
+            "Should use actual ZED_FILE value, not default"
+        );
+        assert_eq!(
+            resolved.resolved.args,
+            vec!["default_value", "123"],
+            "Should use default for missing var, actual value for existing var"
+        );
+
+        // Test 2: When ZED_FILE doesn't exist, should use default value
+        let context_without_file = TaskContext {
+            cwd: None,
+            task_variables: TaskVariables::from_iter(vec![(VariableName::Row, "456".to_string())]),
+            project_env: HashMap::default(),
+        };
+
+        let resolved = task_with_defaults
+            .resolve_task(TEST_ID_BASE, &context_without_file)
+            .expect("Should resolve task using default values");
+
+        assert_eq!(
+            resolved.resolved.command.unwrap(),
+            "echo fallback.txt",
+            "Should use default value when ZED_FILE is missing"
+        );
+        assert_eq!(
+            resolved.resolved.args,
+            vec!["default_value", "456"],
+            "Should use defaults for missing vars"
+        );
+
+        // Test 3: Missing ZED variable without default should fail
+        let task_no_default = TaskTemplate {
+            label: "test no default".to_string(),
+            command: "${ZED_MISSING_NO_DEFAULT}".to_string(),
+            ..TaskTemplate::default()
+        };
+
+        assert!(
+            task_no_default
+                .resolve_task(TEST_ID_BASE, &TaskContext::default())
+                .is_none(),
+            "Should fail when ZED variable has no default and doesn't exist"
+        );
+    }
+
+    #[test]
+    fn test_unknown_variables() {
+        // Variable names starting with `ZED_` that are not valid should be
+        // reported.
+        let label = "test unknown variables".to_string();
+        let command = "$ZED_UNKNOWN".to_string();
+        let task = TaskTemplate {
+            label,
+            command,
+            ..TaskTemplate::default()
+        };
+
+        assert_eq!(task.unknown_variables(), vec!["ZED_UNKNOWN".to_string()]);
+
+        // Variable names starting with `ZED_CUSTOM_` should never be reported,
+        // as those are dynamically provided by extensions.
+        let label = "test custom variables".to_string();
+        let command = "$ZED_CUSTOM_UNKNOWN".to_string();
+        let task = TaskTemplate {
+            label,
+            command,
+            ..TaskTemplate::default()
+        };
+
+        assert!(task.unknown_variables().is_empty());
+
+        // Unknown variable names with defaults should still be reported,
+        // otherwise the default would always be silently used.
+        let label = "test custom variables".to_string();
+        let command = "${ZED_UNKNOWN:default_value}".to_string();
+        let task = TaskTemplate {
+            label,
+            command,
+            ..TaskTemplate::default()
+        };
+
+        assert_eq!(task.unknown_variables(), vec!["ZED_UNKNOWN".to_string()]);
+
+        // Valid variable names are not reported.
+        let label = "test custom variables".to_string();
+        let command = "$ZED_FILE".to_string();
+        let task = TaskTemplate {
+            label,
+            command,
+            ..TaskTemplate::default()
+        };
+
+        assert!(task.unknown_variables().is_empty());
     }
 }

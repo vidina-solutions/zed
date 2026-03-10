@@ -1,23 +1,21 @@
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use async_trait::async_trait;
-use futures::StreamExt;
 use gpui::AsyncApp;
 use language::{
-    LanguageToolchainStore, LspAdapter, LspAdapterDelegate, language_settings::AllLanguageSettings,
+    LspAdapter, LspAdapterDelegate, LspInstaller, Toolchain, language_settings::AllLanguageSettings,
 };
-use lsp::{LanguageServerBinary, LanguageServerName};
-use node_runtime::NodeRuntime;
-use project::{Fs, lsp_store::language_server_settings};
+use lsp::{LanguageServerBinary, LanguageServerName, Uri};
+use node_runtime::{NodeRuntime, VersionStrategy};
+use project::lsp_store::language_server_settings;
+use semver::Version;
 use serde_json::Value;
 use settings::{Settings, SettingsLocation};
-use smol::fs;
 use std::{
-    any::Any,
     ffi::OsString,
     path::{Path, PathBuf},
     sync::Arc,
 };
-use util::{ResultExt, maybe, merge_json_value_into};
+use util::{ResultExt, maybe, merge_json_value_into, rel_path::RelPath};
 
 const SERVER_PATH: &str = "node_modules/yaml-language-server/bin/yaml-language-server";
 
@@ -37,27 +35,24 @@ impl YamlLspAdapter {
     }
 }
 
-#[async_trait(?Send)]
-impl LspAdapter for YamlLspAdapter {
-    fn name(&self) -> LanguageServerName {
-        Self::SERVER_NAME.clone()
-    }
+impl LspInstaller for YamlLspAdapter {
+    type BinaryVersion = Version;
 
     async fn fetch_latest_server_version(
         &self,
         _: &dyn LspAdapterDelegate,
-    ) -> Result<Box<dyn 'static + Any + Send>> {
-        Ok(Box::new(
-            self.node
-                .npm_package_latest_version("yaml-language-server")
-                .await?,
-        ) as Box<_>)
+        _: bool,
+        _: &mut AsyncApp,
+    ) -> Result<Self::BinaryVersion> {
+        self.node
+            .npm_package_latest_version("yaml-language-server")
+            .await
     }
 
     async fn check_if_user_installed(
         &self,
         delegate: &dyn LspAdapterDelegate,
-        _: Arc<dyn LanguageToolchainStore>,
+        _: Option<Toolchain>,
         _: &AsyncApp,
     ) -> Option<LanguageServerBinary> {
         let path = delegate.which(Self::SERVER_NAME.as_ref()).await?;
@@ -72,17 +67,16 @@ impl LspAdapter for YamlLspAdapter {
 
     async fn fetch_server_binary(
         &self,
-        latest_version: Box<dyn 'static + Send + Any>,
+        latest_version: Self::BinaryVersion,
         container_dir: PathBuf,
         _: &dyn LspAdapterDelegate,
     ) -> Result<LanguageServerBinary> {
-        let latest_version = latest_version.downcast::<String>().unwrap();
         let server_path = container_dir.join(SERVER_PATH);
 
         self.node
             .npm_install_packages(
                 &container_dir,
-                &[(Self::PACKAGE_NAME, latest_version.as_str())],
+                &[(Self::PACKAGE_NAME, &latest_version.to_string())],
             )
             .await?;
 
@@ -95,16 +89,20 @@ impl LspAdapter for YamlLspAdapter {
 
     async fn check_if_version_installed(
         &self,
-        version: &(dyn 'static + Send + Any),
+        version: &Self::BinaryVersion,
         container_dir: &PathBuf,
         _: &dyn LspAdapterDelegate,
     ) -> Option<LanguageServerBinary> {
-        let version = version.downcast_ref::<String>().unwrap();
         let server_path = container_dir.join(SERVER_PATH);
 
         let should_install_language_server = self
             .node
-            .should_install_npm_package(Self::PACKAGE_NAME, &server_path, &container_dir, &version)
+            .should_install_npm_package(
+                Self::PACKAGE_NAME,
+                &server_path,
+                container_dir,
+                VersionStrategy::Latest(version),
+            )
             .await;
 
         if should_install_language_server {
@@ -125,24 +123,31 @@ impl LspAdapter for YamlLspAdapter {
     ) -> Option<LanguageServerBinary> {
         get_cached_server_binary(container_dir, &self.node).await
     }
+}
+
+#[async_trait(?Send)]
+impl LspAdapter for YamlLspAdapter {
+    fn name(&self) -> LanguageServerName {
+        Self::SERVER_NAME
+    }
 
     async fn workspace_configuration(
         self: Arc<Self>,
-        _: &dyn Fs,
         delegate: &Arc<dyn LspAdapterDelegate>,
-        _: Arc<dyn LanguageToolchainStore>,
+        _: Option<Toolchain>,
+        _: Option<Uri>,
         cx: &mut AsyncApp,
     ) -> Result<Value> {
         let location = SettingsLocation {
             worktree_id: delegate.worktree_id(),
-            path: delegate.worktree_root_path(),
+            path: RelPath::empty(),
         };
 
         let tab_size = cx.update(|cx| {
             AllLanguageSettings::get(Some(location), cx)
                 .language(Some(location), Some(&"YAML".into()), cx)
                 .tab_size
-        })?;
+        });
 
         let mut options = serde_json::json!({
             "[yaml]": {"editor.tabSize": tab_size},
@@ -151,8 +156,8 @@ impl LspAdapter for YamlLspAdapter {
 
         let project_options = cx.update(|cx| {
             language_server_settings(delegate.as_ref(), &Self::SERVER_NAME, cx)
-                .and_then(|s| s.settings.clone())
-        })?;
+                .and_then(|s| worktree_root(delegate, s.settings.clone()))
+        });
         if let Some(override_options) = project_options {
             merge_json_value_into(override_options, &mut options);
         }
@@ -160,24 +165,47 @@ impl LspAdapter for YamlLspAdapter {
     }
 }
 
+fn worktree_root(delegate: &Arc<dyn LspAdapterDelegate>, settings: Option<Value>) -> Option<Value> {
+    let Some(Value::Object(mut settings_map)) = settings else {
+        return settings;
+    };
+
+    let Some(Value::Object(yaml_config)) = settings_map.get_mut("yaml") else {
+        return Some(Value::Object(settings_map));
+    };
+
+    let Some(Value::Object(schemas)) = yaml_config.remove("schemas") else {
+        return Some(Value::Object(settings_map));
+    };
+
+    let schemas = schemas
+        .into_iter()
+        .map(|(url, v)| {
+            if !url.starts_with(".") && !url.starts_with("~") {
+                (url, v)
+            } else {
+                let resolved_url = delegate
+                    .resolve_relative_path(url.into())
+                    .to_string_lossy()
+                    .into_owned();
+                (resolved_url, v)
+            }
+        })
+        .collect::<serde_json::Map<String, Value>>();
+
+    yaml_config.insert("schemas".into(), Value::Object(schemas));
+    Some(Value::Object(settings_map))
+}
+
 async fn get_cached_server_binary(
     container_dir: PathBuf,
     node: &NodeRuntime,
 ) -> Option<LanguageServerBinary> {
     maybe!(async {
-        let mut last_version_dir = None;
-        let mut entries = fs::read_dir(&container_dir).await?;
-        while let Some(entry) = entries.next().await {
-            let entry = entry?;
-            if entry.file_type().await?.is_dir() {
-                last_version_dir = Some(entry.path());
-            }
-        }
-        let last_version_dir = last_version_dir.context("no cached binary")?;
-        let server_path = last_version_dir.join(SERVER_PATH);
+        let server_path = container_dir.join(SERVER_PATH);
         anyhow::ensure!(
             server_path.exists(),
-            "missing executable in directory {last_version_dir:?}"
+            "missing executable in directory {server_path:?}"
         );
         Ok(LanguageServerBinary {
             path: node.binary_path().await?,

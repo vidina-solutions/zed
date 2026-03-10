@@ -1,10 +1,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context as _, Result};
-use client::{
-    TypedEnvelope,
-    proto::{self, FromProto},
-};
+use client::{TypedEnvelope, proto};
 use collections::{HashMap, HashSet};
 use extension::{
     Extension, ExtensionDebugAdapterProviderProxy, ExtensionHostProxy, ExtensionLanguageProxy,
@@ -99,7 +96,7 @@ impl HeadlessExtensionStore {
 
             for extension in to_load {
                 if let Err(e) = Self::load_extension(this.clone(), extension.clone(), cx).await {
-                    log::info!("failed to load extension: {}, {:?}", extension.id, e);
+                    log::info!("failed to load extension: {}, {:#}", extension.id, e);
                     missing.push(extension)
                 } else if extension.dev {
                     missing.push(extension)
@@ -141,7 +138,9 @@ impl HeadlessExtensionStore {
 
         for language_path in &manifest.languages {
             let language_path = extension_dir.join(language_path);
-            let config = fs.load(&language_path.join("config.toml")).await?;
+            let config = fs
+                .load(&language_path.join(LanguageConfig::FILE_NAME))
+                .await?;
             let mut config = ::toml::from_str::<LanguageConfig>(&config)?;
 
             this.update(cx, |this, _cx| {
@@ -163,6 +162,7 @@ impl HeadlessExtensionStore {
                             queries: LanguageQueries::default(),
                             context_provider: None,
                             toolchain_provider: None,
+                            manifest_name: None,
                         })
                     }),
                 );
@@ -174,7 +174,7 @@ impl HeadlessExtensionStore {
         }
 
         let wasm_extension: Arc<dyn Extension> =
-            Arc::new(WasmExtension::load(&extension_dir, &manifest, wasm_host.clone(), &cx).await?);
+            Arc::new(WasmExtension::load(&extension_dir, &manifest, wasm_host.clone(), cx).await?);
 
         for (language_server_id, language_server_config) in &manifest.language_servers {
             for language in language_server_config.languages() {
@@ -247,8 +247,7 @@ impl HeadlessExtensionStore {
                         cx,
                     ));
                 }
-            })
-            .ok();
+            });
             let _ = join_all(removal_tasks).await;
 
             fs.remove_dir(
@@ -281,7 +280,8 @@ impl HeadlessExtensionStore {
             }
 
             fs.rename(&tmp_path, &path, RenameOptions::default())
-                .await?;
+                .await
+                .context("Failed to rename {tmp_path:?} to {path:?}")?;
 
             Self::load_extension(this, extension, cx).await
         })
@@ -305,7 +305,7 @@ impl HeadlessExtensionStore {
         let missing_extensions = extension_store
             .update(&mut cx, |extension_store, cx| {
                 extension_store.sync_extensions(requested_extensions.collect(), cx)
-            })?
+            })
             .await?;
 
         Ok(proto::SyncExtensionsResponse {
@@ -341,10 +341,10 @@ impl HeadlessExtensionStore {
                         version: extension.version,
                         dev: extension.dev,
                     },
-                    PathBuf::from_proto(envelope.payload.tmp_dir),
+                    PathBuf::from(envelope.payload.tmp_dir),
                     cx,
                 )
-            })?
+            })
             .await?;
 
         Ok(proto::Ack {})

@@ -19,6 +19,9 @@ impl Global for GlobalExtensionHostProxy {}
 ///
 /// This object implements each of the individual proxy types so that their
 /// methods can be called directly on it.
+/// Registration function for language model providers.
+pub type LanguageModelProviderRegistration = Box<dyn FnOnce(&mut App) + Send>;
+
 #[derive(Default)]
 pub struct ExtensionHostProxy {
     theme_proxy: RwLock<Option<Arc<dyn ExtensionThemeProxy>>>,
@@ -28,8 +31,8 @@ pub struct ExtensionHostProxy {
     snippet_proxy: RwLock<Option<Arc<dyn ExtensionSnippetProxy>>>,
     slash_command_proxy: RwLock<Option<Arc<dyn ExtensionSlashCommandProxy>>>,
     context_server_proxy: RwLock<Option<Arc<dyn ExtensionContextServerProxy>>>,
-    indexed_docs_provider_proxy: RwLock<Option<Arc<dyn ExtensionIndexedDocsProviderProxy>>>,
     debug_adapter_provider_proxy: RwLock<Option<Arc<dyn ExtensionDebugAdapterProviderProxy>>>,
+    language_model_provider_proxy: RwLock<Option<Arc<dyn ExtensionLanguageModelProviderProxy>>>,
 }
 
 impl ExtensionHostProxy {
@@ -54,8 +57,8 @@ impl ExtensionHostProxy {
             snippet_proxy: RwLock::default(),
             slash_command_proxy: RwLock::default(),
             context_server_proxy: RwLock::default(),
-            indexed_docs_provider_proxy: RwLock::default(),
             debug_adapter_provider_proxy: RwLock::default(),
+            language_model_provider_proxy: RwLock::default(),
         }
     }
 
@@ -87,16 +90,17 @@ impl ExtensionHostProxy {
         self.context_server_proxy.write().replace(Arc::new(proxy));
     }
 
-    pub fn register_indexed_docs_provider_proxy(
-        &self,
-        proxy: impl ExtensionIndexedDocsProviderProxy,
-    ) {
-        self.indexed_docs_provider_proxy
+    pub fn register_debug_adapter_proxy(&self, proxy: impl ExtensionDebugAdapterProviderProxy) {
+        self.debug_adapter_provider_proxy
             .write()
             .replace(Arc::new(proxy));
     }
-    pub fn register_debug_adapter_proxy(&self, proxy: impl ExtensionDebugAdapterProviderProxy) {
-        self.debug_adapter_provider_proxy
+
+    pub fn register_language_model_provider_proxy(
+        &self,
+        proxy: impl ExtensionLanguageModelProviderProxy,
+    ) {
+        self.language_model_provider_proxy
             .write()
             .replace(Arc::new(proxy));
     }
@@ -219,6 +223,7 @@ pub trait ExtensionGrammarProxy: Send + Sync + 'static {
 }
 
 impl ExtensionGrammarProxy for ExtensionHostProxy {
+    #[ztracing::instrument(skip_all)]
     fn register_grammars(&self, grammars: Vec<(Arc<str>, PathBuf)>) {
         let Some(proxy) = self.grammar_proxy.read().clone() else {
             return;
@@ -246,6 +251,7 @@ pub trait ExtensionLanguageProxy: Send + Sync + 'static {
 }
 
 impl ExtensionLanguageProxy for ExtensionHostProxy {
+    #[ztracing::instrument(skip_all, fields(lang = language.0.as_str()))]
     fn register_language(
         &self,
         language: LanguageName,
@@ -408,30 +414,6 @@ impl ExtensionContextServerProxy for ExtensionHostProxy {
     }
 }
 
-pub trait ExtensionIndexedDocsProviderProxy: Send + Sync + 'static {
-    fn register_indexed_docs_provider(&self, extension: Arc<dyn Extension>, provider_id: Arc<str>);
-
-    fn unregister_indexed_docs_provider(&self, provider_id: Arc<str>);
-}
-
-impl ExtensionIndexedDocsProviderProxy for ExtensionHostProxy {
-    fn register_indexed_docs_provider(&self, extension: Arc<dyn Extension>, provider_id: Arc<str>) {
-        let Some(proxy) = self.indexed_docs_provider_proxy.read().clone() else {
-            return;
-        };
-
-        proxy.register_indexed_docs_provider(extension, provider_id)
-    }
-
-    fn unregister_indexed_docs_provider(&self, provider_id: Arc<str>) {
-        let Some(proxy) = self.indexed_docs_provider_proxy.read().clone() else {
-            return;
-        };
-
-        proxy.unregister_indexed_docs_provider(provider_id)
-    }
-}
-
 pub trait ExtensionDebugAdapterProviderProxy: Send + Sync + 'static {
     fn register_debug_adapter(
         &self,
@@ -478,5 +460,39 @@ impl ExtensionDebugAdapterProviderProxy for ExtensionHostProxy {
         };
 
         proxy.unregister_debug_locator(locator_name)
+    }
+}
+
+pub trait ExtensionLanguageModelProviderProxy: Send + Sync + 'static {
+    fn register_language_model_provider(
+        &self,
+        provider_id: Arc<str>,
+        register_fn: LanguageModelProviderRegistration,
+        cx: &mut App,
+    );
+
+    fn unregister_language_model_provider(&self, provider_id: Arc<str>, cx: &mut App);
+}
+
+impl ExtensionLanguageModelProviderProxy for ExtensionHostProxy {
+    fn register_language_model_provider(
+        &self,
+        provider_id: Arc<str>,
+        register_fn: LanguageModelProviderRegistration,
+        cx: &mut App,
+    ) {
+        let Some(proxy) = self.language_model_provider_proxy.read().clone() else {
+            return;
+        };
+
+        proxy.register_language_model_provider(provider_id, register_fn, cx)
+    }
+
+    fn unregister_language_model_provider(&self, provider_id: Arc<str>, cx: &mut App) {
+        let Some(proxy) = self.language_model_provider_proxy.read().clone() else {
+            return;
+        };
+
+        proxy.unregister_language_model_provider(provider_id, cx)
     }
 }

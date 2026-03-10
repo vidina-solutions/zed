@@ -27,7 +27,7 @@ use gpui::StyleRefinement;
 /// ```
 /// use ui::prelude::*;
 ///
-/// let my_label = Label::new("Deleted").strikethrough(true);
+/// let my_label = Label::new("Deleted").strikethrough();
 /// ```
 #[derive(IntoElement, RegisterComponent)]
 pub struct Label {
@@ -55,6 +55,12 @@ impl Label {
     /// Sets the text of the [`Label`].
     pub fn set_text(&mut self, text: impl Into<SharedString>) {
         self.label = text.into();
+    }
+
+    /// Truncates the label from the start, keeping the end visible.
+    pub fn truncate_start(mut self) -> Self {
+        self.base = self.base.truncate_start();
+        self
     }
 }
 
@@ -89,9 +95,10 @@ impl LabelCommon for Label {
     /// # Examples
     ///
     /// ```
+    /// use gpui::FontWeight;
     /// use ui::prelude::*;
     ///
-    /// let my_label = Label::new("Hello, World!").weight(FontWeight::Bold);
+    /// let my_label = Label::new("Hello, World!").weight(FontWeight::BOLD);
     /// ```
     fn weight(mut self, weight: gpui::FontWeight) -> Self {
         self.base = self.base.weight(weight);
@@ -133,7 +140,7 @@ impl LabelCommon for Label {
     /// ```
     /// use ui::prelude::*;
     ///
-    /// let my_label = Label::new("Hello, World!").strikethrough(true);
+    /// let my_label = Label::new("Hello, World!").strikethrough();
     /// ```
     fn strikethrough(mut self) -> Self {
         self.base = self.base.strikethrough();
@@ -147,7 +154,7 @@ impl LabelCommon for Label {
     /// ```
     /// use ui::prelude::*;
     ///
-    /// let my_label = Label::new("Hello, World!").italic(true);
+    /// let my_label = Label::new("Hello, World!").italic();
     /// ```
     fn italic(mut self) -> Self {
         self.base = self.base.italic();
@@ -255,7 +262,8 @@ impl Component for Label {
                         "Special Cases",
                         vec![
                             single_example("Single Line", Label::new("Line 1\nLine 2\nLine 3").single_line().into_any_element()),
-                            single_example("Text Ellipsis", div().max_w_24().child(Label::new("This is a very long file name that should be truncated: very_long_file_name_with_many_words.rs").truncate()).into_any_element()),
+                            single_example("Regular Truncation", div().max_w_24().child(Label::new("This is a very long file name that should be truncated: very_long_file_name_with_many_words.rs").truncate()).into_any_element()),
+                            single_example("Start Truncation", div().max_w_24().child(Label::new("zed/crates/ui/src/components/label/truncate/label/label.rs").truncate_start()).into_any_element()),
                         ],
                     ),
                 ])

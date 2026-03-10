@@ -14,14 +14,12 @@ use gpui::{
     div, px, size,
 };
 use log::LevelFilter;
-use project::Project;
 use reqwest_client::ReqwestClient;
 use settings::{KeymapFile, Settings};
 use simplelog::SimpleLogger;
 use strum::IntoEnumIterator;
-use theme::{ThemeRegistry, ThemeSettings};
+use theme::ThemeSettings;
 use ui::prelude::*;
-use workspace;
 
 use crate::app_menus::app_menus;
 use crate::assets::Assets;
@@ -67,48 +65,47 @@ fn main() {
     });
     let theme_name = args.theme.unwrap_or("One Dark".to_string());
 
-    gpui::Application::new().with_assets(Assets).run(move |cx| {
-        load_embedded_fonts(cx).unwrap();
+    gpui_platform::application()
+        .with_assets(Assets)
+        .run(move |cx| {
+            load_embedded_fonts(cx).unwrap();
 
-        cx.set_global(GlobalColors(Arc::new(Colors::default())));
+            cx.set_global(GlobalColors(Arc::new(Colors::default())));
 
-        let http_client = ReqwestClient::user_agent("zed_storybook").unwrap();
-        cx.set_http_client(Arc::new(http_client));
+            let http_client = ReqwestClient::user_agent("zed_storybook").unwrap();
+            cx.set_http_client(Arc::new(http_client));
 
-        settings::init(cx);
-        theme::init(theme::LoadThemes::All(Box::new(Assets)), cx);
+            settings::init(cx);
+            theme::init(theme::LoadThemes::All(Box::new(Assets)), cx);
 
-        let selector = story_selector;
+            let selector = story_selector;
 
-        let theme_registry = ThemeRegistry::global(cx);
-        let mut theme_settings = ThemeSettings::get_global(cx).clone();
-        theme_settings.active_theme = theme_registry.get(&theme_name).unwrap();
-        ThemeSettings::override_global(theme_settings, cx);
+            let mut theme_settings = ThemeSettings::get_global(cx).clone();
+            theme_settings.theme =
+                theme::ThemeSelection::Static(settings::ThemeName(theme_name.into()));
+            ThemeSettings::override_global(theme_settings, cx);
 
-        language::init(cx);
-        editor::init(cx);
-        Project::init_settings(cx);
-        workspace::init_settings(cx);
-        init(cx);
-        load_storybook_keymap(cx);
-        cx.set_menus(app_menus());
+            editor::init(cx);
+            init(cx);
+            load_storybook_keymap(cx);
+            cx.set_menus(app_menus());
 
-        let size = size(px(1500.), px(780.));
-        let bounds = Bounds::centered(None, size, cx);
-        let _window = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            move |window, cx| {
-                theme::setup_ui_font(window, cx);
+            let size = size(px(1500.), px(780.));
+            let bounds = Bounds::centered(None, size, cx);
+            let _window = cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                move |window, cx| {
+                    theme::setup_ui_font(window, cx);
 
-                cx.new(|cx| StoryWrapper::new(selector.story(window, cx)))
-            },
-        );
+                    cx.new(|cx| StoryWrapper::new(selector.story(window, cx)))
+                },
+            );
 
-        cx.activate(true);
-    });
+            cx.activate(true);
+        });
 }
 
 #[derive(Clone)]
@@ -128,7 +125,7 @@ impl Render for StoryWrapper {
             .flex()
             .flex_col()
             .size_full()
-            .font_family("Zed Plex Mono")
+            .font_family(".ZedMono")
             .child(self.story.clone())
     }
 }
@@ -159,8 +156,7 @@ pub fn init(cx: &mut App) {
 
 fn quit(_: &Quit, cx: &mut App) {
     cx.spawn(async move |cx| {
-        cx.update(|cx| cx.quit())?;
-        anyhow::Ok(())
+        cx.update(|cx| cx.quit());
     })
-    .detach_and_log_err(cx);
+    .detach();
 }

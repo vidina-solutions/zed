@@ -1,18 +1,19 @@
 use editor::{Bias, Editor, SelectionEffects, scroll::Autoscroll, styled_runs_for_code_label};
 use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::{
-    App, Context, DismissEvent, Entity, FontWeight, ParentElement, StyledText, Task, WeakEntity,
-    Window, rems,
+    App, Context, DismissEvent, Entity, HighlightStyle, ParentElement, StyledText, Task, TextStyle,
+    WeakEntity, Window, relative, rems,
 };
 use ordered_float::OrderedFloat;
 use picker::{Picker, PickerDelegate};
-use project::{Project, Symbol};
-use std::{borrow::Cow, cmp::Reverse, sync::Arc};
-use theme::ActiveTheme;
+use project::{Project, Symbol, lsp_store::SymbolLocation};
+use settings::Settings;
+use std::{cmp::Reverse, sync::Arc};
+use theme::{ActiveTheme, ThemeSettings};
 use util::ResultExt;
 use workspace::{
     Workspace,
-    ui::{Color, Label, LabelCommon, LabelLike, ListItem, ListItemSpacing, Toggleable, v_flex},
+    ui::{LabelLike, ListItem, ListItemSpacing, prelude::*},
 };
 
 pub fn init(cx: &mut App) {
@@ -60,9 +61,10 @@ impl ProjectSymbolsDelegate {
         }
     }
 
+    // Note if you make changes to this, also change `agent_ui::completion_provider::search_symbols`
     fn filter(&mut self, query: &str, window: &mut Window, cx: &mut Context<Picker<Self>>) {
         const MAX_MATCHES: usize = 100;
-        let mut visible_matches = cx.background_executor().block(fuzzy::match_strings(
+        let mut visible_matches = cx.foreground_executor().block_on(fuzzy::match_strings(
             &self.visible_match_candidates,
             query,
             false,
@@ -71,7 +73,7 @@ impl ProjectSymbolsDelegate {
             &Default::default(),
             cx.background_executor().clone(),
         ));
-        let mut external_matches = cx.background_executor().block(fuzzy::match_strings(
+        let mut external_matches = cx.foreground_executor().block_on(fuzzy::match_strings(
             &self.external_match_candidates,
             query,
             false,
@@ -132,8 +134,9 @@ impl PickerDelegate for ProjectSymbolsDelegate {
                         workspace.active_pane().clone()
                     };
 
-                    let editor =
-                        workspace.open_project_item::<Editor>(pane, buffer, true, true, window, cx);
+                    let editor = workspace.open_project_item::<Editor>(
+                        pane, buffer, true, true, true, true, window, cx,
+                    );
 
                     editor.update(cx, |editor, cx| {
                         editor.change_selections(
@@ -176,7 +179,15 @@ impl PickerDelegate for ProjectSymbolsDelegate {
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Task<()> {
-        self.filter(&query, window, cx);
+        // Try to support rust-analyzer's path based symbols feature which
+        // allows to search by rust path syntax, in that case we only want to
+        // filter names by the last segment
+        // Ideally this was a first class LSP feature (rich queries)
+        let query_filter = query
+            .rsplit_once("::")
+            .map_or(&*query, |(_, suffix)| suffix)
+            .to_owned();
+        self.filter(&query_filter, window, cx);
         self.show_worktree_root_name = self.project.read(cx).visible_worktrees(cx).count() > 1;
         let symbols = self
             .project
@@ -191,18 +202,22 @@ impl PickerDelegate for ProjectSymbolsDelegate {
                         .iter()
                         .enumerate()
                         .map(|(id, symbol)| {
-                            StringMatchCandidate::new(id, &symbol.label.filter_text())
+                            StringMatchCandidate::new(id, symbol.label.filter_text())
                         })
                         .partition(|candidate| {
-                            project
-                                .entry_for_path(&symbols[candidate.id].path, cx)
-                                .map_or(false, |e| !e.is_ignored)
+                            if let SymbolLocation::InProject(path) = &symbols[candidate.id].path {
+                                project
+                                    .entry_for_path(path, cx)
+                                    .is_some_and(|e| !e.is_ignored)
+                            } else {
+                                false
+                            }
                         });
 
                     delegate.visible_match_candidates = visible_match_candidates;
                     delegate.external_match_candidates = external_match_candidates;
                     delegate.symbols = symbols;
-                    delegate.filter(&query, window, cx);
+                    delegate.filter(&query_filter, window, cx);
                 })
                 .log_err();
             }
@@ -213,40 +228,59 @@ impl PickerDelegate for ProjectSymbolsDelegate {
         &self,
         ix: usize,
         selected: bool,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
-        let string_match = &self.matches[ix];
-        let symbol = &self.symbols[string_match.candidate_id];
-        let syntax_runs = styled_runs_for_code_label(&symbol.label, cx.theme().syntax());
+        let path_style = self.project.read(cx).path_style(cx);
+        let string_match = &self.matches.get(ix)?;
+        let symbol = &self.symbols.get(string_match.candidate_id)?;
+        let theme = cx.theme();
+        let local_player = theme.players().local();
+        let syntax_runs = styled_runs_for_code_label(&symbol.label, theme.syntax(), &local_player);
 
-        let mut path = symbol.path.path.to_string_lossy();
-        if self.show_worktree_root_name {
-            let project = self.project.read(cx);
-            if let Some(worktree) = project.worktree_for_id(symbol.path.worktree_id, cx) {
-                path = Cow::Owned(format!(
-                    "{}{}{}",
-                    worktree.read(cx).root_name(),
-                    std::path::MAIN_SEPARATOR,
-                    path.as_ref()
-                ));
+        let path = match &symbol.path {
+            SymbolLocation::InProject(project_path) => {
+                let project = self.project.read(cx);
+                let mut path = project_path.path.clone();
+                if self.show_worktree_root_name
+                    && let Some(worktree) = project.worktree_for_id(project_path.worktree_id, cx)
+                {
+                    path = worktree.read(cx).root_name().join(&path);
+                }
+                path.display(path_style).into_owned().into()
             }
-        }
+            SymbolLocation::OutsideProject {
+                abs_path,
+                signature: _,
+            } => abs_path.to_string_lossy(),
+        };
         let label = symbol.label.text.clone();
-        let path = path.to_string().clone();
+        let line_number = symbol.range.start.0.row + 1;
+        let path = path.into_owned();
 
-        let highlights = gpui::combine_highlights(
-            string_match
-                .positions
-                .iter()
-                .map(|pos| (*pos..pos + 1, FontWeight::BOLD.into())),
-            syntax_runs.map(|(range, mut highlight)| {
-                // Ignore font weight for syntax highlighting, as we'll use it
-                // for fuzzy matches.
-                highlight.font_weight = None;
-                (range, highlight)
-            }),
-        );
+        let settings = ThemeSettings::get_global(cx);
+
+        let text_style = TextStyle {
+            color: cx.theme().colors().text,
+            font_family: settings.buffer_font.family.clone(),
+            font_features: settings.buffer_font.features.clone(),
+            font_fallbacks: settings.buffer_font.fallbacks.clone(),
+            font_size: settings.buffer_font_size(cx).into(),
+            font_weight: settings.buffer_font.weight,
+            line_height: relative(1.),
+            ..Default::default()
+        };
+
+        let highlight_style = HighlightStyle {
+            background_color: Some(cx.theme().colors().text_accent.alpha(0.3)),
+            ..Default::default()
+        };
+        let custom_highlights = string_match
+            .positions
+            .iter()
+            .map(|pos| (*pos..pos + 1, highlight_style));
+
+        let highlights = gpui::combine_highlights(custom_highlights, syntax_runs);
 
         Some(
             ListItem::new(ix)
@@ -255,15 +289,18 @@ impl PickerDelegate for ProjectSymbolsDelegate {
                 .toggle_state(selected)
                 .child(
                     v_flex()
+                        .child(LabelLike::new().child(
+                            StyledText::new(label).with_default_highlights(&text_style, highlights),
+                        ))
                         .child(
-                            LabelLike::new().child(
-                                StyledText::new(label).with_default_highlights(
-                                    &window.text_style().clone(),
-                                    highlights,
+                            h_flex()
+                                .child(Label::new(path).size(LabelSize::Small).color(Color::Muted))
+                                .child(
+                                    Label::new(format!(":{}", line_number))
+                                        .size(LabelSize::Small)
+                                        .color(Color::Placeholder),
                                 ),
-                            ),
-                        )
-                        .child(Label::new(path).color(Color::Muted)),
+                        ),
                 ),
         )
     }
@@ -273,7 +310,7 @@ impl PickerDelegate for ProjectSymbolsDelegate {
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use gpui::{SemanticVersion, TestAppContext, VisualContext};
+    use gpui::{TestAppContext, VisualContext};
     use language::{FakeLspAdapter, Language, LanguageConfig, LanguageMatcher};
     use lsp::OneOf;
     use project::FakeFs;
@@ -281,6 +318,7 @@ mod tests {
     use settings::SettingsStore;
     use std::{path::Path, sync::Arc};
     use util::path;
+    use workspace::MultiWorkspace;
 
     #[gpui::test]
     async fn test_project_symbols(cx: &mut TestAppContext) {
@@ -335,17 +373,24 @@ mod tests {
                 let executor = cx.background_executor().clone();
                 let fake_symbols = fake_symbols.clone();
                 async move {
+                    let (query, prefixed) = match params.query.strip_prefix("dir::") {
+                        Some(query) => (query, true),
+                        None => (&*params.query, false),
+                    };
                     let candidates = fake_symbols
                         .iter()
                         .enumerate()
+                        .filter(|(_, symbol)| {
+                            !prefixed || symbol.location.uri.path().contains("dir")
+                        })
                         .map(|(id, symbol)| StringMatchCandidate::new(id, &symbol.name))
                         .collect::<Vec<_>>();
-                    let matches = if params.query.is_empty() {
+                    let matches = if query.is_empty() {
                         Vec::new()
                     } else {
                         fuzzy::match_strings(
                             &candidates,
-                            &params.query,
+                            &query,
                             true,
                             true,
                             100,
@@ -365,8 +410,9 @@ mod tests {
             },
         );
 
-        let (workspace, cx) =
-            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
 
         // Create the project symbols view.
         let symbols = cx.new_window_entity(|window, cx| {
@@ -415,6 +461,16 @@ mod tests {
         symbols.read_with(cx, |symbols, _| {
             assert_eq!(symbols.delegate.matches.len(), 0);
         });
+
+        // Check that rust-analyzer path style symbols work
+        symbols.update_in(cx, |p, window, cx| {
+            p.update_matches("dir::to".to_string(), window, cx);
+        });
+
+        cx.run_until_parked();
+        symbols.read_with(cx, |symbols, _| {
+            assert_eq!(symbols.delegate.matches.len(), 1);
+        });
     }
 
     fn init_test(cx: &mut TestAppContext) {
@@ -422,10 +478,7 @@ mod tests {
             let store = SettingsStore::test(cx);
             cx.set_global(store);
             theme::init(theme::LoadThemes::JustBase, cx);
-            release_channel::init(SemanticVersion::default(), cx);
-            language::init(cx);
-            Project::init_settings(cx);
-            workspace::init_settings(cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
             editor::init(cx);
         });
     }
@@ -439,7 +492,7 @@ mod tests {
             deprecated: None,
             container_name: None,
             location: lsp::Location::new(
-                lsp::Url::from_file_path(path.as_ref()).unwrap(),
+                lsp::Uri::from_file_path(path.as_ref()).unwrap(),
                 lsp::Range::new(lsp::Position::new(0, 0), lsp::Position::new(0, 0)),
             ),
         }

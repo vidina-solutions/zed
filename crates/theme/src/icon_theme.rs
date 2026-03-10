@@ -28,6 +28,8 @@ pub struct IconTheme {
     pub appearance: Appearance,
     /// The icons used for directories.
     pub directory_icons: DirectoryIcons,
+    /// The icons used for named directories.
+    pub named_directory_icons: HashMap<String, DirectoryIcons>,
     /// The icons used for chevrons.
     pub chevron_icons: ChevronIcons,
     /// The mapping of file stems to their associated icon keys.
@@ -39,7 +41,7 @@ pub struct IconTheme {
 }
 
 /// The icons used for directories.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct DirectoryIcons {
     /// The path to the icon to use for a collapsed directory.
     pub collapsed: Option<SharedString>,
@@ -64,7 +66,7 @@ pub struct IconDefinition {
 }
 
 const FILE_STEMS_BY_ICON_KEY: &[(&str, &[&str])] = &[
-    ("docker", &["Dockerfile"]),
+    ("docker", &["Containerfile", "Dockerfile"]),
     ("ruby", &["Podfile"]),
     ("heroku", &["Procfile"]),
 ];
@@ -86,7 +88,9 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
     ("coffeescript", &["coffee"]),
     (
         "cpp",
-        &["c++", "cc", "cpp", "cxx", "hh", "hpp", "hxx", "inl", "ixx"],
+        &[
+            "c++", "h++", "cc", "cpp", "cppm", "cxx", "hh", "hpp", "hxx", "inl", "ixx",
+        ],
     ),
     ("crystal", &["cr", "ecr"]),
     ("csharp", &["cs"]),
@@ -95,6 +99,15 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
     ("cue", &["cue"]),
     ("dart", &["dart"]),
     ("diff", &["diff"]),
+    (
+        "docker",
+        &[
+            "docker-compose.yml",
+            "docker-compose.yaml",
+            "compose.yml",
+            "compose.yaml",
+        ],
+    ),
     (
         "document",
         &[
@@ -134,12 +147,27 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
     ("font", &["otf", "ttf", "woff", "woff2"]),
     ("fsharp", &["fs"]),
     ("fsproj", &["fsproj"]),
-    ("gitlab", &["gitlab-ci.yml"]),
+    ("gitlab", &["gitlab-ci.yml", "gitlab-ci.yaml"]),
     ("gleam", &["gleam"]),
     ("go", &["go", "mod", "work"]),
     ("graphql", &["gql", "graphql", "graphqls"]),
     ("haskell", &["hs"]),
     ("hcl", &["hcl"]),
+    (
+        "helm",
+        &[
+            "helmfile.yaml",
+            "helmfile.yml",
+            "Chart.yaml",
+            "Chart.yml",
+            "Chart.lock",
+            "values.yaml",
+            "values.yml",
+            "requirements.yaml",
+            "requirements.yml",
+            "tpl",
+        ],
+    ),
     ("html", &["htm", "html"]),
     (
         "image",
@@ -148,10 +176,12 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
             "jxl", "png", "psd", "qoi", "svg", "tiff", "webp",
         ],
     ),
+    ("ipynb", &["ipynb"]),
     ("java", &["java"]),
     ("javascript", &["cjs", "js", "mjs"]),
-    ("json", &["json"]),
+    ("json", &["json", "jsonc"]),
     ("julia", &["jl"]),
+    ("kdl", &["kdl"]),
     ("kotlin", &["kt"]),
     ("lock", &["lock"]),
     ("log", &["log"]),
@@ -159,9 +189,10 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
     ("luau", &["luau"]),
     ("markdown", &["markdown", "md"]),
     ("metal", &["metal"]),
-    ("nim", &["nim"]),
+    ("nim", &["nim", "nims", "nimble"]),
     ("nix", &["nix"]),
     ("ocaml", &["ml", "mli"]),
+    ("odin", &["odin"]),
     ("php", &["php"]),
     (
         "prettier",
@@ -182,6 +213,7 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
         ],
     ),
     ("prisma", &["prisma"]),
+    ("puppet", &["pp"]),
     ("python", &["py"]),
     ("r", &["r", "R"]),
     ("react", &["cjsx", "ctsx", "jsx", "mjsx", "mtsx", "tsx"]),
@@ -190,14 +222,14 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
     ("rust", &["rs"]),
     ("sass", &["sass", "scss"]),
     ("scala", &["scala", "sc"]),
-    ("settings", &["conf", "ini", "yaml", "yml"]),
+    ("settings", &["conf", "ini"]),
     ("solidity", &["sol"]),
     (
         "storage",
         &[
-            "accdb", "csv", "dat", "db", "dbf", "dll", "fmp", "fp7", "frm", "gdb", "ib", "jsonc",
-            "ldf", "mdb", "mdf", "myd", "myi", "pdb", "RData", "rdata", "sav", "sdf", "sql",
-            "sqlite", "tsv",
+            "accdb", "csv", "dat", "db", "dbf", "dll", "fmp", "fp7", "frm", "gdb", "ib", "ldf",
+            "mdb", "mdf", "myd", "myi", "pdb", "RData", "rdata", "sav", "sdf", "sql", "sqlite",
+            "tsv",
         ],
     ),
     (
@@ -216,6 +248,7 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
             "stylelintrc.yml",
         ],
     ),
+    ("surrealql", &["surql"]),
     ("svelte", &["svelte"]),
     ("swift", &["swift"]),
     ("tcl", &["tcl"]),
@@ -270,6 +303,7 @@ const FILE_SUFFIXES_BY_ICON_KEY: &[(&str, &[&str])] = &[
     ("vue", &["vue"]),
     ("vyper", &["vy", "vyi"]),
     ("wgsl", &["wgsl"]),
+    ("yaml", &["yaml", "yml"]),
     ("zig", &["zig"]),
 ];
 
@@ -301,19 +335,22 @@ const FILE_ICONS: &[(&str, &str)] = &[
     ("font", "icons/file_icons/font.svg"),
     ("fsharp", "icons/file_icons/fsharp.svg"),
     ("fsproj", "icons/file_icons/file.svg"),
-    ("gitlab", "icons/file_icons/settings.svg"),
+    ("gitlab", "icons/file_icons/gitlab.svg"),
     ("gleam", "icons/file_icons/gleam.svg"),
     ("go", "icons/file_icons/go.svg"),
     ("graphql", "icons/file_icons/graphql.svg"),
     ("haskell", "icons/file_icons/haskell.svg"),
     ("hcl", "icons/file_icons/hcl.svg"),
+    ("helm", "icons/file_icons/helm.svg"),
     ("heroku", "icons/file_icons/heroku.svg"),
     ("html", "icons/file_icons/html.svg"),
     ("image", "icons/file_icons/image.svg"),
+    ("ipynb", "icons/file_icons/jupyter.svg"),
     ("java", "icons/file_icons/java.svg"),
     ("javascript", "icons/file_icons/javascript.svg"),
     ("json", "icons/file_icons/code.svg"),
     ("julia", "icons/file_icons/julia.svg"),
+    ("kdl", "icons/file_icons/kdl.svg"),
     ("kotlin", "icons/file_icons/kotlin.svg"),
     ("lock", "icons/file_icons/lock.svg"),
     ("log", "icons/file_icons/info.svg"),
@@ -324,10 +361,12 @@ const FILE_ICONS: &[(&str, &str)] = &[
     ("nim", "icons/file_icons/nim.svg"),
     ("nix", "icons/file_icons/nix.svg"),
     ("ocaml", "icons/file_icons/ocaml.svg"),
+    ("odin", "icons/file_icons/odin.svg"),
     ("phoenix", "icons/file_icons/phoenix.svg"),
     ("php", "icons/file_icons/php.svg"),
     ("prettier", "icons/file_icons/prettier.svg"),
     ("prisma", "icons/file_icons/prisma.svg"),
+    ("puppet", "icons/file_icons/puppet.svg"),
     ("python", "icons/file_icons/python.svg"),
     ("r", "icons/file_icons/r.svg"),
     ("react", "icons/file_icons/react.svg"),
@@ -340,6 +379,7 @@ const FILE_ICONS: &[(&str, &str)] = &[
     ("solidity", "icons/file_icons/file.svg"),
     ("storage", "icons/file_icons/database.svg"),
     ("stylelint", "icons/file_icons/javascript.svg"),
+    ("surrealql", "icons/file_icons/surrealql.svg"),
     ("svelte", "icons/file_icons/html.svg"),
     ("swift", "icons/file_icons/swift.svg"),
     ("tcl", "icons/file_icons/tcl.svg"),
@@ -357,6 +397,7 @@ const FILE_ICONS: &[(&str, &str)] = &[
     ("vue", "icons/file_icons/vue.svg"),
     ("vyper", "icons/file_icons/vyper.svg"),
     ("wgsl", "icons/file_icons/wgsl.svg"),
+    ("yaml", "icons/file_icons/yaml.svg"),
     ("zig", "icons/file_icons/zig.svg"),
 ];
 
@@ -386,13 +427,14 @@ static DEFAULT_ICON_THEME: LazyLock<Arc<IconTheme>> = LazyLock::new(|| {
             collapsed: Some("icons/file_icons/folder.svg".into()),
             expanded: Some("icons/file_icons/folder_open.svg".into()),
         },
+        named_directory_icons: HashMap::default(),
         chevron_icons: ChevronIcons {
             collapsed: Some("icons/file_icons/chevron_right.svg".into()),
             expanded: Some("icons/file_icons/chevron_down.svg".into()),
         },
         file_stems: icon_keys_by_association(FILE_STEMS_BY_ICON_KEY),
         file_suffixes: icon_keys_by_association(FILE_SUFFIXES_BY_ICON_KEY),
-        file_icons: HashMap::from_iter(FILE_ICONS.into_iter().map(|(ty, path)| {
+        file_icons: HashMap::from_iter(FILE_ICONS.iter().map(|(ty, path)| {
             (
                 ty.to_string(),
                 IconDefinition {

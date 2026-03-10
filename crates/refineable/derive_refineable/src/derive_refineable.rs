@@ -510,12 +510,12 @@ fn is_refineable_field(f: &Field) -> bool {
 }
 
 fn is_optional_field(f: &Field) -> bool {
-    if let Type::Path(typepath) = &f.ty {
-        if typepath.qself.is_none() {
-            let segments = &typepath.path.segments;
-            if segments.len() == 1 && segments.iter().any(|s| s.ident == "Option") {
-                return true;
-            }
+    if let Type::Path(typepath) = &f.ty
+        && typepath.qself.is_none()
+    {
+        let segments = &typepath.path.segments;
+        if segments.len() == 1 && segments.iter().any(|s| s.ident == "Option") {
+            return true;
         }
     }
     false
@@ -528,7 +528,12 @@ fn get_wrapper_type(field: &Field, ty: &Type) -> syn::Type {
         } else {
             panic!("Expected struct type for a refineable field");
         };
-        let refinement_struct_name = format_ident!("{}Refinement", struct_name);
+
+        let refinement_struct_name = if struct_name.to_string().ends_with("Refinement") {
+            format_ident!("{}", struct_name)
+        } else {
+            format_ident!("{}Refinement", struct_name)
+        };
         let generics = if let Type::Path(tp) = ty {
             &tp.path.segments.last().unwrap().arguments
         } else {

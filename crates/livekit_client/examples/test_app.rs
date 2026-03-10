@@ -23,7 +23,7 @@ actions!(livekit_client, [Quit]);
 fn main() {
     SimpleLogger::init(LevelFilter::Info, Default::default()).expect("could not initialize logger");
 
-    gpui::Application::new().run(|cx| {
+    gpui_platform::application().run(|cx| {
         #[cfg(any(test, feature = "test-support"))]
         println!("USING TEST LIVEKIT");
 
@@ -41,6 +41,7 @@ fn main() {
                 name: "Quit".into(),
                 action: Box::new(Quit),
                 os_action: None,
+                checked: false,
             }],
         }]);
 
@@ -143,7 +144,6 @@ impl LivekitWindow {
             )
             .unwrap()
         })
-        .unwrap()
     }
 
     fn handle_room_event(&mut self, event: RoomEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -159,14 +159,14 @@ impl LivekitWindow {
                 if output
                     .audio_output_stream
                     .as_ref()
-                    .map_or(false, |(track, _)| track.sid() == unpublish_sid)
+                    .is_some_and(|(track, _)| track.sid() == unpublish_sid)
                 {
                     output.audio_output_stream.take();
                 }
                 if output
                     .screen_share_output_view
                     .as_ref()
-                    .map_or(false, |(track, _)| track.sid() == unpublish_sid)
+                    .is_some_and(|(track, _)| track.sid() == unpublish_sid)
                 {
                     output.screen_share_output_view.take();
                 }
@@ -183,7 +183,7 @@ impl LivekitWindow {
                 match track {
                     livekit_client::RemoteTrack::Audio(track) => {
                         output.audio_output_stream = Some((
-                            publication.clone(),
+                            publication,
                             room.play_remote_audio_track(&track, cx).unwrap(),
                         ));
                     }
@@ -255,7 +255,10 @@ impl LivekitWindow {
         } else {
             let room = self.room.clone();
             cx.spawn_in(window, async move |this, cx| {
-                let (publication, stream) = room.publish_local_microphone_track(cx).await.unwrap();
+                let (publication, stream) = room
+                    .publish_local_microphone_track("test_user".to_string(), false, cx)
+                    .await
+                    .unwrap();
                 this.update(cx, |this, cx| {
                     this.microphone_track = Some(publication);
                     this.microphone_stream = Some(stream);
@@ -374,7 +377,7 @@ impl Render for LivekitWindow {
                             .when_some(state.audio_output_stream.as_ref(), |el, state| {
                                 el.child(
                                     button()
-                                        .id(SharedString::from(identity.0.clone()))
+                                        .id(identity.0.clone())
                                         .child(if state.0.is_enabled() {
                                             "Deafen"
                                         } else {

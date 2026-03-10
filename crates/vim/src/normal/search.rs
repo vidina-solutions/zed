@@ -3,14 +3,14 @@ use gpui::{Action, Context, Window, actions};
 use language::Point;
 use schemars::JsonSchema;
 use search::{BufferSearchBar, SearchOptions, buffer_search};
-use serde_derive::Deserialize;
+use serde::Deserialize;
 use settings::Settings;
 use std::{iter::Peekable, str::Chars};
 use util::serde::default_true;
 use workspace::{notifications::NotifyResultExt, searchable::Direction};
 
 use crate::{
-    Vim,
+    Vim, VimSettings,
     command::CommandRange,
     motion::Motion,
     state::{Mode, SearchState},
@@ -34,6 +34,32 @@ pub(crate) struct MoveToNext {
 #[action(namespace = vim)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MoveToPrevious {
+    #[serde(default = "default_true")]
+    case_sensitive: bool,
+    #[serde(default)]
+    partial_word: bool,
+    #[serde(default = "default_true")]
+    regex: bool,
+}
+
+/// Searches for the word under the cursor without moving.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Action)]
+#[action(namespace = vim)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SearchUnderCursor {
+    #[serde(default = "default_true")]
+    case_sensitive: bool,
+    #[serde(default)]
+    partial_word: bool,
+    #[serde(default = "default_true")]
+    regex: bool,
+}
+
+/// Searches for the word under the cursor without moving (backwards).
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Action)]
+#[action(namespace = vim)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SearchUnderCursorPrevious {
     #[serde(default = "default_true")]
     case_sensitive: bool,
     #[serde(default)]
@@ -95,6 +121,8 @@ actions!(
 pub(crate) fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
     Vim::action(editor, cx, Vim::move_to_next);
     Vim::action(editor, cx, Vim::move_to_previous);
+    Vim::action(editor, cx, Vim::search_under_cursor);
+    Vim::action(editor, cx, Vim::search_under_cursor_previous);
     Vim::action(editor, cx, Vim::move_to_next_match);
     Vim::action(editor, cx, Vim::move_to_previous_match);
     Vim::action(editor, cx, Vim::search);
@@ -104,12 +132,47 @@ pub(crate) fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
 }
 
 impl Vim {
+    fn search_under_cursor(
+        &mut self,
+        action: &SearchUnderCursor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_to_internal(
+            Direction::Next,
+            action.case_sensitive,
+            !action.partial_word,
+            action.regex,
+            false,
+            window,
+            cx,
+        )
+    }
+
+    fn search_under_cursor_previous(
+        &mut self,
+        action: &SearchUnderCursorPrevious,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_to_internal(
+            Direction::Prev,
+            action.case_sensitive,
+            !action.partial_word,
+            action.regex,
+            false,
+            window,
+            cx,
+        )
+    }
+
     fn move_to_next(&mut self, action: &MoveToNext, window: &mut Window, cx: &mut Context<Self>) {
         self.move_to_internal(
             Direction::Next,
             action.case_sensitive,
             !action.partial_word,
             action.regex,
+            true,
             window,
             cx,
         )
@@ -126,6 +189,7 @@ impl Vim {
             action.case_sensitive,
             !action.partial_word,
             action.regex,
+            true,
             window,
             cx,
         )
@@ -161,49 +225,79 @@ impl Vim {
         let count = Vim::take_count(cx).unwrap_or(1);
         Vim::take_forced_motion(cx);
         let prior_selections = self.editor_selections(window, cx);
-        pane.update(cx, |pane, cx| {
-            if let Some(search_bar) = pane.toolbar().read(cx).item_of_type::<BufferSearchBar>() {
-                search_bar.update(cx, |search_bar, cx| {
-                    if !search_bar.show(window, cx) {
-                        return;
-                    }
 
-                    search_bar.select_query(window, cx);
-                    cx.focus_self(window);
+        let Some(search_bar) = pane
+            .read(cx)
+            .toolbar()
+            .read(cx)
+            .item_of_type::<BufferSearchBar>()
+        else {
+            return;
+        };
 
-                    search_bar.set_replacement(None, cx);
-                    let mut options = SearchOptions::NONE;
-                    if action.regex {
-                        options |= SearchOptions::REGEX;
-                    }
-                    if action.backwards {
-                        options |= SearchOptions::BACKWARDS;
-                    }
-                    if EditorSettings::get_global(cx).search.case_sensitive {
-                        options |= SearchOptions::CASE_SENSITIVE;
-                    }
-                    search_bar.set_search_options(options, cx);
-                    let prior_mode = if self.temp_mode {
-                        Mode::Insert
-                    } else {
-                        self.mode
-                    };
-
-                    self.search = SearchState {
-                        direction,
-                        count,
-                        prior_selections,
-                        prior_operator: self.operator_stack.last().cloned(),
-                        prior_mode,
-                    }
-                });
+        let shown = search_bar.update(cx, |search_bar, cx| {
+            if !search_bar.show(window, cx) {
+                return false;
             }
-        })
+
+            search_bar.select_query(window, cx);
+            cx.focus_self(window);
+
+            search_bar.set_replacement(None, cx);
+            let mut options = SearchOptions::NONE;
+            if action.regex {
+                options |= SearchOptions::REGEX;
+            }
+            if action.backwards {
+                options |= SearchOptions::BACKWARDS;
+            }
+            if EditorSettings::get_global(cx).search.case_sensitive {
+                options |= SearchOptions::CASE_SENSITIVE;
+            }
+            search_bar.set_search_options(options, cx);
+            true
+        });
+
+        if !shown {
+            return;
+        }
+
+        let subscription = cx.subscribe_in(&search_bar, window, |vim, _, event, window, cx| {
+            if let buffer_search::Event::Dismissed = event {
+                if !vim.search.prior_selections.is_empty() {
+                    let prior_selections: Vec<_> = vim.search.prior_selections.drain(..).collect();
+                    vim.update_editor(cx, |_, editor, cx| {
+                        editor.change_selections(Default::default(), window, cx, |s| {
+                            s.select_ranges(prior_selections);
+                        });
+                    });
+                }
+            }
+        });
+
+        let prior_mode = if self.temp_mode {
+            Mode::Insert
+        } else {
+            self.mode
+        };
+
+        self.search = SearchState {
+            direction,
+            count,
+            prior_selections,
+            prior_operator: self.operator_stack.last().cloned(),
+            prior_mode,
+            helix_select: false,
+            _dismiss_subscription: Some(subscription),
+        }
     }
 
     // hook into the existing to clear out any vim search state on cmd+f or edit -> find.
     fn search_deploy(&mut self, _: &buffer_search::Deploy, _: &mut Window, cx: &mut Context<Self>) {
+        // Preserve the current mode when resetting search state
+        let current_mode = self.mode;
         self.search = Default::default();
+        self.search.prior_mode = current_mode;
         cx.propagate();
     }
 
@@ -215,16 +309,22 @@ impl Vim {
         let new_selections = self.editor_selections(window, cx);
         let result = pane.update(cx, |pane, cx| {
             let search_bar = pane.toolbar().read(cx).item_of_type::<BufferSearchBar>()?;
+            if self.search.helix_select {
+                search_bar.update(cx, |search_bar, cx| {
+                    search_bar.select_all_matches(&Default::default(), window, cx)
+                });
+                return None;
+            }
             search_bar.update(cx, |search_bar, cx| {
                 let mut count = self.search.count;
                 let direction = self.search.direction;
                 search_bar.has_active_match();
-                let new_head = new_selections.last().unwrap().start;
+                let new_head = new_selections.last()?.start;
                 let is_different_head = self
                     .search
                     .prior_selections
                     .last()
-                    .map_or(true, |range| range.start != new_head);
+                    .is_none_or(|range| range.start != new_head);
 
                 if is_different_head {
                     count = count.saturating_sub(1)
@@ -251,9 +351,9 @@ impl Vim {
 
         // If the active editor has changed during a search, don't panic.
         if prior_selections.iter().any(|s| {
-            self.update_editor(window, cx, |_, editor, window, cx| {
+            self.update_editor(cx, |_, editor, cx| {
                 !s.start
-                    .is_valid(&editor.snapshot(window, cx).buffer_snapshot)
+                    .is_valid(&editor.snapshot(window, cx).buffer_snapshot())
             })
             .unwrap_or(true)
         }) {
@@ -322,6 +422,7 @@ impl Vim {
         case_sensitive: bool,
         whole_word: bool,
         regex: bool,
+        move_cursor: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -332,7 +433,7 @@ impl Vim {
         Vim::take_forced_motion(cx);
         let prior_selections = self.editor_selections(window, cx);
         let cursor_word = self.editor_cursor_word(window, cx);
-        let vim = cx.entity().clone();
+        let vim = cx.entity();
 
         let searched = pane.update(cx, |pane, cx| {
             self.search.direction = direction;
@@ -357,37 +458,39 @@ impl Vim {
                     .query_suggestion(window, cx)
                     .or_else(|| cursor_word)
                 else {
-                    drop(search_bar.search("", None, window, cx));
+                    drop(search_bar.search("", None, false, window, cx));
                     return None;
                 };
 
                 let query = regex::escape(&query);
-                Some(search_bar.search(&query, Some(options), window, cx))
+                Some(search_bar.search(&query, Some(options), true, window, cx))
             });
 
             let Some(search) = search else { return false };
 
-            let search_bar = search_bar.downgrade();
-            cx.spawn_in(window, async move |_, cx| {
-                search.await?;
-                search_bar.update_in(cx, |search_bar, window, cx| {
-                    search_bar.select_match(direction, count, window, cx);
+            if move_cursor {
+                let search_bar = search_bar.downgrade();
+                cx.spawn_in(window, async move |_, cx| {
+                    search.await?;
+                    search_bar.update_in(cx, |search_bar, window, cx| {
+                        search_bar.select_match(direction, count, window, cx);
 
-                    vim.update(cx, |vim, cx| {
-                        let new_selections = vim.editor_selections(window, cx);
-                        vim.search_motion(
-                            Motion::ZedSearchResult {
-                                prior_selections,
-                                new_selections,
-                            },
-                            window,
-                            cx,
-                        )
-                    });
-                })?;
-                anyhow::Ok(())
-            })
-            .detach_and_log_err(cx);
+                        vim.update(cx, |vim, cx| {
+                            let new_selections = vim.editor_selections(window, cx);
+                            vim.search_motion(
+                                Motion::ZedSearchResult {
+                                    prior_selections,
+                                    new_selections,
+                                },
+                                window,
+                                cx,
+                            )
+                        });
+                    })?;
+                    anyhow::Ok(())
+                })
+                .detach_and_log_err(cx);
+            }
             true
         });
         if !searched {
@@ -422,7 +525,7 @@ impl Vim {
                         );
                     }
 
-                    Some(search_bar.search(&query, Some(options), window, cx))
+                    Some(search_bar.search(&query, Some(options), true, window, cx))
                 });
                 let Some(search) = search else { return };
                 let search_bar = search_bar.downgrade();
@@ -452,14 +555,15 @@ impl Vim {
         let replacement = action.replacement.clone();
         let Some(((pane, workspace), editor)) = self
             .pane(window, cx)
-            .zip(self.workspace(window))
+            .zip(self.workspace(window, cx))
             .zip(self.editor())
         else {
             return;
         };
-        if let Some(result) = self.update_editor(window, cx, |vim, editor, window, cx| {
+        if let Some(result) = self.update_editor(cx, |vim, editor, cx| {
             let range = action.range.buffer_range(vim, editor, window, cx)?;
-            let snapshot = &editor.snapshot(window, cx).buffer_snapshot;
+            let snapshot = editor.snapshot(window, cx);
+            let snapshot = snapshot.buffer_snapshot();
             let end_point = Point::new(range.end.0, snapshot.line_len(range.end));
             let range = snapshot.anchor_before(Point::new(range.start.0, 0))
                 ..snapshot.anchor_after(end_point);
@@ -495,10 +599,17 @@ impl Vim {
                     search_bar.is_contains_uppercase(&search),
                 );
             } else {
-                options.set(SearchOptions::CASE_SENSITIVE, false)
+                // Fallback: no explicit i/I flags and smartcase disabled;
+                // use global editor.search.case_sensitive.
+                options.set(
+                    SearchOptions::CASE_SENSITIVE,
+                    EditorSettings::get_global(cx).search.case_sensitive,
+                )
             }
 
-            if !replacement.flag_g {
+            // gdefault inverts the behavior of the 'g' flag.
+            let replace_all = VimSettings::get_global(cx).gdefault != replacement.flag_g;
+            if !replace_all {
                 options.set(SearchOptions::ONE_MATCH_PER_LINE, true);
             }
 
@@ -506,7 +617,7 @@ impl Vim {
             if replacement.flag_c {
                 search_bar.focus_replace(window, cx);
             }
-            Some(search_bar.search(&search, Some(options), window, cx))
+            Some(search_bar.search(&search, Some(options), true, window, cx))
         });
         if replacement.flag_n {
             self.move_cursor(
@@ -531,7 +642,7 @@ impl Vim {
                 search_bar.select_last_match(window, cx);
                 search_bar.replace_all(&Default::default(), window, cx);
                 editor.update(cx, |editor, cx| editor.clear_search_within_ranges(cx));
-                let _ = search_bar.search(&search_bar.query(cx), None, window, cx);
+                let _ = search_bar.search(&search_bar.query(cx), None, false, window, cx);
                 vim.update(cx, |vim, cx| {
                     vim.move_cursor(
                         Motion::StartOfLine {
@@ -621,7 +732,7 @@ impl Replacement {
 
         for c in flags.chars() {
             match c {
-                'g' => replacement.flag_g = true,
+                'g' => replacement.flag_g = !replacement.flag_g,
                 'n' => replacement.flag_n = true,
                 'c' => replacement.flag_c = true,
                 'i' => replacement.case_sensitive = Some(false),
@@ -642,7 +753,6 @@ mod test {
         state::Mode,
         test::{NeovimBackedTestContext, VimTestContext},
     };
-    use editor::EditorSettings;
     use editor::{DisplayPoint, display_map::DisplayRow};
 
     use indoc::indoc;
@@ -691,7 +801,7 @@ mod test {
         let mut cx = VimTestContext::new(cx, true).await;
 
         cx.update_global(|store: &mut SettingsStore, cx| {
-            store.update_user_settings::<EditorSettings>(cx, |s| s.search_wrap = Some(false));
+            store.update_user_settings(cx, |s| s.editor.search_wrap = Some(false));
         });
 
         cx.set_state("ˇhi\nhigh\nhi\n", Mode::Normal);
@@ -812,7 +922,7 @@ mod test {
 
         // check that searching with unable search wrap
         cx.update_global(|store: &mut SettingsStore, cx| {
-            store.update_user_settings::<EditorSettings>(cx, |s| s.search_wrap = Some(false));
+            store.update_user_settings(cx, |s| s.editor.search_wrap = Some(false));
         });
         cx.set_state("aa\nbˇb\ncc\ncc\ncc\n", Mode::Normal);
         cx.simulate_keystrokes("/ c c enter");
@@ -1062,6 +1172,59 @@ mod test {
     }
 
     #[gpui::test]
+    async fn test_replace_gdefault(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        // Set the `gdefault` option in both Zed and Neovim.
+        cx.simulate_shared_keystrokes(": s e t space g d e f a u l t")
+            .await;
+        cx.simulate_shared_keystrokes("enter").await;
+
+        cx.set_shared_state(indoc! {
+            "ˇaa aa aa aa
+                aa
+                aa"
+        })
+        .await;
+
+        // With gdefault on, :s/// replaces all matches (like :s///g normally).
+        cx.simulate_shared_keystrokes(": s / a a / b b").await;
+        cx.simulate_shared_keystrokes("enter").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇbb bb bb bb
+                aa
+                aa"
+        });
+
+        // With gdefault on, :s///g replaces only the first match.
+        cx.simulate_shared_keystrokes(": s / b b / c c / g").await;
+        cx.simulate_shared_keystrokes("enter").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇcc bb bb bb
+                aa
+                aa"
+        });
+
+        // Each successive `/g` flag should invert the one before it.
+        cx.simulate_shared_keystrokes(": s / b b / d d / g g").await;
+        cx.simulate_shared_keystrokes("enter").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇcc dd dd dd
+                aa
+                aa"
+        });
+
+        cx.simulate_shared_keystrokes(": s / c c / e e / g g g")
+            .await;
+        cx.simulate_shared_keystrokes("enter").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇee dd dd dd
+                aa
+                aa"
+        });
+    }
+
+    #[gpui::test]
     async fn test_replace_c(cx: &mut gpui::TestAppContext) {
         let mut cx = VimTestContext::new(cx, true).await;
         cx.set_state(
@@ -1157,5 +1320,89 @@ mod test {
                 a
                  "
         });
+    }
+
+    #[gpui::test]
+    async fn test_search_dismiss_restores_cursor(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.set_state("ˇhello world\nfoo bar\nhello again\n", Mode::Normal);
+
+        // Move cursor to line 2
+        cx.simulate_keystrokes("j");
+        cx.run_until_parked();
+        cx.assert_state("hello world\nˇfoo bar\nhello again\n", Mode::Normal);
+
+        // Open search
+        cx.simulate_keystrokes("/");
+        cx.run_until_parked();
+
+        // Dismiss search with Escape - cursor should return to line 2
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        // Cursor should be restored to line 2 where it was when search was opened
+        cx.assert_state("hello world\nˇfoo bar\nhello again\n", Mode::Normal);
+    }
+
+    #[gpui::test]
+    async fn test_search_dismiss_restores_cursor_no_matches(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.set_state("ˇapple\nbanana\ncherry\n", Mode::Normal);
+
+        // Move cursor to line 2
+        cx.simulate_keystrokes("j");
+        cx.run_until_parked();
+        cx.assert_state("apple\nˇbanana\ncherry\n", Mode::Normal);
+
+        // Open search and type query for something that doesn't exist
+        cx.simulate_keystrokes("/ n o n e x i s t e n t");
+        cx.run_until_parked();
+
+        // Dismiss search with Escape - cursor should still be at original position
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        cx.assert_state("apple\nˇbanana\ncherry\n", Mode::Normal);
+    }
+
+    #[gpui::test]
+    async fn test_search_dismiss_after_editor_focus_does_not_restore(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.set_state("ˇhello world\nfoo bar\nhello again\n", Mode::Normal);
+
+        // Move cursor to line 2
+        cx.simulate_keystrokes("j");
+        cx.run_until_parked();
+        cx.assert_state("hello world\nˇfoo bar\nhello again\n", Mode::Normal);
+
+        // Open search and type a query that matches line 3
+        cx.simulate_keystrokes("/ a g a i n");
+        cx.run_until_parked();
+
+        // Simulate the editor gaining focus while search is still open
+        // This represents the user clicking in the editor
+        cx.update_editor(|_, window, cx| cx.focus_self(window));
+        cx.run_until_parked();
+
+        // Now dismiss the search bar directly
+        cx.workspace(|workspace, window, cx| {
+            let pane = workspace.active_pane().read(cx);
+            if let Some(search_bar) = pane
+                .toolbar()
+                .read(cx)
+                .item_of_type::<search::BufferSearchBar>()
+            {
+                search_bar.update(cx, |bar, cx| {
+                    bar.dismiss(&search::buffer_search::Dismiss, window, cx)
+                });
+            }
+        });
+        cx.run_until_parked();
+
+        // Cursor should NOT be restored to line 2 (row 1) where search was opened.
+        // Since the user "clicked" in the editor (by focusing it), prior_selections
+        // was cleared, so dismiss should not restore the cursor.
+        // The cursor should be at the match location on line 3 (row 2).
+        cx.assert_state("hello world\nfoo bar\nhello ˇagain\n", Mode::Normal);
     }
 }

@@ -1,9 +1,8 @@
 use collections::HashMap;
 use schemars::{JsonSchema, json_schema};
 use serde::Deserialize;
-use serde_json_lenient::Value;
 use std::borrow::Cow;
-use util::schemars::DefaultDenyUnknownFields;
+use util::schemars::{AllowTrailingCommas, DefaultDenyUnknownFields};
 
 #[derive(Deserialize)]
 pub struct VsSnippetsFile {
@@ -12,13 +11,14 @@ pub struct VsSnippetsFile {
 }
 
 impl VsSnippetsFile {
-    pub fn generate_json_schema() -> Value {
+    pub fn generate_json_schema() -> serde_json::Value {
         let schema = schemars::generate::SchemaSettings::draft2019_09()
             .with_transform(DefaultDenyUnknownFields)
+            .with_transform(AllowTrailingCommas)
             .into_generator()
             .root_schema_for::<Self>();
 
-        serde_json_lenient::to_value(schema).unwrap()
+        serde_json::to_value(schema).unwrap()
     }
 }
 

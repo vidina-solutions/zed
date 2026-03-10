@@ -1,12 +1,16 @@
-pub mod arc_cow;
 pub mod archive;
 pub mod command;
 pub mod fs;
 pub mod markdown;
+pub mod path_list;
 pub mod paths;
+pub mod process;
 pub mod redact;
+pub mod rel_path;
 pub mod schemars;
 pub mod serde;
+pub mod shell;
+pub mod shell_builder;
 pub mod shell_env;
 pub mod size;
 #[cfg(any(test, feature = "test-support"))]
@@ -14,36 +18,31 @@ pub mod test;
 pub mod time;
 
 use anyhow::Result;
-use futures::Future;
 use itertools::Either;
 use regex::Regex;
-use std::sync::{LazyLock, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::{
     borrow::Cow,
     cmp::{self, Ordering},
-    env,
-    ops::{AddAssign, Range, RangeInclusive},
-    panic::Location,
-    pin::Pin,
-    task::{Context, Poll},
-    time::Instant,
+    ops::{Range, RangeInclusive},
 };
 use unicase::UniCase;
+
+pub use gpui_util::*;
 
 pub use take_until::*;
 #[cfg(any(test, feature = "test-support"))]
 pub use util_macros::{line_endings, path, uri};
 
-#[macro_export]
-macro_rules! debug_panic {
-    ( $($fmt_arg:tt)* ) => {
-        if cfg!(debug_assertions) {
-            panic!( $($fmt_arg)* );
-        } else {
-            let backtrace = std::backtrace::Backtrace::capture();
-            log::error!("{}\n{:?}", format_args!($($fmt_arg)*), backtrace);
-        }
-    };
+pub use self::shell::{
+    get_default_system_shell, get_default_system_shell_preferring_bash, get_system_shell,
+};
+
+#[inline]
+pub const fn is_utf8_char_boundary(u8: u8) -> bool {
+    // This is bit magic equivalent to: b < 128 || b >= 192
+    (u8 as i8) >= -0x40
 }
 
 pub fn truncate(s: &str, max_chars: usize) -> &str {
@@ -128,11 +127,9 @@ pub fn truncate_lines_to_byte_limit(s: &str, max_bytes: usize) -> &str {
     }
 
     for i in (0..max_bytes).rev() {
-        if s.is_char_boundary(i) {
-            if s.as_bytes()[i] == b'\n' {
-                // Since the i-th character is \n, valid to slice at i + 1.
-                return &s[..i + 1];
-            }
+        if s.is_char_boundary(i) && s.as_bytes()[i] == b'\n' {
+            // Since the i-th character is \n, valid to slice at i + 1.
+            return &s[..i + 1];
         }
     }
 
@@ -162,12 +159,6 @@ fn test_truncate_lines_to_byte_limit() {
         truncate_lines_to_byte_limit(text_utf8, 15),
         "Line 1\nLíne 2\n"
     );
-}
-
-pub fn post_inc<T: From<u8> + AddAssign<T> + Copy>(value: &mut T) -> T {
-    let prev = *value;
-    *value += T::from(1);
-    prev
 }
 
 /// Extend a sorted vector with a sorted sequence of items, maintaining the vector's sort order and
@@ -258,6 +249,9 @@ fn load_shell_from_passwd() -> Result<()> {
             &mut result,
         )
     };
+    anyhow::ensure!(!result.is_null(), "passwd entry for uid {} not found", uid);
+
+    // SAFETY: If `getpwuid_r` doesn't error, we have the entry here.
     let entry = unsafe { pwd.assume_init() };
 
     anyhow::ensure!(
@@ -266,7 +260,6 @@ fn load_shell_from_passwd() -> Result<()> {
         uid,
         status
     );
-    anyhow::ensure!(!result.is_null(), "passwd entry for uid {} not found", uid);
     anyhow::ensure!(
         entry.pw_uid == uid,
         "passwd entry has different uid ({}) than getuid ({}) returned",
@@ -275,39 +268,89 @@ fn load_shell_from_passwd() -> Result<()> {
     );
 
     let shell = unsafe { std::ffi::CStr::from_ptr(entry.pw_shell).to_str().unwrap() };
-    if env::var("SHELL").map_or(true, |shell_env| shell_env != shell) {
+    let should_set_shell = std::env::var("SHELL").map_or(true, |shell_env| {
+        shell_env != shell && !std::path::Path::new(&shell_env).exists()
+    });
+
+    if should_set_shell {
         log::info!(
             "updating SHELL environment variable to value from passwd entry: {:?}",
             shell,
         );
-        unsafe { env::set_var("SHELL", shell) };
+        unsafe { std::env::set_var("SHELL", shell) };
     }
 
     Ok(())
 }
 
-#[cfg(unix)]
 /// Returns a shell escaped path for the current zed executable
-pub fn get_shell_safe_zed_path() -> anyhow::Result<String> {
-    use anyhow::Context;
+pub fn get_shell_safe_zed_path(shell_kind: shell::ShellKind) -> anyhow::Result<String> {
+    use anyhow::Context as _;
+    use paths::PathExt;
+    let mut zed_path =
+        std::env::current_exe().context("Failed to determine current zed executable path.")?;
+    if cfg!(target_os = "linux")
+        && !zed_path.is_file()
+        && let Some(truncated) = zed_path
+            .clone()
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(|n| n.strip_suffix(" (deleted)"))
+    {
+        // Might have been deleted during update; let's use the new binary if there is one.
+        zed_path.set_file_name(truncated);
+    }
 
-    let zed_path = std::env::current_exe()
-        .context("Failed to determine current zed executable path.")?
-        .to_string_lossy()
-        .trim_end_matches(" (deleted)") // see https://github.com/rust-lang/rust/issues/69343
-        .to_string();
+    zed_path
+        .try_shell_safe(shell_kind)
+        .context("Failed to shell-escape Zed executable path.")
+}
 
-    // As of writing, this can only be fail if the path contains a null byte, which shouldn't be possible
-    // but shlex has annotated the error as #[non_exhaustive] so we can't make it a compile error if other
-    // errors are introduced in the future :(
-    let zed_path_escaped =
-        shlex::try_quote(&zed_path).context("Failed to shell-escape Zed executable path.")?;
+/// Returns a path for the zed cli executable, this function
+/// should be called from the zed executable, not zed-cli.
+pub fn get_zed_cli_path() -> Result<PathBuf> {
+    use anyhow::Context as _;
+    let zed_path =
+        std::env::current_exe().context("Failed to determine current zed executable path.")?;
+    let parent = zed_path
+        .parent()
+        .context("Failed to determine parent directory of zed executable path.")?;
 
-    return Ok(zed_path_escaped.to_string());
+    let possible_locations: &[&str] = if cfg!(target_os = "macos") {
+        // On macOS, the zed executable and zed-cli are inside the app bundle,
+        // so here ./cli is for both installed and development builds.
+        &["./cli"]
+    } else if cfg!(target_os = "windows") {
+        // bin/zed.exe is for installed builds, ./cli.exe is for development builds.
+        &["bin/zed.exe", "./cli.exe"]
+    } else if cfg!(target_os = "linux") || cfg!(target_os = "freebsd") {
+        // bin is the standard, ./cli is for the target directory in development builds.
+        &["../bin/zed", "./cli"]
+    } else {
+        anyhow::bail!("unsupported platform for determining zed-cli path");
+    };
+
+    possible_locations
+        .iter()
+        .find_map(|p| {
+            parent
+                .join(p)
+                .canonicalize()
+                .ok()
+                .filter(|p| p != &zed_path)
+        })
+        .with_context(|| {
+            format!(
+                "could not find zed-cli from any of: {}",
+                possible_locations.join(", ")
+            )
+        })
 }
 
 #[cfg(unix)]
-pub fn load_login_shell_environment() -> Result<()> {
+pub async fn load_login_shell_environment() -> Result<()> {
+    use anyhow::Context as _;
+
     load_shell_from_passwd().log_err();
 
     // If possible, we want to `cd` in the user's `$HOME` to trigger programs
@@ -315,8 +358,18 @@ pub fn load_login_shell_environment() -> Result<()> {
     // into shell's `cd` command (and hooks) to manipulate env.
     // We do this so that we get the env a user would have when spawning a shell
     // in home directory.
-    for (name, value) in shell_env::capture(paths::home_dir())? {
-        unsafe { env::set_var(&name, &value) };
+    for (name, value) in shell_env::capture(get_system_shell(), &[], paths::home_dir())
+        .await
+        .with_context(|| format!("capturing environment with {:?}", get_system_shell()))?
+    {
+        // Skip SHLVL to prevent it from polluting Zed's process environment.
+        // The login shell used for env capture increments SHLVL, and if we propagate it,
+        // terminals spawned by Zed will inherit it and increment again, causing SHLVL
+        // to start at 2 instead of 1 (and increase by 2 on each reload).
+        if name == "SHLVL" {
+            continue;
+        }
+        unsafe { std::env::set_var(&name, &value) };
     }
 
     log::info!(
@@ -331,13 +384,13 @@ pub fn load_login_shell_environment() -> Result<()> {
 /// Configures the process to start a new session, to prevent interactive shells from taking control
 /// of the terminal.
 ///
-/// For more details: https://registerspill.thorstenball.com/p/how-to-lose-control-of-your-shell
+/// For more details: <https://registerspill.thorstenball.com/p/how-to-lose-control-of-your-shell>
 pub fn set_pre_exec_to_start_new_session(
     command: &mut std::process::Command,
 ) -> &mut std::process::Command {
     // safety: code in pre_exec should be signal safe.
     // https://man7.org/linux/man-pages/man7/signal-safety.7.html
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(unix)]
     unsafe {
         use std::os::unix::process::CommandExt;
         command.pre_exec(|| {
@@ -418,25 +471,6 @@ pub fn merge_non_null_json_value_into(source: serde_json::Value, target: &mut se
     }
 }
 
-pub fn measure<R>(label: &str, f: impl FnOnce() -> R) -> R {
-    static ZED_MEASUREMENTS: OnceLock<bool> = OnceLock::new();
-    let zed_measurements = ZED_MEASUREMENTS.get_or_init(|| {
-        env::var("ZED_MEASUREMENTS")
-            .map(|measurements| measurements == "1" || measurements == "true")
-            .unwrap_or(false)
-    });
-
-    if *zed_measurements {
-        let start = Instant::now();
-        let result = f();
-        let elapsed = start.elapsed();
-        eprintln!("{}: {:?}", label, elapsed);
-        result
-    } else {
-        f()
-    }
-}
-
 pub fn expanded_and_wrapped_usize_range(
     range: Range<usize>,
     additional_before: usize,
@@ -503,318 +537,10 @@ pub fn wrapped_usize_outward_from(
     })
 }
 
-#[cfg(target_os = "windows")]
-pub fn get_windows_system_shell() -> String {
-    use std::path::PathBuf;
-
-    fn find_pwsh_in_programfiles(find_alternate: bool, find_preview: bool) -> Option<PathBuf> {
-        #[cfg(target_pointer_width = "64")]
-        let env_var = if find_alternate {
-            "ProgramFiles(x86)"
-        } else {
-            "ProgramFiles"
-        };
-
-        #[cfg(target_pointer_width = "32")]
-        let env_var = if find_alternate {
-            "ProgramW6432"
-        } else {
-            "ProgramFiles"
-        };
-
-        let install_base_dir = PathBuf::from(std::env::var_os(env_var)?).join("PowerShell");
-        install_base_dir
-            .read_dir()
-            .ok()?
-            .filter_map(Result::ok)
-            .filter(|entry| matches!(entry.file_type(), Ok(ft) if ft.is_dir()))
-            .filter_map(|entry| {
-                let dir_name = entry.file_name();
-                let dir_name = dir_name.to_string_lossy();
-
-                let version = if find_preview {
-                    let dash_index = dir_name.find('-')?;
-                    if &dir_name[dash_index + 1..] != "preview" {
-                        return None;
-                    };
-                    dir_name[..dash_index].parse::<u32>().ok()?
-                } else {
-                    dir_name.parse::<u32>().ok()?
-                };
-
-                let exe_path = entry.path().join("pwsh.exe");
-                if exe_path.exists() {
-                    Some((version, exe_path))
-                } else {
-                    None
-                }
-            })
-            .max_by_key(|(version, _)| *version)
-            .map(|(_, path)| path)
-    }
-
-    fn find_pwsh_in_msix(find_preview: bool) -> Option<PathBuf> {
-        let msix_app_dir =
-            PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("Microsoft\\WindowsApps");
-        if !msix_app_dir.exists() {
-            return None;
-        }
-
-        let prefix = if find_preview {
-            "Microsoft.PowerShellPreview_"
-        } else {
-            "Microsoft.PowerShell_"
-        };
-        msix_app_dir
-            .read_dir()
-            .ok()?
-            .filter_map(|entry| {
-                let entry = entry.ok()?;
-                if !matches!(entry.file_type(), Ok(ft) if ft.is_dir()) {
-                    return None;
-                }
-
-                if !entry.file_name().to_string_lossy().starts_with(prefix) {
-                    return None;
-                }
-
-                let exe_path = entry.path().join("pwsh.exe");
-                exe_path.exists().then_some(exe_path)
-            })
-            .next()
-    }
-
-    fn find_pwsh_in_scoop() -> Option<PathBuf> {
-        let pwsh_exe =
-            PathBuf::from(std::env::var_os("USERPROFILE")?).join("scoop\\shims\\pwsh.exe");
-        pwsh_exe.exists().then_some(pwsh_exe)
-    }
-
-    static SYSTEM_SHELL: LazyLock<String> = LazyLock::new(|| {
-        find_pwsh_in_programfiles(false, false)
-            .or_else(|| find_pwsh_in_programfiles(true, false))
-            .or_else(|| find_pwsh_in_msix(false))
-            .or_else(|| find_pwsh_in_programfiles(false, true))
-            .or_else(|| find_pwsh_in_msix(true))
-            .or_else(|| find_pwsh_in_programfiles(true, true))
-            .or_else(find_pwsh_in_scoop)
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or("powershell.exe".to_string())
-    });
-
-    (*SYSTEM_SHELL).clone()
-}
-
-pub trait ResultExt<E> {
-    type Ok;
-
-    fn log_err(self) -> Option<Self::Ok>;
-    /// Assert that this result should never be an error in development or tests.
-    fn debug_assert_ok(self, reason: &str) -> Self;
-    fn warn_on_err(self) -> Option<Self::Ok>;
-    fn log_with_level(self, level: log::Level) -> Option<Self::Ok>;
-    fn anyhow(self) -> anyhow::Result<Self::Ok>
-    where
-        E: Into<anyhow::Error>;
-}
-
-impl<T, E> ResultExt<E> for Result<T, E>
-where
-    E: std::fmt::Debug,
-{
-    type Ok = T;
-
-    #[track_caller]
-    fn log_err(self) -> Option<T> {
-        self.log_with_level(log::Level::Error)
-    }
-
-    #[track_caller]
-    fn debug_assert_ok(self, reason: &str) -> Self {
-        if let Err(error) = &self {
-            debug_panic!("{reason} - {error:?}");
-        }
-        self
-    }
-
-    #[track_caller]
-    fn warn_on_err(self) -> Option<T> {
-        self.log_with_level(log::Level::Warn)
-    }
-
-    #[track_caller]
-    fn log_with_level(self, level: log::Level) -> Option<T> {
-        match self {
-            Ok(value) => Some(value),
-            Err(error) => {
-                log_error_with_caller(*Location::caller(), error, level);
-                None
-            }
-        }
-    }
-
-    fn anyhow(self) -> anyhow::Result<T>
-    where
-        E: Into<anyhow::Error>,
-    {
-        self.map_err(Into::into)
-    }
-}
-
-fn log_error_with_caller<E>(caller: core::panic::Location<'_>, error: E, level: log::Level)
-where
-    E: std::fmt::Debug,
-{
-    #[cfg(not(target_os = "windows"))]
-    let file = caller.file();
-    #[cfg(target_os = "windows")]
-    let file = caller.file().replace('\\', "/");
-    // In this codebase, the first segment of the file path is
-    // the 'crates' folder, followed by the crate name.
-    let target = file.split('/').nth(1);
-
-    log::logger().log(
-        &log::Record::builder()
-            .target(target.unwrap_or(""))
-            .module_path(target)
-            .args(format_args!("{:?}", error))
-            .file(Some(caller.file()))
-            .line(Some(caller.line()))
-            .level(level)
-            .build(),
-    );
-}
-
-pub fn log_err<E: std::fmt::Debug>(error: &E) {
-    log_error_with_caller(*Location::caller(), error, log::Level::Warn);
-}
-
-pub trait TryFutureExt {
-    fn log_err(self) -> LogErrorFuture<Self>
-    where
-        Self: Sized;
-
-    fn log_tracked_err(self, location: core::panic::Location<'static>) -> LogErrorFuture<Self>
-    where
-        Self: Sized;
-
-    fn warn_on_err(self) -> LogErrorFuture<Self>
-    where
-        Self: Sized;
-    fn unwrap(self) -> UnwrapFuture<Self>
-    where
-        Self: Sized;
-}
-
-impl<F, T, E> TryFutureExt for F
-where
-    F: Future<Output = Result<T, E>>,
-    E: std::fmt::Debug,
-{
-    #[track_caller]
-    fn log_err(self) -> LogErrorFuture<Self>
-    where
-        Self: Sized,
-    {
-        let location = Location::caller();
-        LogErrorFuture(self, log::Level::Error, *location)
-    }
-
-    fn log_tracked_err(self, location: core::panic::Location<'static>) -> LogErrorFuture<Self>
-    where
-        Self: Sized,
-    {
-        LogErrorFuture(self, log::Level::Error, location)
-    }
-
-    #[track_caller]
-    fn warn_on_err(self) -> LogErrorFuture<Self>
-    where
-        Self: Sized,
-    {
-        let location = Location::caller();
-        LogErrorFuture(self, log::Level::Warn, *location)
-    }
-
-    fn unwrap(self) -> UnwrapFuture<Self>
-    where
-        Self: Sized,
-    {
-        UnwrapFuture(self)
-    }
-}
-
-#[must_use]
-pub struct LogErrorFuture<F>(F, log::Level, core::panic::Location<'static>);
-
-impl<F, T, E> Future for LogErrorFuture<F>
-where
-    F: Future<Output = Result<T, E>>,
-    E: std::fmt::Debug,
-{
-    type Output = Option<T>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        let level = self.1;
-        let location = self.2;
-        let inner = unsafe { Pin::new_unchecked(&mut self.get_unchecked_mut().0) };
-        match inner.poll(cx) {
-            Poll::Ready(output) => Poll::Ready(match output {
-                Ok(output) => Some(output),
-                Err(error) => {
-                    log_error_with_caller(location, error, level);
-                    None
-                }
-            }),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-pub struct UnwrapFuture<F>(F);
-
-impl<F, T, E> Future for UnwrapFuture<F>
-where
-    F: Future<Output = Result<T, E>>,
-    E: std::fmt::Debug,
-{
-    type Output = T;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        let inner = unsafe { Pin::new_unchecked(&mut self.get_unchecked_mut().0) };
-        match inner.poll(cx) {
-            Poll::Ready(result) => Poll::Ready(result.unwrap()),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-pub struct Deferred<F: FnOnce()>(Option<F>);
-
-impl<F: FnOnce()> Deferred<F> {
-    /// Drop without running the deferred function.
-    pub fn abort(mut self) {
-        self.0.take();
-    }
-}
-
-impl<F: FnOnce()> Drop for Deferred<F> {
-    fn drop(&mut self) {
-        if let Some(f) = self.0.take() {
-            f()
-        }
-    }
-}
-
-/// Run the given function when the returned value is dropped (unless it's cancelled).
-#[must_use]
-pub fn defer<F: FnOnce()>(f: F) -> Deferred<F> {
-    Deferred(Some(f))
-}
-
 #[cfg(any(test, feature = "test-support"))]
 mod rng {
-    use rand::{Rng, seq::SliceRandom};
+    use rand::prelude::*;
+
     pub struct RandomCharIter<T: Rng> {
         rng: T,
         simple_text: bool,
@@ -824,7 +550,7 @@ mod rng {
         pub fn new(rng: T) -> Self {
             Self {
                 rng,
-                simple_text: std::env::var("SIMPLE_TEXT").map_or(false, |v| !v.is_empty()),
+                simple_text: std::env::var("SIMPLE_TEXT").is_ok_and(|v| !v.is_empty()),
             }
         }
 
@@ -839,18 +565,18 @@ mod rng {
 
         fn next(&mut self) -> Option<Self::Item> {
             if self.simple_text {
-                return if self.rng.gen_range(0..100) < 5 {
+                return if self.rng.random_range(0..100) < 5 {
                     Some('\n')
                 } else {
-                    Some(self.rng.gen_range(b'a'..b'z' + 1).into())
+                    Some(self.rng.random_range(b'a'..b'z' + 1).into())
                 };
             }
 
-            match self.rng.gen_range(0..100) {
+            match self.rng.random_range(0..100) {
                 // whitespace
                 0..=19 => [' ', '\n', '\r', '\t'].choose(&mut self.rng).copied(),
                 // two-byte greek letters
-                20..=32 => char::from_u32(self.rng.gen_range(('α' as u32)..('ω' as u32 + 1))),
+                20..=32 => char::from_u32(self.rng.random_range(('α' as u32)..('ω' as u32 + 1))),
                 // // three-byte characters
                 33..=45 => ['✋', '✅', '❌', '❎', '⭐']
                     .choose(&mut self.rng)
@@ -858,7 +584,7 @@ mod rng {
                 // // four-byte characters
                 46..=58 => ['🍐', '🏀', '🍗', '🎉'].choose(&mut self.rng).copied(),
                 // ascii letters
-                _ => Some(self.rng.gen_range(b'a'..b'z' + 1).into()),
+                _ => Some(self.rng.random_range(b'a'..b'z' + 1).into()),
             }
         }
     }
@@ -872,23 +598,6 @@ pub fn asset_str<A: rust_embed::RustEmbed>(path: &str) -> Cow<'static, str> {
         Cow::Borrowed(bytes) => Cow::Borrowed(std::str::from_utf8(bytes).unwrap()),
         Cow::Owned(bytes) => Cow::Owned(String::from_utf8(bytes).unwrap()),
     }
-}
-
-/// Expands to an immediately-invoked function expression. Good for using the ? operator
-/// in functions which do not return an Option or Result.
-///
-/// Accepts a normal block, an async block, or an async move block.
-#[macro_export]
-macro_rules! maybe {
-    ($block:block) => {
-        (|| $block)()
-    };
-    (async $block:block) => {
-        (|| async $block)()
-    };
-    (async move $block:block) => {
-        (|| async move $block)()
-    };
 }
 
 pub trait RangeExt<T> {
@@ -1020,7 +729,10 @@ pub fn word_consists_of_emojis(s: &str) -> bool {
 
 /// Similar to `str::split`, but also provides byte-offset ranges of the results. Unlike
 /// `str::split`, this is not generic on pattern types and does not return an `Iterator`.
-pub fn split_str_with_ranges(s: &str, pat: impl Fn(char) -> bool) -> Vec<(Range<usize>, &str)> {
+pub fn split_str_with_ranges<'s>(
+    s: &'s str,
+    pat: &dyn Fn(char) -> bool,
+) -> Vec<(Range<usize>, &'s str)> {
     let mut result = Vec::new();
     let mut start = 0;
 
@@ -1044,18 +756,6 @@ pub fn default<D: Default>() -> D {
     Default::default()
 }
 
-pub fn get_system_shell() -> String {
-    #[cfg(target_os = "windows")]
-    {
-        get_windows_system_shell()
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::env::var("SHELL").unwrap_or("/bin/sh".to_string())
-    }
-}
-
 #[derive(Debug)]
 pub enum ConnectionResult<O> {
     Timeout,
@@ -1077,6 +777,36 @@ impl<O> From<anyhow::Result<O>> for ConnectionResult<O> {
     fn from(result: anyhow::Result<O>) -> Self {
         ConnectionResult::Result(result)
     }
+}
+
+/// Normalizes a path by resolving `.` and `..` components without
+/// requiring the path to exist on disk (unlike `canonicalize`).
+pub fn normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut components = path.components().peekable();
+    let mut ret = if let Some(c @ Component::Prefix(..)) = components.peek().cloned() {
+        components.next();
+        PathBuf::from(c.as_os_str())
+    } else {
+        PathBuf::new()
+    };
+
+    for component in components {
+        match component {
+            Component::Prefix(..) => unreachable!(),
+            Component::RootDir => {
+                ret.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                ret.pop();
+            }
+            Component::Normal(c) => {
+                ret.push(c);
+            }
+        }
+    }
+    ret
 }
 
 #[cfg(test)]
@@ -1352,13 +1082,13 @@ Line 3"#
     #[test]
     fn test_split_with_ranges() {
         let input = "hi";
-        let result = split_str_with_ranges(input, |c| c == ' ');
+        let result = split_str_with_ranges(input, &|c| c == ' ');
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], (0..2, "hi"));
 
         let input = "héllo🦀world";
-        let result = split_str_with_ranges(input, |c| c == '🦀');
+        let result = split_str_with_ranges(input, &|c| c == '🦀');
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], (0..6, "héllo")); // 'é' is 2 bytes

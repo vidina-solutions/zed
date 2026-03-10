@@ -5,9 +5,14 @@
 //! read/write messages and the types from types.rs for serialization/deserialization
 //! of messages.
 
-use anyhow::Result;
+use std::time::Duration;
 
-use crate::client::Client;
+use anyhow::Result;
+use futures::channel::oneshot;
+use gpui::AsyncApp;
+use serde_json::Value;
+
+use crate::client::{Client, NotificationSubscription};
 use crate::types::{self, Notification, Request};
 
 pub struct ModelContextProtocol {
@@ -95,7 +100,26 @@ impl InitializedContextServerProtocol {
         self.inner.request(T::METHOD, params).await
     }
 
+    pub async fn request_with<T: Request>(
+        &self,
+        params: T::Params,
+        cancel_rx: Option<oneshot::Receiver<()>>,
+        timeout: Option<Duration>,
+    ) -> Result<T::Response> {
+        self.inner
+            .request_with(T::METHOD, params, cancel_rx, timeout)
+            .await
+    }
+
     pub fn notify<T: Notification>(&self, params: T::Params) -> Result<()> {
         self.inner.notify(T::METHOD, params)
+    }
+
+    pub fn on_notification(
+        &self,
+        method: &'static str,
+        f: Box<dyn 'static + Send + FnMut(Value, AsyncApp)>,
+    ) -> NotificationSubscription {
+        self.inner.on_notification(method, f)
     }
 }

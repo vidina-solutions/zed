@@ -1,36 +1,34 @@
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Result, anyhow};
 use collections::{BTreeMap, HashMap};
-use credentials_provider::CredentialsProvider;
-use editor::{Editor, EditorElement, EditorStyle};
+use deepseek::DEEPSEEK_API_URL;
+
 use futures::Stream;
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream::BoxStream};
-use gpui::{
-    AnyView, AppContext as _, AsyncApp, Entity, FontStyle, Subscription, Task, TextStyle,
-    WhiteSpace,
-};
+use gpui::{AnyView, App, AsyncApp, Context, Entity, SharedString, Task, Window};
 use http_client::HttpClient;
 use language_model::{
-    AuthenticateError, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
-    LanguageModelId, LanguageModelName, LanguageModelProvider, LanguageModelProviderId,
-    LanguageModelProviderName, LanguageModelProviderState, LanguageModelRequest,
-    LanguageModelToolChoice, LanguageModelToolResultContent, LanguageModelToolUse, MessageContent,
-    RateLimiter, Role, StopReason, TokenUsage,
+    ApiKeyState, AuthenticateError, EnvVar, IconOrSvg, LanguageModel, LanguageModelCompletionError,
+    LanguageModelCompletionEvent, LanguageModelId, LanguageModelName, LanguageModelProvider,
+    LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
+    LanguageModelRequest, LanguageModelToolChoice, LanguageModelToolResultContent,
+    LanguageModelToolUse, MessageContent, RateLimiter, Role, StopReason, TokenUsage, env_var,
 };
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+pub use settings::DeepseekAvailableModel as AvailableModel;
 use settings::{Settings, SettingsStore};
 use std::pin::Pin;
-use std::str::FromStr;
-use std::sync::Arc;
-use theme::ThemeSettings;
-use ui::{Icon, IconName, List, prelude::*};
+use std::sync::{Arc, LazyLock};
+
+use ui::{ButtonLink, ConfiguredApiCard, List, ListBulletItem, prelude::*};
+use ui_input::InputField;
 use util::ResultExt;
 
-use crate::{AllLanguageModelSettings, ui::InstructionListItem};
+use crate::provider::util::parse_tool_arguments;
 
 const PROVIDER_ID: LanguageModelProviderId = LanguageModelProviderId::new("deepseek");
 const PROVIDER_NAME: LanguageModelProviderName = LanguageModelProviderName::new("DeepSeek");
-const DEEPSEEK_API_KEY_VAR: &str = "DEEPSEEK_API_KEY";
+
+const API_KEY_ENV_VAR_NAME: &str = "DEEPSEEK_API_KEY";
+static API_KEY_ENV_VAR: LazyLock<EnvVar> = env_var!(API_KEY_ENV_VAR_NAME);
 
 #[derive(Default)]
 struct RawToolCall {
@@ -44,110 +42,46 @@ pub struct DeepSeekSettings {
     pub api_url: String,
     pub available_models: Vec<AvailableModel>,
 }
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct AvailableModel {
-    pub name: String,
-    pub display_name: Option<String>,
-    pub max_tokens: u64,
-    pub max_output_tokens: Option<u64>,
-}
-
 pub struct DeepSeekLanguageModelProvider {
     http_client: Arc<dyn HttpClient>,
     state: Entity<State>,
 }
 
 pub struct State {
-    api_key: Option<String>,
-    api_key_from_env: bool,
-    _subscription: Subscription,
+    api_key_state: ApiKeyState,
 }
 
 impl State {
     fn is_authenticated(&self) -> bool {
-        self.api_key.is_some()
+        self.api_key_state.has_key()
     }
 
-    fn reset_api_key(&self, cx: &mut Context<Self>) -> Task<Result<()>> {
-        let credentials_provider = <dyn CredentialsProvider>::global(cx);
-        let api_url = AllLanguageModelSettings::get_global(cx)
-            .deepseek
-            .api_url
-            .clone();
-        cx.spawn(async move |this, cx| {
-            credentials_provider
-                .delete_credentials(&api_url, &cx)
-                .await
-                .log_err();
-            this.update(cx, |this, cx| {
-                this.api_key = None;
-                this.api_key_from_env = false;
-                cx.notify();
-            })
-        })
+    fn set_api_key(&mut self, api_key: Option<String>, cx: &mut Context<Self>) -> Task<Result<()>> {
+        let api_url = DeepSeekLanguageModelProvider::api_url(cx);
+        self.api_key_state
+            .store(api_url, api_key, |this| &mut this.api_key_state, cx)
     }
 
-    fn set_api_key(&mut self, api_key: String, cx: &mut Context<Self>) -> Task<Result<()>> {
-        let credentials_provider = <dyn CredentialsProvider>::global(cx);
-        let api_url = AllLanguageModelSettings::get_global(cx)
-            .deepseek
-            .api_url
-            .clone();
-        cx.spawn(async move |this, cx| {
-            credentials_provider
-                .write_credentials(&api_url, "Bearer", api_key.as_bytes(), &cx)
-                .await?;
-            this.update(cx, |this, cx| {
-                this.api_key = Some(api_key);
-                cx.notify();
-            })
-        })
-    }
-
-    fn authenticate(&self, cx: &mut Context<Self>) -> Task<Result<(), AuthenticateError>> {
-        if self.is_authenticated() {
-            return Task::ready(Ok(()));
-        }
-
-        let credentials_provider = <dyn CredentialsProvider>::global(cx);
-        let api_url = AllLanguageModelSettings::get_global(cx)
-            .deepseek
-            .api_url
-            .clone();
-        cx.spawn(async move |this, cx| {
-            let (api_key, from_env) = if let Ok(api_key) = std::env::var(DEEPSEEK_API_KEY_VAR) {
-                (api_key, true)
-            } else {
-                let (_, api_key) = credentials_provider
-                    .read_credentials(&api_url, &cx)
-                    .await?
-                    .ok_or(AuthenticateError::CredentialsNotFound)?;
-                (
-                    String::from_utf8(api_key).context("invalid {PROVIDER_NAME} API key")?,
-                    false,
-                )
-            };
-
-            this.update(cx, |this, cx| {
-                this.api_key = Some(api_key);
-                this.api_key_from_env = from_env;
-                cx.notify();
-            })?;
-
-            Ok(())
-        })
+    fn authenticate(&mut self, cx: &mut Context<Self>) -> Task<Result<(), AuthenticateError>> {
+        let api_url = DeepSeekLanguageModelProvider::api_url(cx);
+        self.api_key_state
+            .load_if_needed(api_url, |this| &mut this.api_key_state, cx)
     }
 }
 
 impl DeepSeekLanguageModelProvider {
     pub fn new(http_client: Arc<dyn HttpClient>, cx: &mut App) -> Self {
-        let state = cx.new(|cx| State {
-            api_key: None,
-            api_key_from_env: false,
-            _subscription: cx.observe_global::<SettingsStore>(|_this: &mut State, cx| {
+        let state = cx.new(|cx| {
+            cx.observe_global::<SettingsStore>(|this: &mut State, cx| {
+                let api_url = Self::api_url(cx);
+                this.api_key_state
+                    .handle_url_change(api_url, |this| &mut this.api_key_state, cx);
                 cx.notify();
-            }),
+            })
+            .detach();
+            State {
+                api_key_state: ApiKeyState::new(Self::api_url(cx), (*API_KEY_ENV_VAR).clone()),
+            }
         });
 
         Self { http_client, state }
@@ -160,7 +94,20 @@ impl DeepSeekLanguageModelProvider {
             state: self.state.clone(),
             http_client: self.http_client.clone(),
             request_limiter: RateLimiter::new(4),
-        }) as Arc<dyn LanguageModel>
+        })
+    }
+
+    fn settings(cx: &App) -> &DeepSeekSettings {
+        &crate::AllLanguageModelSettings::get_global(cx).deepseek
+    }
+
+    fn api_url(cx: &App) -> SharedString {
+        let api_url = &Self::settings(cx).api_url;
+        if api_url.is_empty() {
+            DEEPSEEK_API_URL.into()
+        } else {
+            SharedString::new(api_url.as_str())
+        }
     }
 }
 
@@ -181,8 +128,8 @@ impl LanguageModelProvider for DeepSeekLanguageModelProvider {
         PROVIDER_NAME
     }
 
-    fn icon(&self) -> IconName {
-        IconName::AiDeepSeek
+    fn icon(&self) -> IconOrSvg {
+        IconOrSvg::Icon(IconName::AiDeepSeek)
     }
 
     fn default_model(&self, _cx: &App) -> Option<Arc<dyn LanguageModel>> {
@@ -199,11 +146,7 @@ impl LanguageModelProvider for DeepSeekLanguageModelProvider {
         models.insert("deepseek-chat", deepseek::Model::Chat);
         models.insert("deepseek-reasoner", deepseek::Model::Reasoner);
 
-        for available_model in AllLanguageModelSettings::get_global(cx)
-            .deepseek
-            .available_models
-            .iter()
-        {
+        for available_model in &Self::settings(cx).available_models {
             models.insert(
                 &available_model.name,
                 deepseek::Model::Custom {
@@ -229,13 +172,19 @@ impl LanguageModelProvider for DeepSeekLanguageModelProvider {
         self.state.update(cx, |state, cx| state.authenticate(cx))
     }
 
-    fn configuration_view(&self, window: &mut Window, cx: &mut App) -> AnyView {
+    fn configuration_view(
+        &self,
+        _target_agent: language_model::ConfigurationViewTargetAgent,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyView {
         cx.new(|cx| ConfigurationView::new(self.state.clone(), window, cx))
             .into()
     }
 
     fn reset_credentials(&self, cx: &mut App) -> Task<Result<()>> {
-        self.state.update(cx, |state, cx| state.reset_api_key(cx))
+        self.state
+            .update(cx, |state, cx| state.set_api_key(None, cx))
     }
 }
 
@@ -254,15 +203,18 @@ impl DeepSeekLanguageModel {
         cx: &AsyncApp,
     ) -> BoxFuture<'static, Result<BoxStream<'static, Result<deepseek::StreamResponse>>>> {
         let http_client = self.http_client.clone();
-        let Ok((api_key, api_url)) = cx.read_entity(&self.state, |state, cx| {
-            let settings = &AllLanguageModelSettings::get_global(cx).deepseek;
-            (state.api_key.clone(), settings.api_url.clone())
-        }) else {
-            return futures::future::ready(Err(anyhow!("App state dropped"))).boxed();
-        };
+
+        let (api_key, api_url) = self.state.read_with(cx, |state, cx| {
+            let api_url = DeepSeekLanguageModelProvider::api_url(cx);
+            (state.api_key_state.key(&api_url), api_url)
+        });
 
         let future = self.request_limiter.stream(async move {
-            let api_key = api_key.context("Missing DeepSeek API Key")?;
+            let Some(api_key) = api_key else {
+                return Err(LanguageModelCompletionError::NoApiKey {
+                    provider: PROVIDER_NAME,
+                });
+            };
             let request =
                 deepseek::stream_completion(http_client.as_ref(), &api_url, &api_key, request);
             let response = request.await?;
@@ -291,6 +243,10 @@ impl LanguageModel for DeepSeekLanguageModel {
     }
 
     fn supports_tools(&self) -> bool {
+        true
+    }
+
+    fn supports_streaming_tools(&self) -> bool {
         true
     }
 
@@ -367,9 +323,11 @@ pub fn into_deepseek(
     model: &deepseek::Model,
     max_output_tokens: Option<u64>,
 ) -> deepseek::Request {
-    let is_reasoner = *model == deepseek::Model::Reasoner;
+    let is_reasoner = model == &deepseek::Model::Reasoner;
 
     let mut messages = Vec::new();
+    let mut current_reasoning: Option<String> = None;
+
     for message in request.messages {
         for content in message.content {
             match content {
@@ -378,10 +336,14 @@ pub fn into_deepseek(
                     Role::Assistant => deepseek::RequestMessage::Assistant {
                         content: Some(text),
                         tool_calls: Vec::new(),
+                        reasoning_content: current_reasoning.take(),
                     },
                     Role::System => deepseek::RequestMessage::System { content: text },
                 }),
-                MessageContent::Thinking { .. } => {}
+                MessageContent::Thinking { text, .. } => {
+                    // Accumulate reasoning content for next assistant message
+                    current_reasoning.get_or_insert_default().push_str(&text);
+                }
                 MessageContent::RedactedThinking(_) => {}
                 MessageContent::Image(_) => {}
                 MessageContent::ToolUse(tool_use) => {
@@ -404,6 +366,7 @@ pub fn into_deepseek(
                         messages.push(deepseek::RequestMessage::Assistant {
                             content: None,
                             tool_calls: vec![tool_call],
+                            reasoning_content: current_reasoning.take(),
                         });
                     }
                 }
@@ -510,6 +473,23 @@ impl DeepSeekEventMapper {
                         entry.arguments.push_str(&arguments);
                     }
                 }
+
+                if !entry.id.is_empty() && !entry.name.is_empty() {
+                    if let Ok(input) = serde_json::from_str::<serde_json::Value>(
+                        &partial_json_fixer::fix_json(&entry.arguments),
+                    ) {
+                        events.push(Ok(LanguageModelCompletionEvent::ToolUse(
+                            LanguageModelToolUse {
+                                id: entry.id.clone().into(),
+                                name: entry.name.as_str().into(),
+                                is_input_complete: false,
+                                input,
+                                raw_input: entry.arguments.clone(),
+                                thought_signature: None,
+                            },
+                        )));
+                    }
+                }
             }
         }
 
@@ -528,7 +508,7 @@ impl DeepSeekEventMapper {
             }
             Some("tool_calls") => {
                 events.extend(self.tool_calls_by_index.drain().map(|(_, tool_call)| {
-                    match serde_json::Value::from_str(&tool_call.arguments) {
+                    match parse_tool_arguments(&tool_call.arguments) {
                         Ok(input) => Ok(LanguageModelCompletionEvent::ToolUse(
                             LanguageModelToolUse {
                                 id: tool_call.id.clone().into(),
@@ -536,6 +516,7 @@ impl DeepSeekEventMapper {
                                 is_input_complete: true,
                                 input,
                                 raw_input: tool_call.arguments.clone(),
+                                thought_signature: None,
                             },
                         )),
                         Err(error) => Ok(LanguageModelCompletionEvent::ToolUseJsonParseError {
@@ -561,18 +542,15 @@ impl DeepSeekEventMapper {
 }
 
 struct ConfigurationView {
-    api_key_editor: Entity<Editor>,
+    api_key_editor: Entity<InputField>,
     state: Entity<State>,
     load_credentials_task: Option<Task<()>>,
 }
 
 impl ConfigurationView {
     fn new(state: Entity<State>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let api_key_editor = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("sk-00000000000000000000000000000000", cx);
-            editor
-        });
+        let api_key_editor =
+            cx.new(|cx| InputField::new(window, cx, "sk-00000000000000000000000000000000"));
 
         cx.observe(&state, |_, _, cx| {
             cx.notify();
@@ -582,10 +560,7 @@ impl ConfigurationView {
         let load_credentials_task = Some(cx.spawn({
             let state = state.clone();
             async move |this, cx| {
-                if let Some(task) = state
-                    .update(cx, |state, cx| state.authenticate(cx))
-                    .log_err()
-                {
+                if let Some(task) = Some(state.update(cx, |state, cx| state.authenticate(cx))) {
                     let _ = task.await;
                 }
 
@@ -605,7 +580,7 @@ impl ConfigurationView {
     }
 
     fn save_api_key(&mut self, _: &menu::Confirm, _window: &mut Window, cx: &mut Context<Self>) {
-        let api_key = self.api_key_editor.read(cx).text(cx);
+        let api_key = self.api_key_editor.read(cx).text(cx).trim().to_string();
         if api_key.is_empty() {
             return;
         }
@@ -613,12 +588,10 @@ impl ConfigurationView {
         let state = self.state.clone();
         cx.spawn(async move |_, cx| {
             state
-                .update(cx, |state, cx| state.set_api_key(api_key, cx))?
+                .update(cx, |state, cx| state.set_api_key(Some(api_key), cx))
                 .await
         })
         .detach_and_log_err(cx);
-
-        cx.notify();
     }
 
     fn reset_api_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -626,38 +599,12 @@ impl ConfigurationView {
             .update(cx, |editor, cx| editor.set_text("", window, cx));
 
         let state = self.state.clone();
-        cx.spawn(async move |_, cx| state.update(cx, |state, cx| state.reset_api_key(cx))?.await)
-            .detach_and_log_err(cx);
-
-        cx.notify();
-    }
-
-    fn render_api_key_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let settings = ThemeSettings::get_global(cx);
-        let text_style = TextStyle {
-            color: cx.theme().colors().text,
-            font_family: settings.ui_font.family.clone(),
-            font_features: settings.ui_font.features.clone(),
-            font_fallbacks: settings.ui_font.fallbacks.clone(),
-            font_size: rems(0.875).into(),
-            font_weight: settings.ui_font.weight,
-            font_style: FontStyle::Normal,
-            line_height: relative(1.3),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-            white_space: WhiteSpace::Normal,
-            ..Default::default()
-        };
-        EditorElement::new(
-            &self.api_key_editor,
-            EditorStyle {
-                background: cx.theme().colors().editor_background,
-                local_player: cx.theme().players().local(),
-                text: text_style,
-                ..Default::default()
-            },
-        )
+        cx.spawn(async move |_, cx| {
+            state
+                .update(cx, |state, cx| state.set_api_key(None, cx))
+                .await
+        })
+        .detach_and_log_err(cx);
     }
 
     fn should_render_editor(&self, cx: &mut Context<Self>) -> bool {
@@ -667,10 +614,22 @@ impl ConfigurationView {
 
 impl Render for ConfigurationView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let env_var_set = self.state.read(cx).api_key_from_env;
+        let env_var_set = self.state.read(cx).api_key_state.is_from_env_var();
+        let configured_card_label = if env_var_set {
+            format!("API key set in {API_KEY_ENV_VAR_NAME} environment variable")
+        } else {
+            let api_url = DeepSeekLanguageModelProvider::api_url(cx);
+            if api_url == DEEPSEEK_API_URL {
+                "API key configured".to_string()
+            } else {
+                format!("API key configured for {}", api_url)
+            }
+        };
 
         if self.load_credentials_task.is_some() {
-            div().child(Label::new("Loading credentials...")).into_any()
+            div()
+                .child(Label::new("Loading credentials..."))
+                .into_any_element()
         } else if self.should_render_editor(cx) {
             v_flex()
                 .size_full()
@@ -678,67 +637,32 @@ impl Render for ConfigurationView {
                 .child(Label::new("To use DeepSeek in Zed, you need an API key:"))
                 .child(
                     List::new()
-                        .child(InstructionListItem::new(
-                            "Get your API key from the",
-                            Some("DeepSeek console"),
-                            Some("https://platform.deepseek.com/api_keys"),
-                        ))
-                        .child(InstructionListItem::text_only(
+                        .child(
+                            ListBulletItem::new("")
+                                .child(Label::new("Get your API key from the"))
+                                .child(ButtonLink::new(
+                                    "DeepSeek console",
+                                    "https://platform.deepseek.com/api_keys",
+                                )),
+                        )
+                        .child(ListBulletItem::new(
                             "Paste your API key below and hit enter to start using the assistant",
                         )),
                 )
-                .child(
-                    h_flex()
-                        .w_full()
-                        .my_2()
-                        .px_2()
-                        .py_1()
-                        .bg(cx.theme().colors().editor_background)
-                        .border_1()
-                        .border_color(cx.theme().colors().border)
-                        .rounded_sm()
-                        .child(self.render_api_key_editor(cx)),
-                )
+                .child(self.api_key_editor.clone())
                 .child(
                     Label::new(format!(
-                        "Or set the {} environment variable.",
-                        DEEPSEEK_API_KEY_VAR
+                        "You can also set the {API_KEY_ENV_VAR_NAME} environment variable and restart Zed."
                     ))
                     .size(LabelSize::Small)
                     .color(Color::Muted),
                 )
-                .into_any()
+                .into_any_element()
         } else {
-            h_flex()
-                .mt_1()
-                .p_1()
-                .justify_between()
-                .rounded_md()
-                .border_1()
-                .border_color(cx.theme().colors().border)
-                .bg(cx.theme().colors().background)
-                .child(
-                    h_flex()
-                        .gap_1()
-                        .child(Icon::new(IconName::Check).color(Color::Success))
-                        .child(Label::new(if env_var_set {
-                            format!("API key set in {}", DEEPSEEK_API_KEY_VAR)
-                        } else {
-                            "API key configured".to_string()
-                        })),
-                )
-                .child(
-                    Button::new("reset-key", "Reset Key")
-                        .label_size(LabelSize::Small)
-                        .icon(Some(IconName::Trash))
-                        .icon_size(IconSize::Small)
-                        .icon_position(IconPosition::Start)
-                        .disabled(env_var_set)
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.reset_api_key(window, cx)),
-                        ),
-                )
-                .into_any()
+            ConfiguredApiCard::new(configured_card_label)
+                .disabled(env_var_set)
+                .on_click(cx.listener(|this, _, window, cx| this.reset_api_key(window, cx)))
+                .into_any_element()
         }
     }
 }

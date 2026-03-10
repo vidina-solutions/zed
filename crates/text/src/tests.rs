@@ -16,7 +16,7 @@ fn init_logger() {
 
 #[test]
 fn test_edit() {
-    let mut buffer = Buffer::new(0, BufferId::new(1).unwrap(), "abc");
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "abc");
     assert_eq!(buffer.text(), "abc");
     buffer.edit([(3..3, "def")]);
     assert_eq!(buffer.text(), "abcdef");
@@ -36,14 +36,18 @@ fn test_random_edits(mut rng: StdRng) {
         .map(|i| i.parse().expect("invalid `OPERATIONS` variable"))
         .unwrap_or(10);
 
-    let reference_string_len = rng.gen_range(0..3);
+    let reference_string_len = rng.random_range(0..3);
     let mut reference_string = RandomCharIter::new(&mut rng)
         .take(reference_string_len)
         .collect::<String>();
-    let mut buffer = Buffer::new(0, BufferId::new(1).unwrap(), reference_string.clone());
+    let mut buffer = Buffer::new(
+        ReplicaId::LOCAL,
+        BufferId::new(1).unwrap(),
+        reference_string.clone(),
+    );
     LineEnding::normalize(&mut reference_string);
 
-    buffer.set_group_interval(Duration::from_millis(rng.gen_range(0..=200)));
+    buffer.set_group_interval(Duration::from_millis(rng.random_range(0..=200)));
     let mut buffer_versions = Vec::new();
     log::info!(
         "buffer text {:?}, version: {:?}",
@@ -64,7 +68,7 @@ fn test_random_edits(mut rng: StdRng) {
             buffer.version()
         );
 
-        if rng.gen_bool(0.25) {
+        if rng.random_bool(0.25) {
             buffer.randomly_undo_redo(&mut rng);
             reference_string = buffer.text();
             log::info!(
@@ -82,7 +86,7 @@ fn test_random_edits(mut rng: StdRng) {
 
         buffer.check_invariants();
 
-        if rng.gen_bool(0.3) {
+        if rng.random_bool(0.3) {
             buffer_versions.push((buffer.clone(), buffer.subscribe()));
         }
     }
@@ -112,8 +116,9 @@ fn test_random_edits(mut rng: StdRng) {
         );
 
         for _ in 0..5 {
-            let end_ix = old_buffer.clip_offset(rng.gen_range(0..=old_buffer.len()), Bias::Right);
-            let start_ix = old_buffer.clip_offset(rng.gen_range(0..=end_ix), Bias::Left);
+            let end_ix =
+                old_buffer.clip_offset(rng.random_range(0..=old_buffer.len()), Bias::Right);
+            let start_ix = old_buffer.clip_offset(rng.random_range(0..=end_ix), Bias::Left);
             let range = old_buffer.anchor_before(start_ix)..old_buffer.anchor_after(end_ix);
             let mut old_text = old_buffer.text_for_range(range.clone()).collect::<String>();
             let edits = buffer
@@ -175,7 +180,11 @@ fn test_line_endings() {
         LineEnding::Windows
     );
 
-    let mut buffer = Buffer::new(0, BufferId::new(1).unwrap(), "one\r\ntwo\rthree");
+    let mut buffer = Buffer::new(
+        ReplicaId::LOCAL,
+        BufferId::new(1).unwrap(),
+        "one\r\ntwo\rthree",
+    );
     assert_eq!(buffer.text(), "one\ntwo\nthree");
     assert_eq!(buffer.line_ending(), LineEnding::Windows);
     buffer.check_invariants();
@@ -189,7 +198,7 @@ fn test_line_endings() {
 
 #[test]
 fn test_line_len() {
-    let mut buffer = Buffer::new(0, BufferId::new(1).unwrap(), "");
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "");
     buffer.edit([(0..0, "abcd\nefg\nhij")]);
     buffer.edit([(12..12, "kl\nmno")]);
     buffer.edit([(18..18, "\npqrs\n")]);
@@ -206,7 +215,7 @@ fn test_line_len() {
 #[test]
 fn test_common_prefix_at_position() {
     let text = "a = str; b = δα";
-    let buffer = Buffer::new(0, BufferId::new(1).unwrap(), text);
+    let buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), text);
 
     let offset1 = offset_after(text, "str");
     let offset2 = offset_after(text, "δα");
@@ -255,7 +264,7 @@ fn test_common_prefix_at_position() {
 #[test]
 fn test_text_summary_for_range() {
     let buffer = Buffer::new(
-        0,
+        ReplicaId::LOCAL,
         BufferId::new(1).unwrap(),
         "ab\nefg\nhklm\nnopqrs\ntuvwxyz",
     );
@@ -347,7 +356,7 @@ fn test_text_summary_for_range() {
 
 #[test]
 fn test_chars_at() {
-    let mut buffer = Buffer::new(0, BufferId::new(1).unwrap(), "");
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "");
     buffer.edit([(0..0, "abcd\nefgh\nij")]);
     buffer.edit([(12..12, "kl\nmno")]);
     buffer.edit([(18..18, "\npqrs")]);
@@ -369,7 +378,7 @@ fn test_chars_at() {
     assert_eq!(chars.collect::<String>(), "PQrs");
 
     // Regression test:
-    let mut buffer = Buffer::new(0, BufferId::new(1).unwrap(), "");
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "");
     buffer.edit([(0..0, "[workspace]\nmembers = [\n    \"xray_core\",\n    \"xray_server\",\n    \"xray_cli\",\n    \"xray_wasm\",\n]\n")]);
     buffer.edit([(60..60, "\n")]);
 
@@ -379,7 +388,7 @@ fn test_chars_at() {
 
 #[test]
 fn test_anchors() {
-    let mut buffer = Buffer::new(0, BufferId::new(1).unwrap(), "");
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "");
     buffer.edit([(0..0, "abc")]);
     let left_anchor = buffer.anchor_before(2);
     let right_anchor = buffer.anchor_after(2);
@@ -497,7 +506,7 @@ fn test_anchors() {
 
 #[test]
 fn test_anchors_at_start_and_end() {
-    let mut buffer = Buffer::new(0, BufferId::new(1).unwrap(), "");
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "");
     let before_start_anchor = buffer.anchor_before(0);
     let after_end_anchor = buffer.anchor_after(0);
 
@@ -520,7 +529,7 @@ fn test_anchors_at_start_and_end() {
 
 #[test]
 fn test_undo_redo() {
-    let mut buffer = Buffer::new(0, BufferId::new(1).unwrap(), "1234");
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "1234");
     // Set group interval to zero so as to not group edits in the undo stack.
     buffer.set_group_interval(Duration::from_secs(0));
 
@@ -557,7 +566,7 @@ fn test_undo_redo() {
 #[test]
 fn test_history() {
     let mut now = Instant::now();
-    let mut buffer = Buffer::new(0, BufferId::new(1).unwrap(), "123456");
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "123456");
     buffer.set_group_interval(Duration::from_millis(300));
 
     let transaction_1 = buffer.start_transaction_at(now).unwrap();
@@ -624,7 +633,7 @@ fn test_history() {
 #[test]
 fn test_finalize_last_transaction() {
     let now = Instant::now();
-    let mut buffer = Buffer::new(0, BufferId::new(1).unwrap(), "123456");
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "123456");
     buffer.history.group_interval = Duration::from_millis(1);
 
     buffer.start_transaction_at(now);
@@ -660,7 +669,7 @@ fn test_finalize_last_transaction() {
 #[test]
 fn test_edited_ranges_for_transaction() {
     let now = Instant::now();
-    let mut buffer = Buffer::new(0, BufferId::new(1).unwrap(), "1234567");
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "1234567");
 
     buffer.start_transaction_at(now);
     buffer.edit([(2..4, "cd")]);
@@ -699,9 +708,9 @@ fn test_edited_ranges_for_transaction() {
 fn test_concurrent_edits() {
     let text = "abcdef";
 
-    let mut buffer1 = Buffer::new(1, BufferId::new(1).unwrap(), text);
-    let mut buffer2 = Buffer::new(2, BufferId::new(1).unwrap(), text);
-    let mut buffer3 = Buffer::new(3, BufferId::new(1).unwrap(), text);
+    let mut buffer1 = Buffer::new(ReplicaId::new(1), BufferId::new(1).unwrap(), text);
+    let mut buffer2 = Buffer::new(ReplicaId::new(2), BufferId::new(1).unwrap(), text);
+    let mut buffer3 = Buffer::new(ReplicaId::new(3), BufferId::new(1).unwrap(), text);
 
     let buf1_op = buffer1.edit([(1..2, "12")]);
     assert_eq!(buffer1.text(), "a12cdef");
@@ -731,7 +740,7 @@ fn test_random_concurrent_edits(mut rng: StdRng) {
         .map(|i| i.parse().expect("invalid `OPERATIONS` variable"))
         .unwrap_or(10);
 
-    let base_text_len = rng.gen_range(0..10);
+    let base_text_len = rng.random_range(0..10);
     let base_text = RandomCharIter::new(&mut rng)
         .take(base_text_len)
         .collect::<String>();
@@ -740,25 +749,29 @@ fn test_random_concurrent_edits(mut rng: StdRng) {
     let mut network = Network::new(rng.clone());
 
     for i in 0..peers {
-        let mut buffer = Buffer::new(i as ReplicaId, BufferId::new(1).unwrap(), base_text.clone());
-        buffer.history.group_interval = Duration::from_millis(rng.gen_range(0..=200));
+        let mut buffer = Buffer::new(
+            ReplicaId::new(i as u16),
+            BufferId::new(1).unwrap(),
+            base_text.clone(),
+        );
+        buffer.history.group_interval = Duration::from_millis(rng.random_range(0..=200));
         buffers.push(buffer);
-        replica_ids.push(i as u16);
-        network.add_peer(i as u16);
+        replica_ids.push(ReplicaId::new(i as u16));
+        network.add_peer(ReplicaId::new(i as u16));
     }
 
     log::info!("initial text: {:?}", base_text);
 
     let mut mutation_count = operations;
     loop {
-        let replica_index = rng.gen_range(0..peers);
+        let replica_index = rng.random_range(0..peers);
         let replica_id = replica_ids[replica_index];
         let buffer = &mut buffers[replica_index];
-        match rng.gen_range(0..=100) {
+        match rng.random_range(0..=100) {
             0..=50 if mutation_count != 0 => {
                 let op = buffer.randomly_edit(&mut rng, 5).1;
                 network.broadcast(buffer.replica_id, vec![op]);
-                log::info!("buffer {} text: {:?}", buffer.replica_id, buffer.text());
+                log::info!("buffer {:?} text: {:?}", buffer.replica_id, buffer.text());
                 mutation_count -= 1;
             }
             51..=70 if mutation_count != 0 => {
@@ -770,7 +783,7 @@ fn test_random_concurrent_edits(mut rng: StdRng) {
                 let ops = network.receive(replica_id);
                 if !ops.is_empty() {
                     log::info!(
-                        "peer {} applying {} ops from the network.",
+                        "peer {:?} applying {} ops from the network.",
                         replica_id,
                         ops.len()
                     );
@@ -791,9 +804,194 @@ fn test_random_concurrent_edits(mut rng: StdRng) {
         assert_eq!(
             buffer.text(),
             first_buffer.text(),
-            "Replica {} text != Replica 0 text",
+            "Replica {:?} text != Replica 0 text",
             buffer.replica_id
         );
         buffer.check_invariants();
     }
+}
+
+#[test]
+fn test_new_normalized_splits_large_base_text() {
+    // ASCII text that exceeds max_insertion_len
+    let text = "abcdefghij".repeat(10); // 100 bytes
+    let rope = Rope::from(text.as_str());
+    let buffer = Buffer::new_normalized(
+        ReplicaId::LOCAL,
+        BufferId::new(1).unwrap(),
+        LineEnding::Unix,
+        rope,
+    );
+    assert_eq!(buffer.text(), text);
+    buffer.check_invariants();
+
+    // Verify anchors at various positions, including across chunk boundaries
+    for offset in [0, 1, 15, 16, 17, 50, 99] {
+        let anchor = buffer.anchor_before(offset);
+        assert_eq!(
+            anchor.to_offset(&buffer),
+            offset,
+            "anchor_before({offset}) round-tripped incorrectly"
+        );
+        let anchor = buffer.anchor_after(offset);
+        assert_eq!(
+            anchor.to_offset(&buffer),
+            offset,
+            "anchor_after({offset}) round-tripped incorrectly"
+        );
+    }
+
+    // Verify editing works after a split initialization
+    let mut buffer = buffer;
+    buffer.edit([(50..60, "XYZ")]);
+    let mut expected = text;
+    expected.replace_range(50..60, "XYZ");
+    assert_eq!(buffer.text(), expected);
+    buffer.check_invariants();
+}
+
+#[test]
+fn test_new_normalized_splits_large_base_text_with_multibyte_chars() {
+    // Use multi-byte chars (é is 2 bytes in UTF-8) so that a naive byte-level
+    // split would land in the middle of a character.
+    let unit = "ééééééééé"; // 9 chars × 2 bytes = 18 bytes
+    let text = unit.repeat(6); // 108 bytes
+    let rope = Rope::from(text.as_str());
+    let buffer = Buffer::new_normalized(
+        ReplicaId::LOCAL,
+        BufferId::new(1).unwrap(),
+        LineEnding::Unix,
+        rope,
+    );
+    assert_eq!(buffer.text(), text);
+    buffer.check_invariants();
+
+    // Every anchor should resolve correctly even though chunks had to be
+    // rounded down to a char boundary.
+    let snapshot = buffer.snapshot();
+    for offset in (0..text.len()).filter(|o| text.is_char_boundary(*o)) {
+        let anchor = snapshot.anchor_before(offset);
+        assert_eq!(
+            anchor.to_offset(snapshot),
+            offset,
+            "anchor round-trip failed at byte offset {offset}"
+        );
+    }
+}
+
+#[test]
+fn test_new_normalized_small_text_unchanged() {
+    // Text that fits in a single chunk should produce exactly one fragment,
+    // matching the original single-fragment behaviour.
+    let text = "hello world";
+    let rope = Rope::from(text);
+    let buffer = Buffer::new_normalized(
+        ReplicaId::LOCAL,
+        BufferId::new(1).unwrap(),
+        LineEnding::Unix,
+        rope,
+    );
+    assert_eq!(buffer.text(), text);
+    buffer.check_invariants();
+    assert_eq!(buffer.snapshot().fragments.items(&None).len(), 1);
+}
+
+#[test]
+fn test_edit_splits_large_insertion() {
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "abcdefghij");
+
+    let large_text: Arc<str> = "X".repeat(100).into();
+    let edits = vec![(3..7, large_text.clone())];
+
+    buffer.edit(edits);
+
+    let expected = format!("abc{}hij", large_text);
+    assert_eq!(buffer.text(), expected);
+    buffer.check_invariants();
+
+    // Anchors should resolve correctly throughout the buffer.
+    for offset in [0, 3, 50, 103, expected.len()] {
+        let anchor = buffer.anchor_before(offset);
+        assert_eq!(
+            anchor.to_offset(&buffer),
+            offset,
+            "anchor_before({offset}) round-tripped incorrectly"
+        );
+    }
+}
+
+#[test]
+fn test_edit_splits_large_insertion_with_multibyte_chars() {
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "abcdefghij");
+
+    // 4-byte chars so that naive byte splits would land mid-character.
+    let large_text: Arc<str> = "😀".repeat(30).into(); // 30 × 4 = 120 bytes
+    let edits = vec![(5..5, large_text.clone())];
+
+    buffer.edit(edits);
+
+    let expected = format!("abcde{}fghij", large_text);
+    assert_eq!(buffer.text(), expected);
+    buffer.check_invariants();
+}
+
+#[test]
+fn test_edit_splits_large_insertion_among_multiple_edits() {
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "ABCDEFGHIJ");
+
+    let large_text: Arc<str> = "x".repeat(60).into();
+    // Three edits: small, large, small. The large one must be split while
+    // preserving the correct positions of the surrounding edits.
+    let edits = vec![
+        (1..2, Arc::from("y")),     // replace "B" with "y"
+        (4..6, large_text.clone()), // replace "EF" with 60 x's
+        (9..9, Arc::from("z")),     // insert "z" before "J"
+    ];
+
+    buffer.edit(edits);
+
+    // Original: A B C D E F G H I J
+    // After (1..2, "y"):       A y C D E F G H I J
+    // After (4..6, large):     A y C D <60 x's> G H I J
+    // After (9..9, "z"):       A y C D <60 x's> G H I z J
+    let expected = format!("AyCD{}GHIzJ", large_text);
+    assert_eq!(buffer.text(), expected);
+    buffer.check_invariants();
+}
+
+#[test]
+fn test_edit_splits_multiple_large_insertions() {
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "ABCDE");
+
+    let text1: Arc<str> = "a".repeat(40).into();
+    let text2: Arc<str> = "b".repeat(40).into();
+    let edits = vec![
+        (1..2, text1.clone()), // replace "B" with 40 a's
+        (3..4, text2.clone()), // replace "D" with 40 b's
+    ];
+
+    buffer.edit(edits);
+
+    let expected = format!("A{}C{}E", text1, text2);
+    assert_eq!(buffer.text(), expected);
+    buffer.check_invariants();
+}
+
+#[test]
+fn test_edit_undo_after_split() {
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "hello world");
+    buffer.set_group_interval(Duration::from_secs(0));
+    let original = buffer.text();
+
+    let large_text: Arc<str> = "Z".repeat(50).into();
+    let edits = vec![(5..6, large_text)];
+    buffer.edit(edits);
+    assert_ne!(buffer.text(), original);
+    buffer.check_invariants();
+
+    // Undo should restore the original text even though the edit was split
+    // into multiple internal operations grouped in one transaction.
+    buffer.undo();
+    assert_eq!(buffer.text(), original);
+    buffer.check_invariants();
 }

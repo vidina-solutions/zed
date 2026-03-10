@@ -1,38 +1,31 @@
 use crate::prelude::*;
 use gpui::{AnyElement, IntoElement, ParentElement, Styled};
 
-/// Severity levels that determine the style of the banner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Severity {
-    Info,
-    Success,
-    Warning,
-    Error,
-}
-
 /// Banners provide informative and brief messages without interrupting the user.
 /// This component offers four severity levels that can be used depending on the message.
 ///
 /// # Usage Example
 ///
 /// ```
-/// use ui::{Banner};
+/// use ui::prelude::*;
+/// use ui::{Banner, Button, IconName, IconPosition, IconSize, Label, Severity};
 ///
-///    Banner::new()
+/// Banner::new()
 ///     .severity(Severity::Success)
-///     .children(Label::new("This is a success message"))
+///     .children([Label::new("This is a success message")])
 ///     .action_slot(
 ///         Button::new("learn-more", "Learn More")
 ///             .icon(IconName::ArrowUpRight)
-///             .icon_size(IconSize::XSmall)
-///             .icon_position(IconPosition::End),
-///     )
+///             .icon_size(IconSize::Small)
+///             .icon_position(IconPosition::End)
+///     );
 /// ```
 #[derive(IntoElement, RegisterComponent)]
 pub struct Banner {
     severity: Severity,
     children: Vec<AnyElement>,
     action_slot: Option<AnyElement>,
+    wrap_content: bool,
 }
 
 impl Banner {
@@ -42,6 +35,7 @@ impl Banner {
             severity: Severity::Info,
             children: Vec::new(),
             action_slot: None,
+            wrap_content: false,
         }
     }
 
@@ -56,6 +50,12 @@ impl Banner {
         self.action_slot = Some(element.into_any_element());
         self
     }
+
+    /// Sets whether the banner content should wrap.
+    pub fn wrap_content(mut self, wrap: bool) -> Self {
+        self.wrap_content = wrap;
+        self
+    }
 }
 
 impl ParentElement for Banner {
@@ -67,9 +67,10 @@ impl ParentElement for Banner {
 impl RenderOnce for Banner {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let banner = h_flex()
+            .min_w_0()
             .py_0p5()
             .gap_1p5()
-            .flex_wrap()
+            .when(self.wrap_content, |this| this.flex_wrap())
             .justify_between()
             .rounded_sm()
             .border_1();
@@ -106,6 +107,7 @@ impl RenderOnce for Banner {
         let icon_and_child = h_flex()
             .items_start()
             .min_w_0()
+            .flex_1()
             .gap_1p5()
             .child(
                 h_flex()
@@ -113,7 +115,7 @@ impl RenderOnce for Banner {
                     .flex_shrink_0()
                     .child(Icon::new(icon).size(IconSize::XSmall).color(icon_color)),
             )
-            .child(div().min_w_0().children(self.children));
+            .child(div().min_w_0().flex_1().children(self.children));
 
         if let Some(action_slot) = self.action_slot {
             banner = banner
@@ -131,7 +133,7 @@ impl RenderOnce for Banner {
 
 impl Component for Banner {
     fn scope() -> ComponentScope {
-        ComponentScope::Notification
+        ComponentScope::DataDisplay
     }
 
     fn preview(_window: &mut Window, _cx: &mut App) -> Option<AnyElement> {
@@ -150,7 +152,7 @@ impl Component for Banner {
                     .action_slot(
                         Button::new("learn-more", "Learn More")
                             .icon(IconName::ArrowUpRight)
-                            .icon_size(IconSize::XSmall)
+                            .icon_size(IconSize::Small)
                             .icon_position(IconPosition::End),
                     )
                     .into_any_element(),

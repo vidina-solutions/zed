@@ -4,11 +4,11 @@ use std::{
     path::PathBuf,
     sync::{
         Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
-use crate::{SCOPE_STRING_SEP_CHAR, Scope};
+use crate::{SCOPE_STRING_SEP_CHAR, ScopeRef};
 
 // ANSI color escape codes for log levels
 const ANSI_RESET: &str = "\x1b[0m";
@@ -19,40 +19,46 @@ const ANSI_GREEN: &str = "\x1b[32m";
 const ANSI_BLUE: &str = "\x1b[34m";
 const ANSI_MAGENTA: &str = "\x1b[35m";
 
-/// Whether stdout output is enabled.
-static mut ENABLED_SINKS_STDOUT: bool = false;
-
 /// Is Some(file) if file output is enabled.
 static ENABLED_SINKS_FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
 static SINK_FILE_PATH: OnceLock<&'static PathBuf> = OnceLock::new();
 static SINK_FILE_PATH_ROTATE: OnceLock<&'static PathBuf> = OnceLock::new();
+
+// NB: Since this can be accessed in tests, we probably should stick to atomics here.
+/// Whether stdout output is enabled.
+static ENABLED_SINKS_STDOUT: AtomicBool = AtomicBool::new(false);
+/// Whether stderr output is enabled.
+static ENABLED_SINKS_STDERR: AtomicBool = AtomicBool::new(false);
 /// Atomic counter for the size of the log file in bytes.
-// TODO: make non-atomic if writing single threaded
 static SINK_FILE_SIZE_BYTES: AtomicU64 = AtomicU64::new(0);
 /// Maximum size of the log file before it will be rotated, in bytes.
 const SINK_FILE_SIZE_BYTES_MAX: u64 = 1024 * 1024; // 1 MB
 
 pub struct Record<'a> {
-    pub scope: Scope,
+    pub scope: ScopeRef<'a>,
     pub level: log::Level,
     pub message: &'a std::fmt::Arguments<'a>,
     pub module_path: Option<&'a str>,
+    pub line: Option<u32>,
 }
 
 pub fn init_output_stdout() {
-    unsafe {
-        ENABLED_SINKS_STDOUT = true;
-    }
+    // Use atomics here instead of just a `static mut`, since in the context
+    // of tests these accesses can be multi-threaded.
+    ENABLED_SINKS_STDOUT.store(true, Ordering::Release);
+}
+
+pub fn init_output_stderr() {
+    ENABLED_SINKS_STDERR.store(true, Ordering::Release);
 }
 
 pub fn init_output_file(
     path: &'static PathBuf,
     path_rotate: Option<&'static PathBuf>,
 ) -> io::Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
+    let mut enabled_sinks_file = ENABLED_SINKS_FILE
+        .try_lock()
+        .expect("Log file lock is available during init");
 
     SINK_FILE_PATH
         .set(path)
@@ -63,20 +69,28 @@ pub fn init_output_file(
             .expect("Init file output should only be called once");
     }
 
-    let mut enabled_sinks_file = ENABLED_SINKS_FILE
-        .try_lock()
-        .expect("Log file lock is available during init");
-
-    let size_bytes = file.metadata().map_or(0, |metadata| metadata.len());
-    if size_bytes >= SINK_FILE_SIZE_BYTES_MAX {
-        rotate_log_file(&mut file, Some(path), path_rotate, &SINK_FILE_SIZE_BYTES);
-    } else {
-        SINK_FILE_SIZE_BYTES.store(size_bytes, Ordering::Relaxed);
-    }
-
+    let file = open_or_create_log_file(path, path_rotate, SINK_FILE_SIZE_BYTES_MAX)?;
+    SINK_FILE_SIZE_BYTES.store(file.metadata().map_or(0, |m| m.len()), Ordering::Release);
     *enabled_sinks_file = Some(file);
 
     Ok(())
+}
+
+fn open_or_create_log_file(
+    path: &PathBuf,
+    path_rotate: Option<&PathBuf>,
+    sink_file_size_bytes_max: u64,
+) -> Result<fs::File, io::Error> {
+    let size_bytes = std::fs::metadata(path).map(|metadata| metadata.len());
+    match size_bytes {
+        Ok(size_bytes) if size_bytes >= sink_file_size_bytes_max => {
+            rotate_log_file(Some(path), path_rotate).map(|it| it.unwrap())
+        }
+        _ => std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path),
+    }
 }
 
 const LEVEL_OUTPUT_STRINGS: [&str; 6] = [
@@ -99,8 +113,12 @@ static LEVEL_ANSI_COLORS: [&str; 6] = [
 ];
 
 // PERF: batching
-pub fn submit(record: Record) {
-    if unsafe { ENABLED_SINKS_STDOUT } {
+pub fn submit(mut record: Record) {
+    if record.module_path.is_none_or(|p| !p.ends_with(".rs")) {
+        // Only render line numbers for actual rust files emitted by `log_err` and friends
+        record.line.take();
+    }
+    if ENABLED_SINKS_STDOUT.load(Ordering::Acquire) {
         let mut stdout = std::io::stdout().lock();
         _ = writeln!(
             &mut stdout,
@@ -111,16 +129,33 @@ pub fn submit(record: Record) {
             SourceFmt {
                 scope: record.scope,
                 module_path: record.module_path,
+                line: record.line,
+                ansi: true,
+            },
+            record.message
+        );
+    } else if ENABLED_SINKS_STDERR.load(Ordering::Acquire) {
+        let mut stdout = std::io::stderr().lock();
+        _ = writeln!(
+            &mut stdout,
+            "{} {ANSI_BOLD}{}{}{ANSI_RESET} {} {}",
+            chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z"),
+            LEVEL_ANSI_COLORS[record.level as usize],
+            LEVEL_OUTPUT_STRINGS[record.level as usize],
+            SourceFmt {
+                scope: record.scope,
+                module_path: record.module_path,
+                line: record.line,
                 ansi: true,
             },
             record.message
         );
     }
-    let mut file = ENABLED_SINKS_FILE.lock().unwrap_or_else(|handle| {
+    let mut file_guard = ENABLED_SINKS_FILE.lock().unwrap_or_else(|handle| {
         ENABLED_SINKS_FILE.clear_poison();
         handle.into_inner()
     });
-    if let Some(file) = file.as_mut() {
+    if let Some(file) = file_guard.as_mut() {
         struct SizedWriter<'a> {
             file: &'a mut std::fs::File,
             written: u64,
@@ -146,41 +181,47 @@ pub fn submit(record: Record) {
                 SourceFmt {
                     scope: record.scope,
                     module_path: record.module_path,
+                    line: record.line,
                     ansi: false,
                 },
                 record.message
             );
-            SINK_FILE_SIZE_BYTES.fetch_add(writer.written, Ordering::Relaxed) + writer.written
+            SINK_FILE_SIZE_BYTES.fetch_add(writer.written, Ordering::AcqRel) + writer.written
         };
         if file_size_bytes > SINK_FILE_SIZE_BYTES_MAX {
-            rotate_log_file(
-                file,
-                SINK_FILE_PATH.get(),
-                SINK_FILE_PATH_ROTATE.get(),
-                &SINK_FILE_SIZE_BYTES,
-            );
+            *file_guard = None;
+            let file = rotate_log_file(SINK_FILE_PATH.get(), SINK_FILE_PATH_ROTATE.get());
+            match file {
+                Ok(Some(file)) => *file_guard = Some(file),
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("Failed to open log file: {e}")
+                }
+            }
+            SINK_FILE_SIZE_BYTES.store(0, Ordering::Release);
         }
     }
 }
 
 pub fn flush() {
-    if unsafe { ENABLED_SINKS_STDOUT } {
+    if ENABLED_SINKS_STDOUT.load(Ordering::Acquire) {
         _ = std::io::stdout().lock().flush();
     }
     let mut file = ENABLED_SINKS_FILE.lock().unwrap_or_else(|handle| {
         ENABLED_SINKS_FILE.clear_poison();
         handle.into_inner()
     });
-    if let Some(file) = file.as_mut() {
-        if let Err(err) = file.flush() {
-            eprintln!("Failed to flush log file: {}", err);
-        }
+    if let Some(file) = file.as_mut()
+        && let Err(err) = file.flush()
+    {
+        eprintln!("Failed to flush log file: {}", err);
     }
 }
 
 struct SourceFmt<'a> {
-    scope: Scope,
+    scope: ScopeRef<'a>,
     module_path: Option<&'a str>,
+    line: Option<u32>,
     ansi: bool,
 }
 
@@ -204,6 +245,10 @@ impl std::fmt::Display for SourceFmt<'_> {
                 f.write_str(subscope)?;
             }
         }
+        if let Some(line) = self.line {
+            f.write_char(':')?;
+            line.fmt(f)?;
+        }
         if self.ansi {
             f.write_str(ANSI_RESET)?;
         }
@@ -213,19 +258,13 @@ impl std::fmt::Display for SourceFmt<'_> {
 }
 
 fn rotate_log_file<PathRef>(
-    file: &mut fs::File,
     path: Option<PathRef>,
     path_rotate: Option<PathRef>,
-    atomic_size: &AtomicU64,
-) where
+) -> std::io::Result<Option<fs::File>>
+where
     PathRef: AsRef<std::path::Path>,
 {
-    if let Err(err) = file.flush() {
-        eprintln!(
-            "Failed to flush log file before rotating, some logs may be lost: {}",
-            err
-        );
-    }
+    let path = path.as_ref().map(PathRef::as_ref);
     let rotation_error = match (path, path_rotate) {
         (Some(_), None) => Some(anyhow::anyhow!("No rotation log file path configured")),
         (None, _) => Some(anyhow::anyhow!("No log file path configured")),
@@ -236,46 +275,53 @@ fn rotate_log_file<PathRef>(
     if let Some(err) = rotation_error {
         eprintln!("Log file rotation failed. Truncating log file anyways: {err}",);
     }
-    _ = file.set_len(0);
-
-    // SAFETY: It is safe to set size to 0 even if set_len fails as
-    // according to the documentation, it only fails if:
-    // - the file is not writeable: should never happen,
-    // - the size would cause an overflow (implementation specific): 0 should never cause an overflow
-    atomic_size.store(0, Ordering::Relaxed);
+    path.map(|path| {
+        fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+    })
+    .transpose()
 }
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
-    fn test_rotate_log_file() {
+    fn test_open_or_create_log_file_rotate() {
         let temp_dir = tempfile::tempdir().unwrap();
         let log_file_path = temp_dir.path().join("log.txt");
         let rotation_log_file_path = temp_dir.path().join("log_rotated.txt");
 
-        let mut file = fs::File::create(&log_file_path).unwrap();
         let contents = String::from("Hello, world!");
-        file.write_all(contents.as_bytes()).unwrap();
+        std::fs::write(&log_file_path, &contents).unwrap();
 
-        let size = AtomicU64::new(contents.len() as u64);
-
-        rotate_log_file(
-            &mut file,
-            Some(&log_file_path),
-            Some(&rotation_log_file_path),
-            &size,
-        );
+        open_or_create_log_file(&log_file_path, Some(&rotation_log_file_path), 4).unwrap();
 
         assert!(log_file_path.exists());
         assert_eq!(log_file_path.metadata().unwrap().len(), 0);
         assert!(rotation_log_file_path.exists());
-        assert_eq!(
-            std::fs::read_to_string(&rotation_log_file_path).unwrap(),
-            contents,
-        );
-        assert_eq!(size.load(Ordering::Relaxed), 0);
+        assert_eq!(std::fs::read_to_string(&log_file_path).unwrap(), "");
+    }
+
+    #[test]
+    fn test_open_or_create_log_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let log_file_path = temp_dir.path().join("log.txt");
+        let rotation_log_file_path = temp_dir.path().join("log_rotated.txt");
+
+        let contents = String::from("Hello, world!");
+        std::fs::write(&log_file_path, &contents).unwrap();
+
+        open_or_create_log_file(&log_file_path, Some(&rotation_log_file_path), !0).unwrap();
+
+        assert!(log_file_path.exists());
+        assert_eq!(log_file_path.metadata().unwrap().len(), 13);
+        assert!(!rotation_log_file_path.exists());
+        assert_eq!(std::fs::read_to_string(&log_file_path).unwrap(), contents);
     }
 
     /// Regression test, ensuring that if log level values change we are made aware

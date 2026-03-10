@@ -5,11 +5,15 @@ use project::{FakeFs, Fs as _, Project};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use task::{DebugRequest, DebugScenario, LaunchRequest, TaskContext, VariableName, ZedDebugConfig};
+use task::{
+    DebugRequest, DebugScenario, LaunchRequest, SharedTaskContext, TaskContext, VariableName,
+    ZedDebugConfig,
+};
 use text::Point;
 use util::path;
 
 use crate::NewProcessMode;
+use crate::new_process_modal::NewProcessModal;
 use crate::tests::{init_test, init_test_workspace};
 
 #[gpui::test]
@@ -39,11 +43,12 @@ async fn test_debug_session_substitutes_variables_and_relativizes_paths(
     .into_iter()
     .collect();
 
-    let task_context = TaskContext {
+    let task_context: SharedTaskContext = TaskContext {
         cwd: None,
         task_variables: test_variables,
         project_env: Default::default(),
-    };
+    }
+    .into();
 
     let home_dir = paths::home_dir();
 
@@ -106,9 +111,7 @@ async fn test_debug_session_substitutes_variables_and_relativizes_paths(
                         );
 
                         let expected_other_field = if input_path.contains("$ZED_WORKTREE_ROOT") {
-                            input_path
-                                .replace("$ZED_WORKTREE_ROOT", &path!("/test/worktree/path"))
-                                .to_owned()
+                            input_path.replace("$ZED_WORKTREE_ROOT", path!("/test/worktree/path"))
                         } else {
                             input_path.to_string()
                         };
@@ -142,15 +145,17 @@ async fn test_debug_session_substitutes_variables_and_relativizes_paths(
         };
 
         workspace
-            .update(cx, |workspace, window, cx| {
-                workspace.start_debug_session(
-                    scenario,
-                    task_context.clone(),
-                    None,
-                    None,
-                    window,
-                    cx,
-                )
+            .update(cx, |multi, window, cx| {
+                multi.workspace().update(cx, |workspace, cx| {
+                    workspace.start_debug_session(
+                        scenario,
+                        task_context.clone(),
+                        None,
+                        None,
+                        window,
+                        cx,
+                    );
+                })
             })
             .unwrap();
 
@@ -179,14 +184,10 @@ async fn test_save_debug_scenario_to_file(executor: BackgroundExecutor, cx: &mut
     let cx = &mut VisualTestContext::from_window(*workspace, cx);
 
     workspace
-        .update(cx, |workspace, window, cx| {
-            crate::new_process_modal::NewProcessModal::show(
-                workspace,
-                window,
-                NewProcessMode::Debug,
-                None,
-                cx,
-            );
+        .update(cx, |multi, window, cx| {
+            multi.workspace().update(cx, |workspace, cx| {
+                NewProcessModal::show(workspace, window, NewProcessMode::Debug, None, cx);
+            });
         })
         .unwrap();
 
@@ -194,7 +195,7 @@ async fn test_save_debug_scenario_to_file(executor: BackgroundExecutor, cx: &mut
 
     let modal = workspace
         .update(cx, |workspace, _, cx| {
-            workspace.active_modal::<crate::new_process_modal::NewProcessModal>(cx)
+            workspace.active_modal::<NewProcessModal>(cx)
         })
         .unwrap()
         .expect("Modal should be active");
@@ -238,7 +239,10 @@ async fn test_save_debug_scenario_to_file(executor: BackgroundExecutor, cx: &mut
 
     editor.update(cx, |editor, cx| {
         assert_eq!(
-            editor.selections.newest::<Point>(cx).head(),
+            editor
+                .selections
+                .newest::<Point>(&editor.display_snapshot(cx))
+                .head(),
             Point::new(5, 2)
         )
     });
@@ -284,6 +288,75 @@ async fn test_save_debug_scenario_to_file(executor: BackgroundExecutor, cx: &mut
 }
 
 #[gpui::test]
+async fn test_debug_modal_subtitles_with_multiple_worktrees(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor.clone());
+
+    fs.insert_tree(
+        path!("/workspace1"),
+        json!({
+            ".zed": {
+                "debug.json": r#"[
+                    {
+                        "adapter": "fake-adapter",
+                        "label": "Debug App 1",
+                        "request": "launch",
+                        "program": "./app1",
+                        "cwd": "."
+                    },
+                    {
+                        "adapter": "fake-adapter",
+                        "label": "Debug Tests 1",
+                        "request": "launch",
+                        "program": "./test1",
+                        "cwd": "."
+                    }
+                ]"#
+            },
+            "main.rs": "fn main() {}"
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/workspace1").as_ref()], cx).await;
+
+    let workspace = init_test_workspace(&project, cx).await;
+    let cx = &mut VisualTestContext::from_window(*workspace, cx);
+
+    workspace
+        .update(cx, |multi, window, cx| {
+            multi.workspace().update(cx, |workspace, cx| {
+                NewProcessModal::show(workspace, window, NewProcessMode::Debug, None, cx);
+            });
+        })
+        .unwrap();
+
+    cx.run_until_parked();
+
+    let modal = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.active_modal::<NewProcessModal>(cx)
+        })
+        .unwrap()
+        .expect("Modal should be active");
+
+    cx.executor().run_until_parked();
+
+    let subtitles = modal.update_in(cx, |modal, _, cx| {
+        modal.debug_picker_candidate_subtitles(cx)
+    });
+
+    assert_eq!(
+        subtitles.as_slice(),
+        [path!(".zed/debug.json"), path!(".zed/debug.json")]
+    );
+}
+
+#[gpui::test]
 async fn test_dap_adapter_config_conversion_and_validation(cx: &mut TestAppContext) {
     init_test(cx);
 
@@ -298,7 +371,7 @@ async fn test_dap_adapter_config_conversion_and_validation(cx: &mut TestAppConte
 
     let adapter_names = cx.update(|cx| {
         let registry = DapRegistry::global(cx);
-        registry.enumerate_adapters()
+        registry.enumerate_adapters::<Vec<_>>()
     });
 
     let zed_config = ZedDebugConfig {

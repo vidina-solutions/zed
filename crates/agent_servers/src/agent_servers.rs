@@ -1,165 +1,159 @@
-mod claude;
-mod gemini;
-mod settings;
-mod stdio_agent_server;
+mod acp;
+mod custom;
 
-#[cfg(test)]
-mod e2e_tests;
+#[cfg(any(test, feature = "test-support"))]
+pub mod e2e_tests;
 
-pub use claude::*;
-pub use gemini::*;
-pub use settings::*;
-pub use stdio_agent_server::*;
-
-use acp_thread::AcpThread;
-use anyhow::Result;
-use collections::HashMap;
-use gpui::{App, AsyncApp, Entity, SharedString, Task};
+use client::ProxySettings;
+use collections::{HashMap, HashSet};
+pub use custom::*;
+use fs::Fs;
+use http_client::read_no_proxy_from_env;
 use project::Project;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
-use util::ResultExt as _;
+use project::agent_server_store::AgentServerStore;
 
-pub fn init(cx: &mut App) {
-    settings::init(cx);
+use acp_thread::AgentConnection;
+use anyhow::Result;
+use gpui::{App, AppContext, Entity, SharedString, Task};
+use settings::SettingsStore;
+use std::{any::Any, rc::Rc, sync::Arc};
+
+pub use acp::AcpConnection;
+
+pub struct AgentServerDelegate {
+    store: Entity<AgentServerStore>,
+    project: Entity<Project>,
+    status_tx: Option<watch::Sender<SharedString>>,
+    new_version_available: Option<watch::Sender<Option<String>>>,
+}
+
+impl AgentServerDelegate {
+    pub fn new(
+        store: Entity<AgentServerStore>,
+        project: Entity<Project>,
+        status_tx: Option<watch::Sender<SharedString>>,
+        new_version_tx: Option<watch::Sender<Option<String>>>,
+    ) -> Self {
+        Self {
+            store,
+            project,
+            status_tx,
+            new_version_available: new_version_tx,
+        }
+    }
+
+    pub fn project(&self) -> &Entity<Project> {
+        &self.project
+    }
 }
 
 pub trait AgentServer: Send {
     fn logo(&self) -> ui::IconName;
-    fn name(&self) -> &'static str;
-    fn empty_state_headline(&self) -> &'static str;
-    fn empty_state_message(&self) -> &'static str;
-    fn supports_always_allow(&self) -> bool;
-
-    fn new_thread(
+    fn name(&self) -> SharedString;
+    fn connect(
         &self,
-        root_dir: &Path,
-        project: &Entity<Project>,
+        delegate: AgentServerDelegate,
         cx: &mut App,
-    ) -> Task<Result<Entity<AcpThread>>>;
-}
+    ) -> Task<Result<Rc<dyn AgentConnection>>>;
 
-impl std::fmt::Debug for AgentServerCommand {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let filtered_env = self.env.as_ref().map(|env| {
-            env.iter()
-                .map(|(k, v)| {
-                    (
-                        k,
-                        if util::redact::should_redact(k) {
-                            "[REDACTED]"
-                        } else {
-                            v
-                        },
-                    )
-                })
-                .collect::<Vec<_>>()
-        });
+    fn into_any(self: Rc<Self>) -> Rc<dyn Any>;
 
-        f.debug_struct("AgentServerCommand")
-            .field("path", &self.path)
-            .field("args", &self.args)
-            .field("env", &filtered_env)
-            .finish()
+    fn default_mode(&self, _cx: &App) -> Option<agent_client_protocol::SessionModeId> {
+        None
+    }
+
+    fn set_default_mode(
+        &self,
+        _mode_id: Option<agent_client_protocol::SessionModeId>,
+        _fs: Arc<dyn Fs>,
+        _cx: &mut App,
+    ) {
+    }
+
+    fn default_model(&self, _cx: &App) -> Option<agent_client_protocol::ModelId> {
+        None
+    }
+
+    fn set_default_model(
+        &self,
+        _model_id: Option<agent_client_protocol::ModelId>,
+        _fs: Arc<dyn Fs>,
+        _cx: &mut App,
+    ) {
+    }
+
+    fn favorite_model_ids(&self, _cx: &mut App) -> HashSet<agent_client_protocol::ModelId> {
+        HashSet::default()
+    }
+
+    fn default_config_option(&self, _config_id: &str, _cx: &App) -> Option<String> {
+        None
+    }
+
+    fn set_default_config_option(
+        &self,
+        _config_id: &str,
+        _value_id: Option<&str>,
+        _fs: Arc<dyn Fs>,
+        _cx: &mut App,
+    ) {
+    }
+
+    fn favorite_config_option_value_ids(
+        &self,
+        _config_id: &agent_client_protocol::SessionConfigId,
+        _cx: &mut App,
+    ) -> HashSet<agent_client_protocol::SessionConfigValueId> {
+        HashSet::default()
+    }
+
+    fn toggle_favorite_config_option_value(
+        &self,
+        _config_id: agent_client_protocol::SessionConfigId,
+        _value_id: agent_client_protocol::SessionConfigValueId,
+        _should_be_favorite: bool,
+        _fs: Arc<dyn Fs>,
+        _cx: &App,
+    ) {
+    }
+
+    fn toggle_favorite_model(
+        &self,
+        _model_id: agent_client_protocol::ModelId,
+        _should_be_favorite: bool,
+        _fs: Arc<dyn Fs>,
+        _cx: &App,
+    ) {
     }
 }
 
-pub enum AgentServerVersion {
-    Supported,
-    Unsupported {
-        error_message: SharedString,
-        upgrade_message: SharedString,
-        upgrade_command: String,
-    },
+impl dyn AgentServer {
+    pub fn downcast<T: 'static + AgentServer + Sized>(self: Rc<Self>) -> Option<Rc<T>> {
+        self.into_any().downcast().ok()
+    }
 }
 
-#[derive(Deserialize, Serialize, Clone, PartialEq, Eq, JsonSchema)]
-pub struct AgentServerCommand {
-    #[serde(rename = "command")]
-    pub path: PathBuf,
-    #[serde(default)]
-    pub args: Vec<String>,
-    pub env: Option<HashMap<String, String>>,
-}
+/// Load the default proxy environment variables to pass through to the agent
+pub fn load_proxy_env(cx: &mut App) -> HashMap<String, String> {
+    let proxy_url = cx
+        .read_global(|settings: &SettingsStore, _| settings.get::<ProxySettings>(None).proxy_url());
+    let mut env = HashMap::default();
 
-impl AgentServerCommand {
-    pub(crate) async fn resolve(
-        path_bin_name: &'static str,
-        extra_args: &[&'static str],
-        settings: Option<AgentServerSettings>,
-        project: &Entity<Project>,
-        cx: &mut AsyncApp,
-    ) -> Option<Self> {
-        if let Some(agent_settings) = settings {
-            return Some(Self {
-                path: agent_settings.command.path,
-                args: agent_settings
-                    .command
-                    .args
-                    .into_iter()
-                    .chain(extra_args.iter().map(|arg| arg.to_string()))
-                    .collect(),
-                env: agent_settings.command.env,
-            });
+    if let Some(proxy_url) = &proxy_url {
+        let env_var = if proxy_url.scheme() == "https" {
+            "HTTPS_PROXY"
         } else {
-            find_bin_in_path(path_bin_name, project, cx)
-                .await
-                .map(|path| Self {
-                    path,
-                    args: extra_args.iter().map(|arg| arg.to_string()).collect(),
-                    env: None,
-                })
-        }
+            "HTTP_PROXY"
+        };
+        env.insert(env_var.to_owned(), proxy_url.to_string());
     }
-}
 
-async fn find_bin_in_path(
-    bin_name: &'static str,
-    project: &Entity<Project>,
-    cx: &mut AsyncApp,
-) -> Option<PathBuf> {
-    let (env_task, root_dir) = project
-        .update(cx, |project, cx| {
-            let worktree = project.visible_worktrees(cx).next();
-            match worktree {
-                Some(worktree) => {
-                    let env_task = project.environment().update(cx, |env, cx| {
-                        env.get_worktree_environment(worktree.clone(), cx)
-                    });
+    if let Some(no_proxy) = read_no_proxy_from_env() {
+        env.insert("NO_PROXY".to_owned(), no_proxy);
+    } else if proxy_url.is_some() {
+        // We sometimes need local MCP servers that we don't want to proxy
+        env.insert("NO_PROXY".to_owned(), "localhost,127.0.0.1".to_owned());
+    }
 
-                    let path = worktree.read(cx).abs_path();
-                    (env_task, path)
-                }
-                None => {
-                    let path: Arc<Path> = paths::home_dir().as_path().into();
-                    let env_task = project.environment().update(cx, |env, cx| {
-                        env.get_directory_environment(path.clone(), cx)
-                    });
-                    (env_task, path)
-                }
-            }
-        })
-        .log_err()?;
-
-    cx.background_executor()
-        .spawn(async move {
-            let which_result = if cfg!(windows) {
-                which::which(bin_name)
-            } else {
-                let env = env_task.await.unwrap_or_default();
-                let shell_path = env.get("PATH").cloned();
-                which::which_in(bin_name, shell_path.as_ref(), root_dir.as_ref())
-            };
-
-            if let Err(which::Error::CannotFindBinaryPath) = which_result {
-                return None;
-            }
-
-            which_result.log_err()
-        })
-        .await
+    env
 }

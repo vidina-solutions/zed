@@ -6,6 +6,8 @@ use std::{
 };
 
 use anyhow::Result;
+use language::{markdown_lang, rust_lang};
+use multi_buffer::MultiBufferOffset;
 use serde_json::json;
 
 use crate::{Editor, ToPoint};
@@ -14,13 +16,13 @@ use futures::Future;
 use gpui::{Context, Entity, Focusable as _, VisualTestContext, Window};
 use indoc::indoc;
 use language::{
-    FakeLspAdapter, Language, LanguageConfig, LanguageMatcher, LanguageQueries, point_to_lsp,
+    BlockCommentConfig, FakeLspAdapter, Language, LanguageConfig, LanguageMatcher, LanguageQueries,
+    point_to_lsp,
 };
 use lsp::{notification, request};
-use multi_buffer::ToPointUtf16;
 use project::Project;
 use smol::stream::StreamExt;
-use workspace::{AppState, Workspace, WorkspaceHandle};
+use workspace::{AppState, MultiWorkspace, Workspace, WorkspaceHandle};
 
 use super::editor_test_context::{AssertionContextManager, EditorTestContext};
 
@@ -28,56 +30,7 @@ pub struct EditorLspTestContext {
     pub cx: EditorTestContext,
     pub lsp: lsp::FakeLanguageServer,
     pub workspace: Entity<Workspace>,
-    pub buffer_lsp_url: lsp::Url,
-}
-
-pub(crate) fn rust_lang() -> Arc<Language> {
-    let language = Language::new(
-        LanguageConfig {
-            name: "Rust".into(),
-            matcher: LanguageMatcher {
-                path_suffixes: vec!["rs".to_string()],
-                ..Default::default()
-            },
-            line_comments: vec!["// ".into(), "/// ".into(), "//! ".into()],
-            ..Default::default()
-        },
-        Some(tree_sitter_rust::LANGUAGE.into()),
-    )
-    .with_queries(LanguageQueries {
-        indents: Some(Cow::from(indoc! {r#"
-            [
-                ((where_clause) _ @end)
-                (field_expression)
-                (call_expression)
-                (assignment_expression)
-                (let_declaration)
-                (let_chain)
-                (await_expression)
-            ] @indent
-
-            (_ "[" "]" @end) @indent
-            (_ "<" ">" @end) @indent
-            (_ "{" "}" @end) @indent
-            (_ "(" ")" @end) @indent"#})),
-        brackets: Some(Cow::from(indoc! {r#"
-            ("(" @open ")" @close)
-            ("[" @open "]" @close)
-            ("{" @open "}" @close)
-            ("<" @open ">" @close)
-            ("\"" @open "\"" @close)
-            (closure_parameters "|" @open "|" @close)"#})),
-        text_objects: Some(Cow::from(indoc! {r#"
-            (function_item
-                body: (_
-                    "{"
-                    (_)* @function.inside
-                    "}" )) @function.around
-        "#})),
-        ..Default::default()
-    })
-    .expect("Could not parse queries");
-    Arc::new(language)
+    pub buffer_lsp_url: lsp::Uri,
 }
 
 #[cfg(test)]
@@ -102,10 +55,8 @@ impl EditorLspTestContext {
 
         cx.update(|cx| {
             assets::Assets.load_test_fonts(cx);
-            language::init(cx);
             crate::init(cx);
             workspace::init(app_state.clone(), cx);
-            Project::init_settings(cx);
         });
 
         let file_name = format!(
@@ -144,7 +95,8 @@ impl EditorLspTestContext {
             )
             .await;
 
-        let window = cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
 
         let workspace = window.root(cx).unwrap();
 
@@ -155,12 +107,20 @@ impl EditorLspTestContext {
             })
             .await
             .unwrap();
-        cx.read(|cx| workspace.read(cx).worktree_scans_complete(cx))
-            .await;
-        let file = cx.read(|cx| workspace.file_project_paths(cx)[0].clone());
+        cx.read(|cx| {
+            workspace
+                .read(cx)
+                .workspace()
+                .read(cx)
+                .worktree_scans_complete(cx)
+        })
+        .await;
+        let file = cx.read(|cx| workspace.read(cx).workspace().file_project_paths(cx)[0].clone());
         let item = workspace
             .update_in(&mut cx, |workspace, window, cx| {
-                workspace.open_path(file, None, true, window, cx)
+                workspace.workspace().update(cx, |workspace, cx| {
+                    workspace.open_path(file, None, true, window, cx)
+                })
             })
             .await
             .expect("Could not open test file");
@@ -171,14 +131,22 @@ impl EditorLspTestContext {
         editor.update_in(&mut cx, |editor, window, cx| {
             let nav_history = workspace
                 .read(cx)
+                .workspace()
+                .read(cx)
                 .active_pane()
                 .read(cx)
                 .nav_history_for_item(&cx.entity());
             editor.set_nav_history(Some(nav_history));
-            window.focus(&editor.focus_handle(cx))
+            window.focus(&editor.focus_handle(cx), cx)
         });
 
         let lsp = fake_servers.next().await.unwrap();
+
+        // Ensure the language server is fully registered with the buffer
+        cx.executor().run_until_parked();
+
+        let workspace = cx.read(|cx| workspace.read(cx).workspace().clone());
+
         Self {
             cx: EditorTestContext {
                 cx,
@@ -188,7 +156,7 @@ impl EditorLspTestContext {
             },
             lsp,
             workspace,
-            buffer_lsp_url: lsp::Url::from_file_path(root.join("dir").join(file_name)).unwrap(),
+            buffer_lsp_url: lsp::Uri::from_file_path(root.join("dir").join(file_name)).unwrap(),
         }
     }
 
@@ -254,6 +222,163 @@ impl EditorLspTestContext {
                 (_ "{" "}" @end) @indent
                 (_ "(" ")" @end) @indent
                 "#})),
+            text_objects: Some(Cow::from(indoc! {r#"
+                (function_declaration
+                    body: (_
+                        "{"
+                        (_)* @function.inside
+                        "}")) @function.around
+
+                (method_definition
+                    body: (_
+                        "{"
+                        (_)* @function.inside
+                        "}")) @function.around
+
+                ; Arrow function in variable declaration - capture the full declaration
+                ([
+                    (lexical_declaration
+                        (variable_declarator
+                            value: (arrow_function
+                                body: (statement_block
+                                    "{"
+                                    (_)* @function.inside
+                                    "}"))))
+                    (variable_declaration
+                        (variable_declarator
+                            value: (arrow_function
+                                body: (statement_block
+                                    "{"
+                                    (_)* @function.inside
+                                    "}"))))
+                ]) @function.around
+
+                ([
+                    (lexical_declaration
+                        (variable_declarator
+                            value: (arrow_function)))
+                    (variable_declaration
+                        (variable_declarator
+                            value: (arrow_function)))
+                ]) @function.around
+
+                ; Catch-all for arrow functions in other contexts (callbacks, etc.)
+                ((arrow_function) @function.around (#not-has-parent? @function.around variable_declarator))
+                "#})),
+            ..Default::default()
+        })
+        .expect("Could not parse queries");
+
+        Self::new(language, capabilities, cx).await
+    }
+
+    pub async fn new_tsx(
+        capabilities: lsp::ServerCapabilities,
+        cx: &mut gpui::TestAppContext,
+    ) -> EditorLspTestContext {
+        let mut word_characters: HashSet<char> = Default::default();
+        word_characters.insert('$');
+        word_characters.insert('#');
+        let language = Language::new(
+            LanguageConfig {
+                name: "TSX".into(),
+                matcher: LanguageMatcher {
+                    path_suffixes: vec!["tsx".to_string()],
+                    ..Default::default()
+                },
+                brackets: language::BracketPairConfig {
+                    pairs: vec![language::BracketPair {
+                        start: "{".to_string(),
+                        end: "}".to_string(),
+                        close: true,
+                        surround: true,
+                        newline: true,
+                    }],
+                    disabled_scopes_by_bracket_ix: Default::default(),
+                },
+                word_characters,
+                ..Default::default()
+            },
+            Some(tree_sitter_typescript::LANGUAGE_TSX.into()),
+        )
+        .with_queries(LanguageQueries {
+            brackets: Some(Cow::from(indoc! {r#"
+                ("(" @open ")" @close)
+                ("[" @open "]" @close)
+                ("{" @open "}" @close)
+                ("<" @open ">" @close)
+                ("<" @open "/>" @close)
+                ("</" @open ">" @close)
+                ("\"" @open "\"" @close)
+                ("'" @open "'" @close)
+                ("`" @open "`" @close)
+                ((jsx_element (jsx_opening_element) @open (jsx_closing_element) @close) (#set! newline.only))"#})),
+            indents: Some(Cow::from(indoc! {r#"
+                [
+                    (call_expression)
+                    (assignment_expression)
+                    (member_expression)
+                    (lexical_declaration)
+                    (variable_declaration)
+                    (assignment_expression)
+                    (if_statement)
+                    (for_statement)
+                ] @indent
+
+                (_ "[" "]" @end) @indent
+                (_ "<" ">" @end) @indent
+                (_ "{" "}" @end) @indent
+                (_ "(" ")" @end) @indent
+
+                (jsx_opening_element ">" @end) @indent
+
+                (jsx_element
+                  (jsx_opening_element) @start
+                  (jsx_closing_element)? @end) @indent
+                "#})),
+            text_objects: Some(Cow::from(indoc! {r#"
+                (function_declaration
+                    body: (_
+                        "{"
+                        (_)* @function.inside
+                        "}")) @function.around
+
+                (method_definition
+                    body: (_
+                        "{"
+                        (_)* @function.inside
+                        "}")) @function.around
+
+                ; Arrow function in variable declaration - capture the full declaration
+                ([
+                    (lexical_declaration
+                        (variable_declarator
+                            value: (arrow_function
+                                body: (statement_block
+                                    "{"
+                                    (_)* @function.inside
+                                    "}"))))
+                    (variable_declaration
+                        (variable_declarator
+                            value: (arrow_function
+                                body: (statement_block
+                                    "{"
+                                    (_)* @function.inside
+                                    "}"))))
+                ]) @function.around
+
+                ([
+                    (lexical_declaration
+                        (variable_declarator
+                            value: (arrow_function)))
+                    (variable_declaration
+                        (variable_declarator
+                            value: (arrow_function)))
+                ]) @function.around
+
+                ; Catch-all for arrow functions in other contexts (callbacks, etc.)
+                ((arrow_function) @function.around (#not-has-parent? @function.around variable_declarator))
+                "#})),
             ..Default::default()
         })
         .expect("Could not parse queries");
@@ -269,7 +394,12 @@ impl EditorLspTestContext {
                     path_suffixes: vec!["html".into()],
                     ..Default::default()
                 },
-                block_comment: Some(("<!-- ".into(), " -->".into())),
+                block_comment: Some(BlockCommentConfig {
+                    start: "<!--".into(),
+                    prefix: "".into(),
+                    end: "-->".into(),
+                    tab_size: 0,
+                }),
                 completion_query_characters: ['-'].into_iter().collect(),
                 ..Default::default()
             },
@@ -287,52 +417,58 @@ impl EditorLspTestContext {
         Self::new(language, Default::default(), cx).await
     }
 
+    pub async fn new_markdown_with_rust(cx: &mut gpui::TestAppContext) -> Self {
+        let context = Self::new(
+            Arc::into_inner(markdown_lang()).unwrap(),
+            Default::default(),
+            cx,
+        )
+        .await;
+
+        let language_registry = context.workspace.read_with(cx, |workspace, cx| {
+            workspace.project().read(cx).languages().clone()
+        });
+        language_registry.add(rust_lang());
+
+        context
+    }
+
     /// Constructs lsp range using a marked string with '[', ']' range delimiters
     #[track_caller]
     pub fn lsp_range(&mut self, marked_text: &str) -> lsp::Range {
         let ranges = self.ranges(marked_text);
-        self.to_lsp_range(ranges[0].clone())
+        self.to_lsp_range(MultiBufferOffset(ranges[0].start)..MultiBufferOffset(ranges[0].end))
     }
 
-    pub fn to_lsp_range(&mut self, range: Range<usize>) -> lsp::Range {
+    #[expect(clippy::wrong_self_convention, reason = "This is test code")]
+    pub fn to_lsp_range(&mut self, range: Range<MultiBufferOffset>) -> lsp::Range {
+        use language::ToPointUtf16;
         let snapshot = self.update_editor(|editor, window, cx| editor.snapshot(window, cx));
-        let start_point = range.start.to_point(&snapshot.buffer_snapshot);
-        let end_point = range.end.to_point(&snapshot.buffer_snapshot);
+        let start_point = range.start.to_point(&snapshot.buffer_snapshot());
+        let end_point = range.end.to_point(&snapshot.buffer_snapshot());
 
         self.editor(|editor, _, cx| {
             let buffer = editor.buffer().read(cx);
-            let start = point_to_lsp(
-                buffer
-                    .point_to_buffer_offset(start_point, cx)
-                    .unwrap()
-                    .1
-                    .to_point_utf16(&buffer.read(cx)),
-            );
-            let end = point_to_lsp(
-                buffer
-                    .point_to_buffer_offset(end_point, cx)
-                    .unwrap()
-                    .1
-                    .to_point_utf16(&buffer.read(cx)),
-            );
-
+            let (start_buffer, start_offset) =
+                buffer.point_to_buffer_offset(start_point, cx).unwrap();
+            let start = point_to_lsp(start_offset.to_point_utf16(&start_buffer.read(cx)));
+            let (end_buffer, end_offset) = buffer.point_to_buffer_offset(end_point, cx).unwrap();
+            let end = point_to_lsp(end_offset.to_point_utf16(&end_buffer.read(cx)));
             lsp::Range { start, end }
         })
     }
 
-    pub fn to_lsp(&mut self, offset: usize) -> lsp::Position {
+    #[expect(clippy::wrong_self_convention, reason = "This is test code")]
+    pub fn to_lsp(&mut self, offset: MultiBufferOffset) -> lsp::Position {
+        use language::ToPointUtf16;
+
         let snapshot = self.update_editor(|editor, window, cx| editor.snapshot(window, cx));
-        let point = offset.to_point(&snapshot.buffer_snapshot);
+        let point = offset.to_point(&snapshot.buffer_snapshot());
 
         self.editor(|editor, _, cx| {
             let buffer = editor.buffer().read(cx);
-            point_to_lsp(
-                buffer
-                    .point_to_buffer_offset(point, cx)
-                    .unwrap()
-                    .1
-                    .to_point_utf16(&buffer.read(cx)),
-            )
+            let (buffer, offset) = buffer.point_to_buffer_offset(point, cx).unwrap();
+            point_to_lsp(offset.to_point_utf16(&buffer.read(cx)))
         })
     }
 
@@ -350,7 +486,7 @@ impl EditorLspTestContext {
     where
         T: 'static + request::Request,
         T::Params: 'static + Send,
-        F: 'static + Send + FnMut(lsp::Url, T::Params, gpui::AsyncApp) -> Fut,
+        F: 'static + Send + FnMut(lsp::Uri, T::Params, gpui::AsyncApp) -> Fut,
         Fut: 'static + Future<Output = Result<T::Result>>,
     {
         let url = self.buffer_lsp_url.clone();
@@ -361,16 +497,16 @@ impl EditorLspTestContext {
     }
 
     pub fn notify<T: notification::Notification>(&self, params: T::Params) {
-        self.lsp.notify::<T>(&params);
+        self.lsp.notify::<T>(params);
     }
 
     #[cfg(target_os = "windows")]
-    fn root_path() -> &'static Path {
+    pub fn root_path() -> &'static Path {
         Path::new("C:\\root")
     }
 
     #[cfg(not(target_os = "windows"))]
-    fn root_path() -> &'static Path {
+    pub fn root_path() -> &'static Path {
         Path::new("/root")
     }
 }

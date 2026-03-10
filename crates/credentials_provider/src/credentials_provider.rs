@@ -19,7 +19,7 @@ use release_channel::ReleaseChannel;
 /// Only works in development. Setting this environment variable in other
 /// release channels is a no-op.
 static ZED_DEVELOPMENT_USE_KEYCHAIN: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var("ZED_DEVELOPMENT_USE_KEYCHAIN").map_or(false, |value| !value.is_empty())
+    std::env::var("ZED_DEVELOPMENT_USE_KEYCHAIN").is_ok_and(|value| !value.is_empty())
 });
 
 /// A provider for credentials.
@@ -92,7 +92,7 @@ impl CredentialsProvider for KeychainCredentialsProvider {
         url: &'a str,
         cx: &'a AsyncApp,
     ) -> Pin<Box<dyn Future<Output = Result<Option<(String, Vec<u8>)>>> + 'a>> {
-        async move { cx.update(|cx| cx.read_credentials(url))?.await }.boxed_local()
+        async move { cx.update(|cx| cx.read_credentials(url)).await }.boxed_local()
     }
 
     fn write_credentials<'a>(
@@ -103,7 +103,7 @@ impl CredentialsProvider for KeychainCredentialsProvider {
         cx: &'a AsyncApp,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
         async move {
-            cx.update(move |cx| cx.write_credentials(url, username, password))?
+            cx.update(move |cx| cx.write_credentials(url, username, password))
                 .await
         }
         .boxed_local()
@@ -114,7 +114,7 @@ impl CredentialsProvider for KeychainCredentialsProvider {
         url: &'a str,
         cx: &'a AsyncApp,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
-        async move { cx.update(move |cx| cx.delete_credentials(url))?.await }.boxed_local()
+        async move { cx.update(move |cx| cx.delete_credentials(url)).await }.boxed_local()
     }
 }
 

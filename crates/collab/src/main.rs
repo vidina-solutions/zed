@@ -1,4 +1,4 @@
-use anyhow::{Context as _, anyhow};
+use anyhow::anyhow;
 use axum::headers::HeaderMapExt;
 use axum::{
     Extension, Router,
@@ -8,20 +8,15 @@ use axum::{
 };
 
 use collab::api::CloudflareIpCountryHeader;
-use collab::api::billing::sync_llm_request_usage_with_stripe_periodically;
-use collab::llm::db::LlmDatabase;
-use collab::migrations::run_database_migrations;
-use collab::user_backfiller::spawn_user_backfiller;
 use collab::{
     AppState, Config, Result, api::fetch_extensions_from_blob_store_periodically, db, env,
-    executor::Executor, rpc::ResultExt,
+    executor::Executor,
 };
-use collab::{ServiceMode, api::billing::poll_stripe_events_periodically};
+use collab::{REVISION, ServiceMode, VERSION};
 use db::Database;
 use std::{
     env::args,
     net::{SocketAddr, TcpListener},
-    path::Path,
     sync::Arc,
     time::Duration,
 };
@@ -31,10 +26,7 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::{
     Layer, filter::EnvFilter, fmt::format::JsonFields, util::SubscriberInitExt,
 };
-use util::{ResultExt as _, maybe};
-
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-const REVISION: Option<&'static str> = option_env!("GITHUB_SHA");
+use util::ResultExt as _;
 
 #[expect(clippy::result_large_err)]
 #[tokio::main]
@@ -51,10 +43,6 @@ async fn main() -> Result<()> {
         Some("version") => {
             println!("collab v{} ({})", VERSION, REVISION.unwrap_or("unknown"));
         }
-        Some("migrate") => {
-            let config = envy::from_env::<Config>().expect("error loading config");
-            setup_app_database(&config).await?;
-        }
         Some("seed") => {
             let config = envy::from_env::<Config>().expect("error loading config");
             let db_options = db::ConnectOptions::new(config.database_url.clone());
@@ -63,13 +51,6 @@ async fn main() -> Result<()> {
             db.initialize_notification_kinds().await?;
 
             collab::seed::seed(&config, &db, false).await?;
-
-            if let Some(llm_database_url) = config.llm_database_url.clone() {
-                let db_options = db::ConnectOptions::new(llm_database_url);
-                let mut db = LlmDatabase::new(db_options.clone(), Executor::Production).await?;
-                db.initialize().await?;
-                collab::llm::db::seed_database(&config, &mut db, true).await?;
-            }
         }
         Some("serve") => {
             let mode = match args.next().as_deref() {
@@ -78,7 +59,7 @@ async fn main() -> Result<()> {
                 Some("all") => ServiceMode::All,
                 _ => {
                     return Err(anyhow!(
-                        "usage: collab <version | migrate | seed | serve <api|collab|all>>"
+                        "usage: collab <version | seed | serve <api|collab|all>>"
                     ))?;
                 }
             };
@@ -99,20 +80,10 @@ async fn main() -> Result<()> {
 
             if mode.is_collab() || mode.is_api() {
                 setup_app_database(&config).await?;
-                setup_llm_database(&config).await?;
 
                 let state = AppState::new(config, Executor::Production).await?;
 
-                if let Some(stripe_billing) = state.stripe_billing.clone() {
-                    let executor = state.executor.clone();
-                    executor.spawn_detached(async move {
-                        stripe_billing.initialize().await.trace_err();
-                    });
-                }
-
                 if mode.is_collab() {
-                    state.db.purge_old_embeddings().await.trace_err();
-
                     let epoch = state
                         .db
                         .create_server(&state.config.zed_environment)
@@ -120,41 +91,13 @@ async fn main() -> Result<()> {
                     let rpc_server = collab::rpc::Server::new(epoch, state.clone());
                     rpc_server.start().await?;
 
-                    poll_stripe_events_periodically(state.clone(), rpc_server.clone());
-
-                    app = app
-                        .merge(collab::api::routes(rpc_server.clone()))
-                        .merge(collab::rpc::routes(rpc_server.clone()));
+                    app = app.merge(collab::rpc::routes(rpc_server.clone()));
 
                     on_shutdown = Some(Box::new(move || rpc_server.teardown()));
                 }
 
                 if mode.is_api() {
                     fetch_extensions_from_blob_store_periodically(state.clone());
-                    spawn_user_backfiller(state.clone());
-
-                    let llm_db = maybe!(async {
-                        let database_url = state
-                            .config
-                            .llm_database_url
-                            .as_ref()
-                            .context("missing LLM_DATABASE_URL")?;
-                        let max_connections = state
-                            .config
-                            .llm_database_max_connections
-                            .context("missing LLM_DATABASE_MAX_CONNECTIONS")?;
-
-                        let mut db_options = db::ConnectOptions::new(database_url);
-                        db_options.max_connections(max_connections);
-                        LlmDatabase::new(db_options, state.executor.clone()).await
-                    })
-                    .await
-                    .trace_err();
-
-                    if let Some(mut llm_db) = llm_db {
-                        llm_db.initialize().await?;
-                        sync_llm_request_usage_with_stripe_periodically(state.clone());
-                    }
 
                     app = app
                         .merge(collab::api::events::router())
@@ -255,63 +198,10 @@ async fn setup_app_database(config: &Config) -> Result<()> {
     let db_options = db::ConnectOptions::new(config.database_url.clone());
     let mut db = Database::new(db_options).await?;
 
-    let migrations_path = config.migrations_path.as_deref().unwrap_or_else(|| {
-        #[cfg(feature = "sqlite")]
-        let default_migrations = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations.sqlite");
-        #[cfg(not(feature = "sqlite"))]
-        let default_migrations = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations");
-
-        Path::new(default_migrations)
-    });
-
-    let migrations = run_database_migrations(db.options(), migrations_path).await?;
-    for (migration, duration) in migrations {
-        log::info!(
-            "Migrated {} {} {:?}",
-            migration.version,
-            migration.description,
-            duration
-        );
-    }
-
     db.initialize_notification_kinds().await?;
 
     if config.seed_path.is_some() {
         collab::seed::seed(config, &db, false).await?;
-    }
-
-    Ok(())
-}
-
-async fn setup_llm_database(config: &Config) -> Result<()> {
-    let database_url = config
-        .llm_database_url
-        .as_ref()
-        .context("missing LLM_DATABASE_URL")?;
-
-    let db_options = db::ConnectOptions::new(database_url.clone());
-    let db = LlmDatabase::new(db_options, Executor::Production).await?;
-
-    let migrations_path = config
-        .llm_database_migrations_path
-        .as_deref()
-        .unwrap_or_else(|| {
-            #[cfg(feature = "sqlite")]
-            let default_migrations = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations_llm.sqlite");
-            #[cfg(not(feature = "sqlite"))]
-            let default_migrations = concat!(env!("CARGO_MANIFEST_DIR"), "/migrations_llm");
-
-            Path::new(default_migrations)
-        });
-
-    let migrations = run_database_migrations(db.options(), migrations_path).await?;
-    for (migration, duration) in migrations {
-        log::info!(
-            "Migrated {} {} {:?}",
-            migration.version,
-            migration.description,
-            duration
-        );
     }
 
     Ok(())

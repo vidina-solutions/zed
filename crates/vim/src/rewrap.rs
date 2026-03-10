@@ -18,7 +18,7 @@ pub(crate) fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
         Vim::take_count(cx);
         Vim::take_forced_motion(cx);
         vim.store_visual_marks(window, cx);
-        vim.update_editor(window, cx, |vim, editor, window, cx| {
+        vim.update_editor(cx, |vim, editor, cx| {
             editor.transact(window, cx, |editor, window, cx| {
                 let mut positions = vim.save_selection_starts(editor, cx);
                 editor.rewrap_impl(
@@ -29,7 +29,7 @@ pub(crate) fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
                     cx,
                 );
                 editor.change_selections(Default::default(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         if let Some(anchor) = positions.remove(&selection.id) {
                             let mut point = anchor.to_display_point(map);
                             *point.column_mut() = 0;
@@ -55,12 +55,12 @@ impl Vim {
         cx: &mut Context<Self>,
     ) {
         self.stop_recording(cx);
-        self.update_editor(window, cx, |_, editor, window, cx| {
-            let text_layout_details = editor.text_layout_details(window);
+        self.update_editor(cx, |_, editor, cx| {
+            let text_layout_details = editor.text_layout_details(window, cx);
             editor.transact(window, cx, |editor, window, cx| {
                 let mut selection_starts: HashMap<_, _> = Default::default();
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         let anchor = map.display_point_to_anchor(selection.head(), Bias::Right);
                         selection_starts.insert(selection.id, anchor);
                         motion.expand_selection(
@@ -80,7 +80,7 @@ impl Vim {
                     cx,
                 );
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         let anchor = selection_starts.remove(&selection.id).unwrap();
                         let mut point = anchor.to_display_point(map);
                         *point.column_mut() = 0;
@@ -100,11 +100,11 @@ impl Vim {
         cx: &mut Context<Self>,
     ) {
         self.stop_recording(cx);
-        self.update_editor(window, cx, |_, editor, window, cx| {
+        self.update_editor(cx, |_, editor, cx| {
             editor.transact(window, cx, |editor, window, cx| {
                 let mut original_positions: HashMap<_, _> = Default::default();
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         let anchor = map.display_point_to_anchor(selection.head(), Bias::Right);
                         original_positions.insert(selection.id, anchor);
                         object.expand_selection(map, selection, around, times);
@@ -118,7 +118,7 @@ impl Vim {
                     cx,
                 );
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         let anchor = original_positions.remove(&selection.id).unwrap();
                         let mut point = anchor.to_display_point(map);
                         *point.column_mut() = 0;

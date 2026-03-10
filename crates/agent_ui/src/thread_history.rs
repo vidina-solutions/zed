@@ -1,79 +1,86 @@
-use crate::{AgentPanel, RemoveSelectedThread};
-use agent::history_store::{HistoryEntry, HistoryStore};
-use chrono::{Datelike as _, Local, NaiveDate, TimeDelta};
+use crate::ConnectionView;
+use crate::{AgentPanel, RemoveHistory, RemoveSelectedThread};
+use acp_thread::{AgentSessionInfo, AgentSessionList, AgentSessionListRequest, SessionListUpdate};
+use agent_client_protocol as acp;
+use chrono::{Datelike as _, Local, NaiveDate, TimeDelta, Utc};
 use editor::{Editor, EditorEvent};
-use fuzzy::{StringMatch, StringMatchCandidate};
+use fuzzy::StringMatchCandidate;
 use gpui::{
-    App, ClickEvent, Empty, Entity, FocusHandle, Focusable, ScrollStrategy, Stateful, Task,
+    App, Entity, EventEmitter, FocusHandle, Focusable, ScrollStrategy, Task,
     UniformListScrollHandle, WeakEntity, Window, uniform_list,
 };
-use std::{fmt::Display, ops::Range, sync::Arc};
+use std::{fmt::Display, ops::Range, rc::Rc};
+use text::Bias;
 use time::{OffsetDateTime, UtcOffset};
 use ui::{
-    HighlightedLabel, IconButtonShape, ListItem, ListItemSpacing, Scrollbar, ScrollbarState,
-    Tooltip, prelude::*,
+    ElementId, HighlightedLabel, IconButtonShape, ListItem, ListItemSpacing, Tab, Tooltip,
+    WithScrollbar, prelude::*,
 };
-use util::ResultExt;
+
+const DEFAULT_TITLE: &SharedString = &SharedString::new_static("New Thread");
+
+fn thread_title(entry: &AgentSessionInfo) -> &SharedString {
+    entry
+        .title
+        .as_ref()
+        .filter(|title| !title.is_empty())
+        .unwrap_or(DEFAULT_TITLE)
+}
 
 pub struct ThreadHistory {
-    agent_panel: WeakEntity<AgentPanel>,
-    history_store: Entity<HistoryStore>,
+    session_list: Option<Rc<dyn AgentSessionList>>,
+    sessions: Vec<AgentSessionInfo>,
     scroll_handle: UniformListScrollHandle,
     selected_index: usize,
     hovered_index: Option<usize>,
     search_editor: Entity<Editor>,
-    all_entries: Arc<Vec<HistoryEntry>>,
-    // When the search is empty, we display date separators between history entries
-    // This vector contains an enum of either a separator or an actual entry
-    separated_items: Vec<ListItemType>,
-    // Maps entry indexes to list item indexes
-    separated_item_indexes: Vec<u32>,
-    _separated_items_task: Option<Task<()>>,
-    search_state: SearchState,
-    scrollbar_visibility: bool,
-    scrollbar_state: ScrollbarState,
+    search_query: SharedString,
+    visible_items: Vec<ListItemType>,
+    local_timezone: UtcOffset,
+    confirming_delete_history: bool,
+    _visible_items_task: Task<()>,
+    _refresh_task: Task<()>,
+    _watch_task: Option<Task<()>>,
     _subscriptions: Vec<gpui::Subscription>,
-}
-
-enum SearchState {
-    Empty,
-    Searching {
-        query: SharedString,
-        _task: Task<()>,
-    },
-    Searched {
-        query: SharedString,
-        matches: Vec<StringMatch>,
-    },
 }
 
 enum ListItemType {
     BucketSeparator(TimeBucket),
     Entry {
-        index: usize,
+        entry: AgentSessionInfo,
         format: EntryTimeFormat,
+    },
+    SearchResult {
+        entry: AgentSessionInfo,
+        positions: Vec<usize>,
     },
 }
 
 impl ListItemType {
-    fn entry_index(&self) -> Option<usize> {
+    fn history_entry(&self) -> Option<&AgentSessionInfo> {
         match self {
-            ListItemType::BucketSeparator(_) => None,
-            ListItemType::Entry { index, .. } => Some(*index),
+            ListItemType::Entry { entry, .. } => Some(entry),
+            ListItemType::SearchResult { entry, .. } => Some(entry),
+            _ => None,
         }
     }
 }
 
+pub enum ThreadHistoryEvent {
+    Open(AgentSessionInfo),
+}
+
+impl EventEmitter<ThreadHistoryEvent> for ThreadHistory {}
+
 impl ThreadHistory {
-    pub(crate) fn new(
-        agent_panel: WeakEntity<AgentPanel>,
-        history_store: Entity<HistoryStore>,
+    pub fn new(
+        session_list: Option<Rc<dyn AgentSessionList>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let search_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Search threads...", cx);
+            editor.set_placeholder_text("Search threads...", window, cx);
             editor
         });
 
@@ -81,142 +88,347 @@ impl ThreadHistory {
             cx.subscribe(&search_editor, |this, search_editor, event, cx| {
                 if let EditorEvent::BufferEdited = event {
                     let query = search_editor.read(cx).text(cx);
-                    this.search(query.into(), cx);
+                    if this.search_query != query {
+                        this.search_query = query.into();
+                        this.update_visible_items(false, cx);
+                    }
                 }
             });
 
-        let history_store_subscription = cx.observe(&history_store, |this, _, cx| {
-            this.update_all_entries(cx);
-        });
-
         let scroll_handle = UniformListScrollHandle::default();
-        let scrollbar_state = ScrollbarState::new(scroll_handle.clone());
 
         let mut this = Self {
-            agent_panel,
-            history_store,
+            session_list: None,
+            sessions: Vec::new(),
             scroll_handle,
             selected_index: 0,
             hovered_index: None,
-            search_state: SearchState::Empty,
-            all_entries: Default::default(),
-            separated_items: Default::default(),
-            separated_item_indexes: Default::default(),
+            visible_items: Default::default(),
             search_editor,
-            scrollbar_visibility: true,
-            scrollbar_state,
-            _subscriptions: vec![search_editor_subscription, history_store_subscription],
-            _separated_items_task: None,
+            local_timezone: UtcOffset::from_whole_seconds(
+                chrono::Local::now().offset().local_minus_utc(),
+            )
+            .unwrap(),
+            search_query: SharedString::default(),
+            confirming_delete_history: false,
+            _subscriptions: vec![search_editor_subscription],
+            _visible_items_task: Task::ready(()),
+            _refresh_task: Task::ready(()),
+            _watch_task: None,
         };
-        this.update_all_entries(cx);
+        this.set_session_list(session_list, cx);
         this
     }
 
-    fn update_all_entries(&mut self, cx: &mut Context<Self>) {
-        let new_entries: Arc<Vec<HistoryEntry>> = self
-            .history_store
-            .update(cx, |store, cx| store.entries(cx))
-            .into();
+    fn update_visible_items(&mut self, preserve_selected_item: bool, cx: &mut Context<Self>) {
+        let entries = self.sessions.clone();
+        let new_list_items = if self.search_query.is_empty() {
+            self.add_list_separators(entries, cx)
+        } else {
+            self.filter_search_results(entries, cx)
+        };
+        let selected_history_entry = if preserve_selected_item {
+            self.selected_history_entry().cloned()
+        } else {
+            None
+        };
 
-        self._separated_items_task.take();
+        self._visible_items_task = cx.spawn(async move |this, cx| {
+            let new_visible_items = new_list_items.await;
+            this.update(cx, |this, cx| {
+                let new_selected_index = if let Some(history_entry) = selected_history_entry {
+                    new_visible_items
+                        .iter()
+                        .position(|visible_entry| {
+                            visible_entry
+                                .history_entry()
+                                .is_some_and(|entry| entry.session_id == history_entry.session_id)
+                        })
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
 
-        let mut items = Vec::with_capacity(new_entries.len() + 1);
-        let mut indexes = Vec::with_capacity(new_entries.len() + 1);
+                this.visible_items = new_visible_items;
+                this.set_selected_index(new_selected_index, Bias::Right, cx);
+                cx.notify();
+            })
+            .ok();
+        });
+    }
 
-        let bg_task = cx.background_spawn(async move {
+    pub fn set_session_list(
+        &mut self,
+        session_list: Option<Rc<dyn AgentSessionList>>,
+        cx: &mut Context<Self>,
+    ) {
+        if let (Some(current), Some(next)) = (&self.session_list, &session_list)
+            && Rc::ptr_eq(current, next)
+        {
+            return;
+        }
+
+        self.session_list = session_list;
+        self.sessions.clear();
+        self.visible_items.clear();
+        self.selected_index = 0;
+        self._visible_items_task = Task::ready(());
+        self._refresh_task = Task::ready(());
+
+        let Some(session_list) = self.session_list.as_ref() else {
+            self._watch_task = None;
+            cx.notify();
+            return;
+        };
+        let Some(rx) = session_list.watch(cx) else {
+            // No watch support - do a one-time refresh
+            self._watch_task = None;
+            self.refresh_sessions(false, false, cx);
+            return;
+        };
+        session_list.notify_refresh();
+
+        self._watch_task = Some(cx.spawn(async move |this, cx| {
+            while let Ok(first_update) = rx.recv().await {
+                let mut updates = vec![first_update];
+                // Collect any additional updates that are already in the channel
+                while let Ok(update) = rx.try_recv() {
+                    updates.push(update);
+                }
+
+                this.update(cx, |this, cx| {
+                    let needs_refresh = updates
+                        .iter()
+                        .any(|u| matches!(u, SessionListUpdate::Refresh));
+
+                    if needs_refresh {
+                        this.refresh_sessions(true, false, cx);
+                    } else {
+                        for update in updates {
+                            if let SessionListUpdate::SessionInfo { session_id, update } = update {
+                                this.apply_info_update(session_id, update, cx);
+                            }
+                        }
+                    }
+                })
+                .ok();
+            }
+        }));
+    }
+
+    pub(crate) fn refresh_full_history(&mut self, cx: &mut Context<Self>) {
+        self.refresh_sessions(true, true, cx);
+    }
+
+    fn apply_info_update(
+        &mut self,
+        session_id: acp::SessionId,
+        info_update: acp::SessionInfoUpdate,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|s| s.session_id == session_id)
+        else {
+            return;
+        };
+
+        match info_update.title {
+            acp::MaybeUndefined::Value(title) => {
+                session.title = Some(title.into());
+            }
+            acp::MaybeUndefined::Null => {
+                session.title = None;
+            }
+            acp::MaybeUndefined::Undefined => {}
+        }
+        match info_update.updated_at {
+            acp::MaybeUndefined::Value(date_str) => {
+                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&date_str) {
+                    session.updated_at = Some(dt.with_timezone(&chrono::Utc));
+                }
+            }
+            acp::MaybeUndefined::Null => {
+                session.updated_at = None;
+            }
+            acp::MaybeUndefined::Undefined => {}
+        }
+        if let Some(meta) = info_update.meta {
+            session.meta = Some(meta);
+        }
+
+        self.update_visible_items(true, cx);
+    }
+
+    fn refresh_sessions(
+        &mut self,
+        preserve_selected_item: bool,
+        load_all_pages: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session_list) = self.session_list.clone() else {
+            self.update_visible_items(preserve_selected_item, cx);
+            return;
+        };
+
+        // If a new refresh arrives while pagination is in progress, the previous
+        // `_refresh_task` is cancelled. This is intentional (latest refresh wins),
+        // but means sessions may be in a partial state until the new refresh completes.
+        self._refresh_task = cx.spawn(async move |this, cx| {
+            let mut cursor: Option<String> = None;
+            let mut is_first_page = true;
+
+            loop {
+                let request = AgentSessionListRequest {
+                    cursor: cursor.clone(),
+                    ..Default::default()
+                };
+                let task = cx.update(|cx| session_list.list_sessions(request, cx));
+                let response = match task.await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        log::error!("Failed to load session history: {error:#}");
+                        return;
+                    }
+                };
+
+                let acp_thread::AgentSessionListResponse {
+                    sessions: page_sessions,
+                    next_cursor,
+                    ..
+                } = response;
+
+                this.update(cx, |this, cx| {
+                    if is_first_page {
+                        this.sessions = page_sessions;
+                    } else {
+                        this.sessions.extend(page_sessions);
+                    }
+                    this.update_visible_items(preserve_selected_item, cx);
+                })
+                .ok();
+
+                is_first_page = false;
+                if !load_all_pages {
+                    break;
+                }
+
+                match next_cursor {
+                    Some(next_cursor) => {
+                        if cursor.as_ref() == Some(&next_cursor) {
+                            log::warn!(
+                                "Session list pagination returned the same cursor; stopping to avoid a loop."
+                            );
+                            break;
+                        }
+                        cursor = Some(next_cursor);
+                    }
+                    None => break,
+                }
+            }
+        });
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+
+    pub fn has_session_list(&self) -> bool {
+        self.session_list.is_some()
+    }
+
+    pub fn refresh(&mut self, _cx: &mut Context<Self>) {
+        if let Some(session_list) = &self.session_list {
+            session_list.notify_refresh();
+        }
+    }
+
+    pub fn session_for_id(&self, session_id: &acp::SessionId) -> Option<AgentSessionInfo> {
+        self.sessions
+            .iter()
+            .find(|entry| &entry.session_id == session_id)
+            .cloned()
+    }
+
+    pub(crate) fn sessions(&self) -> &[AgentSessionInfo] {
+        &self.sessions
+    }
+
+    pub(crate) fn get_recent_sessions(&self, limit: usize) -> Vec<AgentSessionInfo> {
+        self.sessions.iter().take(limit).cloned().collect()
+    }
+
+    pub fn supports_delete(&self) -> bool {
+        self.session_list
+            .as_ref()
+            .map(|sl| sl.supports_delete())
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn delete_session(
+        &self,
+        session_id: &acp::SessionId,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<()>> {
+        if let Some(session_list) = self.session_list.as_ref() {
+            session_list.delete_session(session_id, cx)
+        } else {
+            Task::ready(Ok(()))
+        }
+    }
+
+    fn add_list_separators(
+        &self,
+        entries: Vec<AgentSessionInfo>,
+        cx: &App,
+    ) -> Task<Vec<ListItemType>> {
+        cx.background_spawn(async move {
+            let mut items = Vec::with_capacity(entries.len() + 1);
             let mut bucket = None;
             let today = Local::now().naive_local().date();
 
-            for (index, entry) in new_entries.iter().enumerate() {
-                let entry_date = entry
-                    .updated_at()
-                    .with_timezone(&Local)
-                    .naive_local()
-                    .date();
-                let entry_bucket = TimeBucket::from_dates(today, entry_date);
+            for entry in entries.into_iter() {
+                let entry_bucket = entry
+                    .updated_at
+                    .map(|timestamp| {
+                        let entry_date = timestamp.with_timezone(&Local).naive_local().date();
+                        TimeBucket::from_dates(today, entry_date)
+                    })
+                    .unwrap_or(TimeBucket::All);
 
                 if Some(entry_bucket) != bucket {
                     bucket = Some(entry_bucket);
                     items.push(ListItemType::BucketSeparator(entry_bucket));
                 }
 
-                indexes.push(items.len() as u32);
                 items.push(ListItemType::Entry {
-                    index,
+                    entry,
                     format: entry_bucket.into(),
                 });
             }
-            (new_entries, items, indexes)
-        });
-
-        let task = cx.spawn(async move |this, cx| {
-            let (new_entries, items, indexes) = bg_task.await;
-            this.update(cx, |this, cx| {
-                let previously_selected_entry =
-                    this.all_entries.get(this.selected_index).map(|e| e.id());
-
-                this.all_entries = new_entries;
-                this.separated_items = items;
-                this.separated_item_indexes = indexes;
-
-                match &this.search_state {
-                    SearchState::Empty => {
-                        if this.selected_index >= this.all_entries.len() {
-                            this.set_selected_entry_index(
-                                this.all_entries.len().saturating_sub(1),
-                                cx,
-                            );
-                        } else if let Some(prev_id) = previously_selected_entry {
-                            if let Some(new_ix) = this
-                                .all_entries
-                                .iter()
-                                .position(|probe| probe.id() == prev_id)
-                            {
-                                this.set_selected_entry_index(new_ix, cx);
-                            }
-                        }
-                    }
-                    SearchState::Searching { query, .. } | SearchState::Searched { query, .. } => {
-                        this.search(query.clone(), cx);
-                    }
-                }
-
-                cx.notify();
-            })
-            .log_err();
-        });
-        self._separated_items_task = Some(task);
+            items
+        })
     }
 
-    fn search(&mut self, query: SharedString, cx: &mut Context<Self>) {
-        if query.is_empty() {
-            self.search_state = SearchState::Empty;
-            cx.notify();
-            return;
-        }
-
-        let all_entries = self.all_entries.clone();
-
-        let fuzzy_search_task = cx.background_spawn({
-            let query = query.clone();
+    fn filter_search_results(
+        &self,
+        entries: Vec<AgentSessionInfo>,
+        cx: &App,
+    ) -> Task<Vec<ListItemType>> {
+        let query = self.search_query.clone();
+        cx.background_spawn({
             let executor = cx.background_executor().clone();
             async move {
-                let mut candidates = Vec::with_capacity(all_entries.len());
+                let mut candidates = Vec::with_capacity(entries.len());
 
-                for (idx, entry) in all_entries.iter().enumerate() {
-                    match entry {
-                        HistoryEntry::Thread(thread) => {
-                            candidates.push(StringMatchCandidate::new(idx, &thread.summary));
-                        }
-                        HistoryEntry::Context(context) => {
-                            candidates.push(StringMatchCandidate::new(idx, &context.title));
-                        }
-                    }
+                for (idx, entry) in entries.iter().enumerate() {
+                    candidates.push(StringMatchCandidate::new(idx, thread_title(entry)));
                 }
 
                 const MAX_MATCHES: usize = 100;
 
-                fuzzy::match_strings(
+                let matches = fuzzy::match_strings(
                     &candidates,
                     &query,
                     false,
@@ -225,74 +437,61 @@ impl ThreadHistory {
                     &Default::default(),
                     executor,
                 )
-                .await
+                .await;
+
+                matches
+                    .into_iter()
+                    .map(|search_match| ListItemType::SearchResult {
+                        entry: entries[search_match.candidate_id].clone(),
+                        positions: search_match.positions,
+                    })
+                    .collect()
             }
-        });
-
-        let task = cx.spawn({
-            let query = query.clone();
-            async move |this, cx| {
-                let matches = fuzzy_search_task.await;
-
-                this.update(cx, |this, cx| {
-                    let SearchState::Searching {
-                        query: current_query,
-                        _task,
-                    } = &this.search_state
-                    else {
-                        return;
-                    };
-
-                    if &query == current_query {
-                        this.search_state = SearchState::Searched {
-                            query: query.clone(),
-                            matches,
-                        };
-
-                        this.set_selected_entry_index(0, cx);
-                        cx.notify();
-                    };
-                })
-                .log_err();
-            }
-        });
-
-        self.search_state = SearchState::Searching { query, _task: task };
-        cx.notify();
-    }
-
-    fn matched_count(&self) -> usize {
-        match &self.search_state {
-            SearchState::Empty => self.all_entries.len(),
-            SearchState::Searching { .. } => 0,
-            SearchState::Searched { matches, .. } => matches.len(),
-        }
-    }
-
-    fn list_item_count(&self) -> usize {
-        match &self.search_state {
-            SearchState::Empty => self.separated_items.len(),
-            SearchState::Searching { .. } => 0,
-            SearchState::Searched { matches, .. } => matches.len(),
-        }
+        })
     }
 
     fn search_produced_no_matches(&self) -> bool {
-        match &self.search_state {
-            SearchState::Empty => false,
-            SearchState::Searching { .. } => false,
-            SearchState::Searched { matches, .. } => matches.is_empty(),
-        }
+        self.visible_items.is_empty() && !self.search_query.is_empty()
     }
 
-    fn get_match(&self, ix: usize) -> Option<&HistoryEntry> {
-        match &self.search_state {
-            SearchState::Empty => self.all_entries.get(ix),
-            SearchState::Searching { .. } => None,
-            SearchState::Searched { matches, .. } => matches
-                .get(ix)
-                .and_then(|m| self.all_entries.get(m.candidate_id)),
+    fn selected_history_entry(&self) -> Option<&AgentSessionInfo> {
+        self.get_history_entry(self.selected_index)
+    }
+
+    fn get_history_entry(&self, visible_items_ix: usize) -> Option<&AgentSessionInfo> {
+        self.visible_items.get(visible_items_ix)?.history_entry()
+    }
+
+    fn set_selected_index(&mut self, mut index: usize, bias: Bias, cx: &mut Context<Self>) {
+        if self.visible_items.len() == 0 {
+            self.selected_index = 0;
+            return;
         }
+        while matches!(
+            self.visible_items.get(index),
+            None | Some(ListItemType::BucketSeparator(..))
+        ) {
+            index = match bias {
+                Bias::Left => {
+                    if index == 0 {
+                        self.visible_items.len() - 1
+                    } else {
+                        index - 1
+                    }
+                }
+                Bias::Right => {
+                    if index >= self.visible_items.len() - 1 {
+                        0
+                    } else {
+                        index + 1
+                    }
+                }
+            };
+        }
+        self.selected_index = index;
+        self.scroll_handle
+            .scroll_to_item(index, ScrollStrategy::Top);
+        cx.notify()
     }
 
     pub fn select_previous(
@@ -301,13 +500,10 @@ impl ThreadHistory {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let count = self.matched_count();
-        if count > 0 {
-            if self.selected_index == 0 {
-                self.set_selected_entry_index(count - 1, cx);
-            } else {
-                self.set_selected_entry_index(self.selected_index - 1, cx);
-            }
+        if self.selected_index == 0 {
+            self.set_selected_index(self.visible_items.len() - 1, Bias::Left, cx);
+        } else {
+            self.set_selected_index(self.selected_index - 1, Bias::Left, cx);
         }
     }
 
@@ -317,13 +513,10 @@ impl ThreadHistory {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let count = self.matched_count();
-        if count > 0 {
-            if self.selected_index == count - 1 {
-                self.set_selected_entry_index(0, cx);
-            } else {
-                self.set_selected_entry_index(self.selected_index + 1, cx);
-            }
+        if self.selected_index == self.visible_items.len() - 1 {
+            self.set_selected_index(0, Bias::Right, cx);
+        } else {
+            self.set_selected_index(self.selected_index + 1, Bias::Right, cx);
         }
     }
 
@@ -333,91 +526,22 @@ impl ThreadHistory {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let count = self.matched_count();
-        if count > 0 {
-            self.set_selected_entry_index(0, cx);
-        }
+        self.set_selected_index(0, Bias::Right, cx);
     }
 
     fn select_last(&mut self, _: &menu::SelectLast, _window: &mut Window, cx: &mut Context<Self>) {
-        let count = self.matched_count();
-        if count > 0 {
-            self.set_selected_entry_index(count - 1, cx);
-        }
+        self.set_selected_index(self.visible_items.len() - 1, Bias::Left, cx);
     }
 
-    fn set_selected_entry_index(&mut self, entry_index: usize, cx: &mut Context<Self>) {
-        self.selected_index = entry_index;
+    fn confirm(&mut self, _: &menu::Confirm, _window: &mut Window, cx: &mut Context<Self>) {
+        self.confirm_entry(self.selected_index, cx);
+    }
 
-        let scroll_ix = match self.search_state {
-            SearchState::Empty | SearchState::Searching { .. } => self
-                .separated_item_indexes
-                .get(entry_index)
-                .map(|ix| *ix as usize)
-                .unwrap_or(entry_index + 1),
-            SearchState::Searched { .. } => entry_index,
+    fn confirm_entry(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(entry) = self.get_history_entry(ix) else {
+            return;
         };
-
-        self.scroll_handle
-            .scroll_to_item(scroll_ix, ScrollStrategy::Top);
-
-        cx.notify();
-    }
-
-    fn render_scrollbar(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
-        if !(self.scrollbar_visibility || self.scrollbar_state.is_dragging()) {
-            return None;
-        }
-
-        Some(
-            div()
-                .occlude()
-                .id("thread-history-scroll")
-                .h_full()
-                .bg(cx.theme().colors().panel_background.opacity(0.8))
-                .border_l_1()
-                .border_color(cx.theme().colors().border_variant)
-                .absolute()
-                .right_1()
-                .top_0()
-                .bottom_0()
-                .w_4()
-                .pl_1()
-                .cursor_default()
-                .on_mouse_move(cx.listener(|_, _, _window, cx| {
-                    cx.notify();
-                    cx.stop_propagation()
-                }))
-                .on_hover(|_, _window, cx| {
-                    cx.stop_propagation();
-                })
-                .on_any_mouse_down(|_, _window, cx| {
-                    cx.stop_propagation();
-                })
-                .on_scroll_wheel(cx.listener(|_, _, _window, cx| {
-                    cx.notify();
-                }))
-                .children(Scrollbar::vertical(self.scrollbar_state.clone())),
-        )
-    }
-
-    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(entry) = self.get_match(self.selected_index) {
-            let task_result = match entry {
-                HistoryEntry::Thread(thread) => self.agent_panel.update(cx, move |this, cx| {
-                    this.open_thread_by_id(&thread.id, window, cx)
-                }),
-                HistoryEntry::Context(context) => self.agent_panel.update(cx, move |this, cx| {
-                    this.open_saved_prompt_editor(context.path.clone(), window, cx)
-                }),
-            };
-
-            if let Some(task) = task_result.log_err() {
-                task.detach_and_log_err(cx);
-            };
-
-            cx.notify();
-        }
+        cx.emit(ThreadHistoryEvent::Open(entry.clone()));
     }
 
     fn remove_selected_thread(
@@ -426,96 +550,72 @@ impl ThreadHistory {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(entry) = self.get_match(self.selected_index) {
-            let task_result = match entry {
-                HistoryEntry::Thread(thread) => self
-                    .agent_panel
-                    .update(cx, |this, cx| this.delete_thread(&thread.id, cx)),
-                HistoryEntry::Context(context) => self
-                    .agent_panel
-                    .update(cx, |this, cx| this.delete_context(context.path.clone(), cx)),
-            };
-
-            if let Some(task) = task_result.log_err() {
-                task.detach_and_log_err(cx);
-            };
-
-            cx.notify();
-        }
+        self.remove_thread(self.selected_index, cx)
     }
 
-    fn list_items(
+    fn remove_thread(&mut self, visible_item_ix: usize, cx: &mut Context<Self>) {
+        let Some(entry) = self.get_history_entry(visible_item_ix) else {
+            return;
+        };
+        let Some(session_list) = self.session_list.as_ref() else {
+            return;
+        };
+        if !session_list.supports_delete() {
+            return;
+        }
+        let task = session_list.delete_session(&entry.session_id, cx);
+        task.detach_and_log_err(cx);
+    }
+
+    fn remove_history(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session_list) = self.session_list.as_ref() else {
+            return;
+        };
+        if !session_list.supports_delete() {
+            return;
+        }
+        session_list.delete_sessions(cx).detach_and_log_err(cx);
+        self.confirming_delete_history = false;
+        cx.notify();
+    }
+
+    fn prompt_delete_history(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.confirming_delete_history = true;
+        cx.notify();
+    }
+
+    fn cancel_delete_history(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.confirming_delete_history = false;
+        cx.notify();
+    }
+
+    fn render_list_items(
         &mut self,
         range: Range<usize>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        let range_start = range.start;
-
-        match &self.search_state {
-            SearchState::Empty => self
-                .separated_items
-                .get(range)
-                .iter()
-                .flat_map(|items| {
-                    items
-                        .iter()
-                        .map(|item| self.render_list_item(item.entry_index(), item, vec![], cx))
-                })
-                .collect(),
-            SearchState::Searched { matches, .. } => matches[range]
-                .iter()
-                .enumerate()
-                .map(|(ix, m)| {
-                    self.render_list_item(
-                        Some(range_start + ix),
-                        &ListItemType::Entry {
-                            index: m.candidate_id,
-                            format: EntryTimeFormat::DateAndTime,
-                        },
-                        m.positions.clone(),
-                        cx,
-                    )
-                })
-                .collect(),
-            SearchState::Searching { .. } => {
-                vec![]
-            }
-        }
+        self.visible_items
+            .get(range.clone())
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(ix, item)| self.render_list_item(item, range.start + ix, cx))
+            .collect()
     }
 
-    fn render_list_item(
-        &self,
-        list_entry_ix: Option<usize>,
-        item: &ListItemType,
-        highlight_positions: Vec<usize>,
-        cx: &Context<Self>,
-    ) -> AnyElement {
+    fn render_list_item(&self, item: &ListItemType, ix: usize, cx: &Context<Self>) -> AnyElement {
         match item {
-            ListItemType::Entry { index, format } => match self.all_entries.get(*index) {
-                Some(entry) => h_flex()
-                    .w_full()
-                    .pb_1()
-                    .child(
-                        HistoryEntryElement::new(entry.clone(), self.agent_panel.clone())
-                            .highlight_positions(highlight_positions)
-                            .timestamp_format(*format)
-                            .selected(list_entry_ix == Some(self.selected_index))
-                            .hovered(list_entry_ix == self.hovered_index)
-                            .on_hover(cx.listener(move |this, is_hovered, _window, cx| {
-                                if *is_hovered {
-                                    this.hovered_index = list_entry_ix;
-                                } else if this.hovered_index == list_entry_ix {
-                                    this.hovered_index = None;
-                                }
-
-                                cx.notify();
-                            }))
-                            .into_any_element(),
-                    )
-                    .into_any(),
-                None => Empty.into_any_element(),
-            },
+            ListItemType::Entry { entry, format } => self
+                .render_history_entry(entry, *format, ix, Vec::default(), cx)
+                .into_any(),
+            ListItemType::SearchResult { entry, positions } => self.render_history_entry(
+                entry,
+                EntryTimeFormat::DateAndTime,
+                ix,
+                positions.clone(),
+                cx,
+            ),
             ListItemType::BucketSeparator(bucket) => div()
                 .px(DynamicSpacing::Base06.rems(cx))
                 .pt_2()
@@ -528,6 +628,96 @@ impl ThreadHistory {
                 .into_any_element(),
         }
     }
+
+    fn render_history_entry(
+        &self,
+        entry: &AgentSessionInfo,
+        format: EntryTimeFormat,
+        ix: usize,
+        highlight_positions: Vec<usize>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let selected = ix == self.selected_index;
+        let hovered = Some(ix) == self.hovered_index;
+        let entry_time = entry.updated_at;
+        let display_text = match (format, entry_time) {
+            (EntryTimeFormat::DateAndTime, Some(entry_time)) => {
+                let now = Utc::now();
+                let duration = now.signed_duration_since(entry_time);
+                let days = duration.num_days();
+
+                format!("{}d", days)
+            }
+            (EntryTimeFormat::TimeOnly, Some(entry_time)) => {
+                format.format_timestamp(entry_time.timestamp(), self.local_timezone)
+            }
+            (_, None) => "—".to_string(),
+        };
+
+        let title = thread_title(entry).clone();
+        let full_date = entry_time
+            .map(|time| {
+                EntryTimeFormat::DateAndTime.format_timestamp(time.timestamp(), self.local_timezone)
+            })
+            .unwrap_or_else(|| "Unknown".to_string());
+
+        h_flex()
+            .w_full()
+            .pb_1()
+            .child(
+                ListItem::new(ix)
+                    .rounded()
+                    .toggle_state(selected)
+                    .spacing(ListItemSpacing::Sparse)
+                    .start_slot(
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .justify_between()
+                            .child(
+                                HighlightedLabel::new(thread_title(entry), highlight_positions)
+                                    .size(LabelSize::Small)
+                                    .truncate(),
+                            )
+                            .child(
+                                Label::new(display_text)
+                                    .color(Color::Muted)
+                                    .size(LabelSize::XSmall),
+                            ),
+                    )
+                    .tooltip(move |_, cx| {
+                        Tooltip::with_meta(title.clone(), None, full_date.clone(), cx)
+                    })
+                    .on_hover(cx.listener(move |this, is_hovered, _window, cx| {
+                        if *is_hovered {
+                            this.hovered_index = Some(ix);
+                        } else if this.hovered_index == Some(ix) {
+                            this.hovered_index = None;
+                        }
+
+                        cx.notify();
+                    }))
+                    .end_slot::<IconButton>(if hovered && self.supports_delete() {
+                        Some(
+                            IconButton::new("delete", IconName::Trash)
+                                .shape(IconButtonShape::Square)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .tooltip(move |_window, cx| {
+                                    Tooltip::for_action("Delete", &RemoveSelectedThread, cx)
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.remove_thread(ix, cx);
+                                    cx.stop_propagation()
+                                })),
+                        )
+                    } else {
+                        None
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| this.confirm_entry(ix, cx))),
+            )
+            .into_any_element()
+    }
 }
 
 impl Focusable for ThreadHistory {
@@ -537,35 +727,39 @@ impl Focusable for ThreadHistory {
 }
 
 impl Render for ThreadHistory {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let has_no_history = self.is_empty();
+
         v_flex()
             .key_context("ThreadHistory")
             .size_full()
+            .bg(cx.theme().colors().panel_background)
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_first))
             .on_action(cx.listener(Self::select_last))
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::remove_selected_thread))
-            .when(!self.all_entries.is_empty(), |parent| {
-                parent.child(
-                    h_flex()
-                        .h(px(41.)) // Match the toolbar perfectly
-                        .w_full()
-                        .py_1()
-                        .px_2()
-                        .gap_2()
-                        .justify_between()
-                        .border_b_1()
-                        .border_color(cx.theme().colors().border)
-                        .child(
-                            Icon::new(IconName::MagnifyingGlass)
-                                .color(Color::Muted)
-                                .size(IconSize::Small),
-                        )
-                        .child(self.search_editor.clone()),
-                )
-            })
+            .on_action(cx.listener(|this, _: &RemoveHistory, window, cx| {
+                this.remove_history(window, cx);
+            }))
+            .child(
+                h_flex()
+                    .h(Tab::container_height(cx))
+                    .w_full()
+                    .py_1()
+                    .px_2()
+                    .gap_2()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border)
+                    .child(
+                        Icon::new(IconName::MagnifyingGlass)
+                            .color(Color::Muted)
+                            .size(IconSize::Small),
+                    )
+                    .child(self.search_editor.clone()),
+            )
             .child({
                 let view = v_flex()
                     .id("list-container")
@@ -573,68 +767,122 @@ impl Render for ThreadHistory {
                     .overflow_hidden()
                     .flex_grow();
 
-                if self.all_entries.is_empty() {
-                    view.justify_center()
-                        .child(
-                            h_flex().w_full().justify_center().child(
-                                Label::new("You don't have any past threads yet.")
-                                    .size(LabelSize::Small),
-                            ),
-                        )
-                } else if self.search_produced_no_matches() {
-                    view.justify_center().child(
-                        h_flex().w_full().justify_center().child(
-                            Label::new("No threads match your search.").size(LabelSize::Small),
-                        ),
+                if has_no_history {
+                    view.justify_center().items_center().child(
+                        Label::new("You don't have any past threads yet.")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
                     )
+                } else if self.search_produced_no_matches() {
+                    view.justify_center()
+                        .items_center()
+                        .child(Label::new("No threads match your search.").size(LabelSize::Small))
                 } else {
-                    view.pr_5()
-                        .child(
-                            uniform_list(
-                                "thread-history",
-                                self.list_item_count(),
-                                cx.processor(|this, range: Range<usize>, window, cx| {
-                                    this.list_items(range, window, cx)
-                                }),
-                            )
-                            .p_1()
-                            .track_scroll(self.scroll_handle.clone())
-                            .flex_grow(),
+                    view.child(
+                        uniform_list(
+                            "thread-history",
+                            self.visible_items.len(),
+                            cx.processor(|this, range: Range<usize>, window, cx| {
+                                this.render_list_items(range, window, cx)
+                            }),
                         )
-                        .when_some(self.render_scrollbar(cx), |div, scrollbar| {
-                            div.child(scrollbar)
-                        })
+                        .p_1()
+                        .pr_4()
+                        .track_scroll(&self.scroll_handle)
+                        .flex_grow(),
+                    )
+                    .vertical_scrollbar_for(&self.scroll_handle, window, cx)
                 }
+            })
+            .when(!has_no_history && self.supports_delete(), |this| {
+                this.child(
+                    h_flex()
+                        .p_2()
+                        .border_t_1()
+                        .border_color(cx.theme().colors().border_variant)
+                        .when(!self.confirming_delete_history, |this| {
+                            this.child(
+                                Button::new("delete_history", "Delete All History")
+                                    .full_width()
+                                    .style(ButtonStyle::Outlined)
+                                    .label_size(LabelSize::Small)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.prompt_delete_history(window, cx);
+                                    })),
+                            )
+                        })
+                        .when(self.confirming_delete_history, |this| {
+                            this.w_full()
+                                .gap_2()
+                                .flex_wrap()
+                                .justify_between()
+                                .child(
+                                    h_flex()
+                                        .flex_wrap()
+                                        .gap_1()
+                                        .child(
+                                            Label::new("Delete all threads?")
+                                                .size(LabelSize::Small),
+                                        )
+                                        .child(
+                                            Label::new("You won't be able to recover them later.")
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .child(
+                                            Button::new("cancel_delete", "Cancel")
+                                                .label_size(LabelSize::Small)
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.cancel_delete_history(window, cx);
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("confirm_delete", "Delete")
+                                                .style(ButtonStyle::Tinted(ui::TintColor::Error))
+                                                .color(Color::Error)
+                                                .label_size(LabelSize::Small)
+                                                .on_click(cx.listener(|_, _, window, cx| {
+                                                    window.dispatch_action(
+                                                        Box::new(RemoveHistory),
+                                                        cx,
+                                                    );
+                                                })),
+                                        ),
+                                )
+                        }),
+                )
             })
     }
 }
 
 #[derive(IntoElement)]
 pub struct HistoryEntryElement {
-    entry: HistoryEntry,
-    agent_panel: WeakEntity<AgentPanel>,
+    entry: AgentSessionInfo,
+    thread_view: WeakEntity<ConnectionView>,
     selected: bool,
     hovered: bool,
-    highlight_positions: Vec<usize>,
-    timestamp_format: EntryTimeFormat,
+    supports_delete: bool,
     on_hover: Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>,
 }
 
 impl HistoryEntryElement {
-    pub fn new(entry: HistoryEntry, agent_panel: WeakEntity<AgentPanel>) -> Self {
+    pub fn new(entry: AgentSessionInfo, thread_view: WeakEntity<ConnectionView>) -> Self {
         Self {
             entry,
-            agent_panel,
+            thread_view,
             selected: false,
             hovered: false,
-            highlight_positions: vec![],
-            timestamp_format: EntryTimeFormat::DateAndTime,
+            supports_delete: false,
             on_hover: Box::new(|_, _, _| {}),
         }
     }
 
-    pub fn selected(mut self, selected: bool) -> Self {
-        self.selected = selected;
+    pub fn supports_delete(mut self, supports_delete: bool) -> Self {
+        self.supports_delete = supports_delete;
         self
     }
 
@@ -643,42 +891,36 @@ impl HistoryEntryElement {
         self
     }
 
-    pub fn highlight_positions(mut self, positions: Vec<usize>) -> Self {
-        self.highlight_positions = positions;
-        self
-    }
-
     pub fn on_hover(mut self, on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static) -> Self {
         self.on_hover = Box::new(on_hover);
-        self
-    }
-
-    pub fn timestamp_format(mut self, format: EntryTimeFormat) -> Self {
-        self.timestamp_format = format;
         self
     }
 }
 
 impl RenderOnce for HistoryEntryElement {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let (id, summary, timestamp) = match &self.entry {
-            HistoryEntry::Thread(thread) => (
-                thread.id.to_string(),
-                thread.summary.clone(),
-                thread.updated_at.timestamp(),
-            ),
-            HistoryEntry::Context(context) => (
-                context.path.to_string_lossy().to_string(),
-                context.title.clone(),
-                context.mtime.timestamp(),
-            ),
-        };
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        let id = ElementId::Name(self.entry.session_id.0.clone().into());
+        let title = thread_title(&self.entry).clone();
+        let formatted_time = self
+            .entry
+            .updated_at
+            .map(|timestamp| {
+                let now = chrono::Utc::now();
+                let duration = now.signed_duration_since(timestamp);
 
-        let thread_timestamp =
-            self.timestamp_format
-                .format_timestamp(&self.agent_panel, timestamp, cx);
+                if duration.num_days() > 0 {
+                    format!("{}d", duration.num_days())
+                } else if duration.num_hours() > 0 {
+                    format!("{}h ago", duration.num_hours())
+                } else if duration.num_minutes() > 0 {
+                    format!("{}m ago", duration.num_minutes())
+                } else {
+                    "Just now".to_string()
+                }
+            })
+            .unwrap_or_else(|| "Unknown".to_string());
 
-        ListItem::new(SharedString::from(id))
+        ListItem::new(id)
             .rounded()
             .toggle_state(self.selected)
             .spacing(ListItemSpacing::Sparse)
@@ -687,92 +929,61 @@ impl RenderOnce for HistoryEntryElement {
                     .w_full()
                     .gap_2()
                     .justify_between()
+                    .child(Label::new(title).size(LabelSize::Small).truncate())
                     .child(
-                        HighlightedLabel::new(summary, self.highlight_positions)
-                            .size(LabelSize::Small)
-                            .truncate(),
-                    )
-                    .child(
-                        Label::new(thread_timestamp)
+                        Label::new(formatted_time)
                             .color(Color::Muted)
                             .size(LabelSize::XSmall),
                     ),
             )
             .on_hover(self.on_hover)
-            .end_slot::<IconButton>(if self.hovered || self.selected {
+            .end_slot::<IconButton>(if (self.hovered || self.selected) && self.supports_delete {
                 Some(
-                    IconButton::new("delete", IconName::TrashAlt)
+                    IconButton::new("delete", IconName::Trash)
                         .shape(IconButtonShape::Square)
                         .icon_size(IconSize::XSmall)
                         .icon_color(Color::Muted)
-                        .tooltip(move |window, cx| {
-                            Tooltip::for_action("Delete", &RemoveSelectedThread, window, cx)
+                        .tooltip(move |_window, cx| {
+                            Tooltip::for_action("Delete", &RemoveSelectedThread, cx)
                         })
                         .on_click({
-                            let agent_panel = self.agent_panel.clone();
+                            let thread_view = self.thread_view.clone();
+                            let session_id = self.entry.session_id.clone();
 
-                            let f: Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static> =
-                                match &self.entry {
-                                    HistoryEntry::Thread(thread) => {
-                                        let id = thread.id.clone();
-
-                                        Box::new(move |_event, _window, cx| {
-                                            agent_panel
-                                                .update(cx, |this, cx| {
-                                                    this.delete_thread(&id, cx)
-                                                        .detach_and_log_err(cx);
-                                                })
-                                                .ok();
-                                        })
-                                    }
-                                    HistoryEntry::Context(context) => {
-                                        let path = context.path.clone();
-
-                                        Box::new(move |_event, _window, cx| {
-                                            agent_panel
-                                                .update(cx, |this, cx| {
-                                                    this.delete_context(path.clone(), cx)
-                                                        .detach_and_log_err(cx);
-                                                })
-                                                .ok();
-                                        })
-                                    }
-                                };
-                            f
+                            move |_event, _window, cx| {
+                                if let Some(thread_view) = thread_view.upgrade() {
+                                    thread_view.update(cx, |thread_view, cx| {
+                                        thread_view.delete_history_entry(&session_id, cx);
+                                    });
+                                }
+                            }
                         }),
                 )
             } else {
                 None
             })
             .on_click({
-                let agent_panel = self.agent_panel.clone();
+                let thread_view = self.thread_view.clone();
+                let entry = self.entry;
 
-                let f: Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static> = match &self.entry
-                {
-                    HistoryEntry::Thread(thread) => {
-                        let id = thread.id.clone();
-                        Box::new(move |_event, window, cx| {
-                            agent_panel
-                                .update(cx, |this, cx| {
-                                    this.open_thread_by_id(&id, window, cx)
-                                        .detach_and_log_err(cx);
-                                })
-                                .ok();
-                        })
+                move |_event, window, cx| {
+                    if let Some(workspace) = thread_view
+                        .upgrade()
+                        .and_then(|view| view.read(cx).workspace().upgrade())
+                    {
+                        if let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
+                            panel.update(cx, |panel, cx| {
+                                panel.load_agent_thread(
+                                    entry.session_id.clone(),
+                                    entry.cwd.clone(),
+                                    entry.title.clone(),
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }
                     }
-                    HistoryEntry::Context(context) => {
-                        let path = context.path.clone();
-                        Box::new(move |_event, window, cx| {
-                            agent_panel
-                                .update(cx, |this, cx| {
-                                    this.open_saved_prompt_editor(path.clone(), window, cx)
-                                        .detach_and_log_err(cx);
-                                })
-                                .ok();
-                        })
-                    }
-                };
-                f
+                }
             })
     }
 }
@@ -784,25 +995,17 @@ pub enum EntryTimeFormat {
 }
 
 impl EntryTimeFormat {
-    fn format_timestamp(
-        &self,
-        agent_panel: &WeakEntity<AgentPanel>,
-        timestamp: i64,
-        cx: &App,
-    ) -> String {
+    fn format_timestamp(&self, timestamp: i64, timezone: UtcOffset) -> String {
         let timestamp = OffsetDateTime::from_unix_timestamp(timestamp).unwrap();
-        let timezone = agent_panel
-            .read_with(cx, |this, _cx| this.local_timezone())
-            .unwrap_or(UtcOffset::UTC);
 
-        match &self {
+        match self {
             EntryTimeFormat::DateAndTime => time_format::format_localized_timestamp(
                 timestamp,
                 OffsetDateTime::now_utc(),
                 timezone,
                 time_format::TimestampFormat::EnhancedAbsolute,
             ),
-            EntryTimeFormat::TimeOnly => time_format::format_time(timestamp),
+            EntryTimeFormat::TimeOnly => time_format::format_time(timestamp.to_offset(timezone)),
         }
     }
 }
@@ -869,7 +1072,591 @@ impl Display for TimeBucket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use acp_thread::AgentSessionListResponse;
     use chrono::NaiveDate;
+    use gpui::TestAppContext;
+    use std::{
+        any::Any,
+        sync::{Arc, Mutex},
+    };
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme::init(theme::LoadThemes::JustBase, cx);
+        });
+    }
+
+    #[derive(Clone)]
+    struct TestSessionList {
+        sessions: Vec<AgentSessionInfo>,
+        updates_tx: smol::channel::Sender<SessionListUpdate>,
+        updates_rx: smol::channel::Receiver<SessionListUpdate>,
+    }
+
+    impl TestSessionList {
+        fn new(sessions: Vec<AgentSessionInfo>) -> Self {
+            let (tx, rx) = smol::channel::unbounded();
+            Self {
+                sessions,
+                updates_tx: tx,
+                updates_rx: rx,
+            }
+        }
+
+        fn send_update(&self, update: SessionListUpdate) {
+            self.updates_tx.try_send(update).ok();
+        }
+    }
+
+    impl AgentSessionList for TestSessionList {
+        fn list_sessions(
+            &self,
+            _request: AgentSessionListRequest,
+            _cx: &mut App,
+        ) -> Task<anyhow::Result<AgentSessionListResponse>> {
+            Task::ready(Ok(AgentSessionListResponse::new(self.sessions.clone())))
+        }
+
+        fn watch(&self, _cx: &mut App) -> Option<smol::channel::Receiver<SessionListUpdate>> {
+            Some(self.updates_rx.clone())
+        }
+
+        fn notify_refresh(&self) {
+            self.send_update(SessionListUpdate::Refresh);
+        }
+
+        fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
+            self
+        }
+    }
+
+    #[derive(Clone)]
+    struct PaginatedTestSessionList {
+        first_page_sessions: Vec<AgentSessionInfo>,
+        second_page_sessions: Vec<AgentSessionInfo>,
+        requested_cursors: Arc<Mutex<Vec<Option<String>>>>,
+        async_responses: bool,
+        updates_tx: smol::channel::Sender<SessionListUpdate>,
+        updates_rx: smol::channel::Receiver<SessionListUpdate>,
+    }
+
+    impl PaginatedTestSessionList {
+        fn new(
+            first_page_sessions: Vec<AgentSessionInfo>,
+            second_page_sessions: Vec<AgentSessionInfo>,
+        ) -> Self {
+            let (tx, rx) = smol::channel::unbounded();
+            Self {
+                first_page_sessions,
+                second_page_sessions,
+                requested_cursors: Arc::new(Mutex::new(Vec::new())),
+                async_responses: false,
+                updates_tx: tx,
+                updates_rx: rx,
+            }
+        }
+
+        fn with_async_responses(mut self) -> Self {
+            self.async_responses = true;
+            self
+        }
+
+        fn requested_cursors(&self) -> Vec<Option<String>> {
+            self.requested_cursors.lock().unwrap().clone()
+        }
+
+        fn clear_requested_cursors(&self) {
+            self.requested_cursors.lock().unwrap().clear()
+        }
+
+        fn send_update(&self, update: SessionListUpdate) {
+            self.updates_tx.try_send(update).ok();
+        }
+    }
+
+    impl AgentSessionList for PaginatedTestSessionList {
+        fn list_sessions(
+            &self,
+            request: AgentSessionListRequest,
+            cx: &mut App,
+        ) -> Task<anyhow::Result<AgentSessionListResponse>> {
+            let requested_cursors = self.requested_cursors.clone();
+            let first_page_sessions = self.first_page_sessions.clone();
+            let second_page_sessions = self.second_page_sessions.clone();
+
+            let respond = move || {
+                requested_cursors
+                    .lock()
+                    .unwrap()
+                    .push(request.cursor.clone());
+
+                match request.cursor.as_deref() {
+                    None => AgentSessionListResponse {
+                        sessions: first_page_sessions,
+                        next_cursor: Some("page-2".to_string()),
+                        meta: None,
+                    },
+                    Some("page-2") => AgentSessionListResponse::new(second_page_sessions),
+                    _ => AgentSessionListResponse::new(Vec::new()),
+                }
+            };
+
+            if self.async_responses {
+                cx.foreground_executor().spawn(async move {
+                    smol::future::yield_now().await;
+                    Ok(respond())
+                })
+            } else {
+                Task::ready(Ok(respond()))
+            }
+        }
+
+        fn watch(&self, _cx: &mut App) -> Option<smol::channel::Receiver<SessionListUpdate>> {
+            Some(self.updates_rx.clone())
+        }
+
+        fn notify_refresh(&self) {
+            self.send_update(SessionListUpdate::Refresh);
+        }
+
+        fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
+            self
+        }
+    }
+
+    fn test_session(session_id: &str, title: &str) -> AgentSessionInfo {
+        AgentSessionInfo {
+            session_id: acp::SessionId::new(session_id),
+            cwd: None,
+            title: Some(title.to_string().into()),
+            updated_at: None,
+            created_at: None,
+            meta: None,
+        }
+    }
+
+    #[gpui::test]
+    async fn test_refresh_only_loads_first_page_by_default(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let session_list = Rc::new(PaginatedTestSessionList::new(
+            vec![test_session("session-1", "First")],
+            vec![test_session("session-2", "Second")],
+        ));
+
+        let (history, cx) = cx.add_window_view(|window, cx| {
+            ThreadHistory::new(Some(session_list.clone()), window, cx)
+        });
+        cx.run_until_parked();
+
+        history.update(cx, |history, _cx| {
+            assert_eq!(history.sessions.len(), 1);
+            assert_eq!(
+                history.sessions[0].session_id,
+                acp::SessionId::new("session-1")
+            );
+        });
+        assert_eq!(session_list.requested_cursors(), vec![None]);
+    }
+
+    #[gpui::test]
+    async fn test_enabling_full_pagination_loads_all_pages(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let session_list = Rc::new(PaginatedTestSessionList::new(
+            vec![test_session("session-1", "First")],
+            vec![test_session("session-2", "Second")],
+        ));
+
+        let (history, cx) = cx.add_window_view(|window, cx| {
+            ThreadHistory::new(Some(session_list.clone()), window, cx)
+        });
+        cx.run_until_parked();
+        session_list.clear_requested_cursors();
+
+        history.update(cx, |history, cx| history.refresh_full_history(cx));
+        cx.run_until_parked();
+
+        history.update(cx, |history, _cx| {
+            assert_eq!(history.sessions.len(), 2);
+            assert_eq!(
+                history.sessions[0].session_id,
+                acp::SessionId::new("session-1")
+            );
+            assert_eq!(
+                history.sessions[1].session_id,
+                acp::SessionId::new("session-2")
+            );
+        });
+        assert_eq!(
+            session_list.requested_cursors(),
+            vec![None, Some("page-2".to_string())]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_standard_refresh_replaces_with_first_page_after_full_history_refresh(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let session_list = Rc::new(PaginatedTestSessionList::new(
+            vec![test_session("session-1", "First")],
+            vec![test_session("session-2", "Second")],
+        ));
+
+        let (history, cx) = cx.add_window_view(|window, cx| {
+            ThreadHistory::new(Some(session_list.clone()), window, cx)
+        });
+        cx.run_until_parked();
+
+        history.update(cx, |history, cx| history.refresh_full_history(cx));
+        cx.run_until_parked();
+        session_list.clear_requested_cursors();
+
+        history.update(cx, |history, cx| {
+            history.refresh(cx);
+        });
+        cx.run_until_parked();
+
+        history.update(cx, |history, _cx| {
+            assert_eq!(history.sessions.len(), 1);
+            assert_eq!(
+                history.sessions[0].session_id,
+                acp::SessionId::new("session-1")
+            );
+        });
+        assert_eq!(session_list.requested_cursors(), vec![None]);
+    }
+
+    #[gpui::test]
+    async fn test_re_entering_full_pagination_reloads_all_pages(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let session_list = Rc::new(PaginatedTestSessionList::new(
+            vec![test_session("session-1", "First")],
+            vec![test_session("session-2", "Second")],
+        ));
+
+        let (history, cx) = cx.add_window_view(|window, cx| {
+            ThreadHistory::new(Some(session_list.clone()), window, cx)
+        });
+        cx.run_until_parked();
+
+        history.update(cx, |history, cx| history.refresh_full_history(cx));
+        cx.run_until_parked();
+        session_list.clear_requested_cursors();
+
+        history.update(cx, |history, cx| history.refresh_full_history(cx));
+        cx.run_until_parked();
+
+        history.update(cx, |history, _cx| {
+            assert_eq!(history.sessions.len(), 2);
+        });
+        assert_eq!(
+            session_list.requested_cursors(),
+            vec![None, Some("page-2".to_string())]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_partial_refresh_batch_drops_non_first_page_sessions(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let second_page_session_id = acp::SessionId::new("session-2");
+        let session_list = Rc::new(PaginatedTestSessionList::new(
+            vec![test_session("session-1", "First")],
+            vec![test_session("session-2", "Second")],
+        ));
+
+        let (history, cx) = cx.add_window_view(|window, cx| {
+            ThreadHistory::new(Some(session_list.clone()), window, cx)
+        });
+        cx.run_until_parked();
+
+        history.update(cx, |history, cx| history.refresh_full_history(cx));
+        cx.run_until_parked();
+
+        session_list.clear_requested_cursors();
+
+        session_list.send_update(SessionListUpdate::SessionInfo {
+            session_id: second_page_session_id.clone(),
+            update: acp::SessionInfoUpdate::new().title("Updated Second"),
+        });
+        session_list.send_update(SessionListUpdate::Refresh);
+        cx.run_until_parked();
+
+        history.update(cx, |history, _cx| {
+            assert_eq!(history.sessions.len(), 1);
+            assert_eq!(
+                history.sessions[0].session_id,
+                acp::SessionId::new("session-1")
+            );
+            assert!(
+                history
+                    .sessions
+                    .iter()
+                    .all(|session| session.session_id != second_page_session_id)
+            );
+        });
+        assert_eq!(session_list.requested_cursors(), vec![None]);
+    }
+
+    #[gpui::test]
+    async fn test_full_pagination_works_with_async_page_fetches(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let session_list = Rc::new(
+            PaginatedTestSessionList::new(
+                vec![test_session("session-1", "First")],
+                vec![test_session("session-2", "Second")],
+            )
+            .with_async_responses(),
+        );
+
+        let (history, cx) = cx.add_window_view(|window, cx| {
+            ThreadHistory::new(Some(session_list.clone()), window, cx)
+        });
+        cx.run_until_parked();
+        session_list.clear_requested_cursors();
+
+        history.update(cx, |history, cx| history.refresh_full_history(cx));
+        cx.run_until_parked();
+
+        history.update(cx, |history, _cx| {
+            assert_eq!(history.sessions.len(), 2);
+        });
+        assert_eq!(
+            session_list.requested_cursors(),
+            vec![None, Some("page-2".to_string())]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_apply_info_update_title(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let session_id = acp::SessionId::new("test-session");
+        let sessions = vec![AgentSessionInfo {
+            session_id: session_id.clone(),
+            cwd: None,
+            title: Some("Original Title".into()),
+            updated_at: None,
+            created_at: None,
+            meta: None,
+        }];
+        let session_list = Rc::new(TestSessionList::new(sessions));
+
+        let (history, cx) = cx.add_window_view(|window, cx| {
+            ThreadHistory::new(Some(session_list.clone()), window, cx)
+        });
+        cx.run_until_parked();
+
+        // Send a title update
+        session_list.send_update(SessionListUpdate::SessionInfo {
+            session_id: session_id.clone(),
+            update: acp::SessionInfoUpdate::new().title("New Title"),
+        });
+        cx.run_until_parked();
+
+        // Check that the title was updated
+        history.update(cx, |history, _cx| {
+            let session = history.sessions.iter().find(|s| s.session_id == session_id);
+            assert_eq!(
+                session.unwrap().title.as_ref().map(|s| s.as_ref()),
+                Some("New Title")
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_apply_info_update_clears_title_with_null(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let session_id = acp::SessionId::new("test-session");
+        let sessions = vec![AgentSessionInfo {
+            session_id: session_id.clone(),
+            cwd: None,
+            title: Some("Original Title".into()),
+            updated_at: None,
+            created_at: None,
+            meta: None,
+        }];
+        let session_list = Rc::new(TestSessionList::new(sessions));
+
+        let (history, cx) = cx.add_window_view(|window, cx| {
+            ThreadHistory::new(Some(session_list.clone()), window, cx)
+        });
+        cx.run_until_parked();
+
+        // Send an update that clears the title (null)
+        session_list.send_update(SessionListUpdate::SessionInfo {
+            session_id: session_id.clone(),
+            update: acp::SessionInfoUpdate::new().title(None::<String>),
+        });
+        cx.run_until_parked();
+
+        // Check that the title was cleared
+        history.update(cx, |history, _cx| {
+            let session = history.sessions.iter().find(|s| s.session_id == session_id);
+            assert_eq!(session.unwrap().title, None);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_apply_info_update_ignores_undefined_fields(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let session_id = acp::SessionId::new("test-session");
+        let sessions = vec![AgentSessionInfo {
+            session_id: session_id.clone(),
+            cwd: None,
+            title: Some("Original Title".into()),
+            updated_at: None,
+            created_at: None,
+            meta: None,
+        }];
+        let session_list = Rc::new(TestSessionList::new(sessions));
+
+        let (history, cx) = cx.add_window_view(|window, cx| {
+            ThreadHistory::new(Some(session_list.clone()), window, cx)
+        });
+        cx.run_until_parked();
+
+        // Send an update with no fields set (all undefined)
+        session_list.send_update(SessionListUpdate::SessionInfo {
+            session_id: session_id.clone(),
+            update: acp::SessionInfoUpdate::new(),
+        });
+        cx.run_until_parked();
+
+        // Check that the title is unchanged
+        history.update(cx, |history, _cx| {
+            let session = history.sessions.iter().find(|s| s.session_id == session_id);
+            assert_eq!(
+                session.unwrap().title.as_ref().map(|s| s.as_ref()),
+                Some("Original Title")
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_multiple_info_updates_applied_in_order(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let session_id = acp::SessionId::new("test-session");
+        let sessions = vec![AgentSessionInfo {
+            session_id: session_id.clone(),
+            cwd: None,
+            title: None,
+            updated_at: None,
+            created_at: None,
+            meta: None,
+        }];
+        let session_list = Rc::new(TestSessionList::new(sessions));
+
+        let (history, cx) = cx.add_window_view(|window, cx| {
+            ThreadHistory::new(Some(session_list.clone()), window, cx)
+        });
+        cx.run_until_parked();
+
+        // Send multiple updates before the executor runs
+        session_list.send_update(SessionListUpdate::SessionInfo {
+            session_id: session_id.clone(),
+            update: acp::SessionInfoUpdate::new().title("First Title"),
+        });
+        session_list.send_update(SessionListUpdate::SessionInfo {
+            session_id: session_id.clone(),
+            update: acp::SessionInfoUpdate::new().title("Second Title"),
+        });
+        cx.run_until_parked();
+
+        // Check that the final title is "Second Title" (both applied in order)
+        history.update(cx, |history, _cx| {
+            let session = history.sessions.iter().find(|s| s.session_id == session_id);
+            assert_eq!(
+                session.unwrap().title.as_ref().map(|s| s.as_ref()),
+                Some("Second Title")
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_refresh_supersedes_info_updates(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let session_id = acp::SessionId::new("test-session");
+        let sessions = vec![AgentSessionInfo {
+            session_id: session_id.clone(),
+            cwd: None,
+            title: Some("Server Title".into()),
+            updated_at: None,
+            created_at: None,
+            meta: None,
+        }];
+        let session_list = Rc::new(TestSessionList::new(sessions));
+
+        let (history, cx) = cx.add_window_view(|window, cx| {
+            ThreadHistory::new(Some(session_list.clone()), window, cx)
+        });
+        cx.run_until_parked();
+
+        // Send an info update followed by a refresh
+        session_list.send_update(SessionListUpdate::SessionInfo {
+            session_id: session_id.clone(),
+            update: acp::SessionInfoUpdate::new().title("Local Update"),
+        });
+        session_list.send_update(SessionListUpdate::Refresh);
+        cx.run_until_parked();
+
+        // The refresh should have fetched from server, getting "Server Title"
+        history.update(cx, |history, _cx| {
+            let session = history.sessions.iter().find(|s| s.session_id == session_id);
+            assert_eq!(
+                session.unwrap().title.as_ref().map(|s| s.as_ref()),
+                Some("Server Title")
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_info_update_for_unknown_session_is_ignored(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let session_id = acp::SessionId::new("known-session");
+        let sessions = vec![AgentSessionInfo {
+            session_id,
+            cwd: None,
+            title: Some("Original".into()),
+            updated_at: None,
+            created_at: None,
+            meta: None,
+        }];
+        let session_list = Rc::new(TestSessionList::new(sessions));
+
+        let (history, cx) = cx.add_window_view(|window, cx| {
+            ThreadHistory::new(Some(session_list.clone()), window, cx)
+        });
+        cx.run_until_parked();
+
+        // Send an update for an unknown session
+        session_list.send_update(SessionListUpdate::SessionInfo {
+            session_id: acp::SessionId::new("unknown-session"),
+            update: acp::SessionInfoUpdate::new().title("Should Be Ignored"),
+        });
+        cx.run_until_parked();
+
+        // Check that the known session is unchanged and no crash occurred
+        history.update(cx, |history, _cx| {
+            assert_eq!(history.sessions.len(), 1);
+            assert_eq!(
+                history.sessions[0].title.as_ref().map(|s| s.as_ref()),
+                Some("Original")
+            );
+        });
+    }
 
     #[test]
     fn test_time_bucket_from_dates() {

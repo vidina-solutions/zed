@@ -1,36 +1,33 @@
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::Result;
 use collections::HashMap;
-use credentials_provider::CredentialsProvider;
-use editor::{Editor, EditorElement, EditorStyle};
 use futures::{FutureExt, Stream, StreamExt, future::BoxFuture};
-use gpui::{
-    AnyView, App, AsyncApp, Context, Entity, FontStyle, Subscription, Task, TextStyle, WhiteSpace,
-};
+use gpui::{AnyView, App, AsyncApp, Context, Entity, SharedString, Task};
 use http_client::HttpClient;
 use language_model::{
-    AuthenticateError, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
-    LanguageModelId, LanguageModelName, LanguageModelProvider, LanguageModelProviderId,
-    LanguageModelProviderName, LanguageModelProviderState, LanguageModelRequest,
-    LanguageModelToolChoice, LanguageModelToolResultContent, LanguageModelToolSchemaFormat,
-    LanguageModelToolUse, MessageContent, RateLimiter, Role, StopReason, TokenUsage,
+    ApiKeyState, AuthenticateError, EnvVar, IconOrSvg, LanguageModel, LanguageModelCompletionError,
+    LanguageModelCompletionEvent, LanguageModelId, LanguageModelName, LanguageModelProvider,
+    LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
+    LanguageModelRequest, LanguageModelToolChoice, LanguageModelToolResultContent,
+    LanguageModelToolSchemaFormat, LanguageModelToolUse, MessageContent, RateLimiter, Role,
+    StopReason, TokenUsage, env_var,
 };
 use open_router::{
-    Model, ModelMode as OpenRouterModelMode, ResponseStreamEvent, list_models, stream_completion,
+    Model, ModelMode as OpenRouterModelMode, OPEN_ROUTER_API_URL, ResponseStreamEvent, list_models,
 };
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use settings::{Settings, SettingsStore};
+use settings::{OpenRouterAvailableModel as AvailableModel, Settings, SettingsStore};
 use std::pin::Pin;
-use std::str::FromStr as _;
-use std::sync::Arc;
-use theme::ThemeSettings;
-use ui::{Icon, IconName, List, Tooltip, prelude::*};
+use std::sync::{Arc, LazyLock};
+use ui::{ButtonLink, ConfiguredApiCard, List, ListBulletItem, prelude::*};
+use ui_input::InputField;
 use util::ResultExt;
 
-use crate::{AllLanguageModelSettings, ui::InstructionListItem};
+use crate::provider::util::parse_tool_arguments;
 
 const PROVIDER_ID: LanguageModelProviderId = LanguageModelProviderId::new("openrouter");
 const PROVIDER_NAME: LanguageModelProviderName = LanguageModelProviderName::new("OpenRouter");
+
+const API_KEY_ENV_VAR_NAME: &str = "OPENROUTER_API_KEY";
+static API_KEY_ENV_VAR: LazyLock<EnvVar> = env_var!(API_KEY_ENV_VAR_NAME);
 
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct OpenRouterSettings {
@@ -38,157 +35,71 @@ pub struct OpenRouterSettings {
     pub available_models: Vec<AvailableModel>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct AvailableModel {
-    pub name: String,
-    pub display_name: Option<String>,
-    pub max_tokens: u64,
-    pub max_output_tokens: Option<u64>,
-    pub max_completion_tokens: Option<u64>,
-    pub supports_tools: Option<bool>,
-    pub supports_images: Option<bool>,
-    pub mode: Option<ModelMode>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum ModelMode {
-    #[default]
-    Default,
-    Thinking {
-        budget_tokens: Option<u32>,
-    },
-}
-
-impl From<ModelMode> for OpenRouterModelMode {
-    fn from(value: ModelMode) -> Self {
-        match value {
-            ModelMode::Default => OpenRouterModelMode::Default,
-            ModelMode::Thinking { budget_tokens } => {
-                OpenRouterModelMode::Thinking { budget_tokens }
-            }
-        }
-    }
-}
-
-impl From<OpenRouterModelMode> for ModelMode {
-    fn from(value: OpenRouterModelMode) -> Self {
-        match value {
-            OpenRouterModelMode::Default => ModelMode::Default,
-            OpenRouterModelMode::Thinking { budget_tokens } => {
-                ModelMode::Thinking { budget_tokens }
-            }
-        }
-    }
-}
-
 pub struct OpenRouterLanguageModelProvider {
     http_client: Arc<dyn HttpClient>,
-    state: gpui::Entity<State>,
+    state: Entity<State>,
 }
 
 pub struct State {
-    api_key: Option<String>,
-    api_key_from_env: bool,
+    api_key_state: ApiKeyState,
     http_client: Arc<dyn HttpClient>,
     available_models: Vec<open_router::Model>,
-    fetch_models_task: Option<Task<Result<()>>>,
-    settings: OpenRouterSettings,
-    _subscription: Subscription,
+    fetch_models_task: Option<Task<Result<(), LanguageModelCompletionError>>>,
 }
-
-const OPENROUTER_API_KEY_VAR: &str = "OPENROUTER_API_KEY";
 
 impl State {
     fn is_authenticated(&self) -> bool {
-        self.api_key.is_some()
+        self.api_key_state.has_key()
     }
 
-    fn reset_api_key(&self, cx: &mut Context<Self>) -> Task<Result<()>> {
-        let credentials_provider = <dyn CredentialsProvider>::global(cx);
-        let api_url = AllLanguageModelSettings::get_global(cx)
-            .open_router
-            .api_url
-            .clone();
+    fn set_api_key(&mut self, api_key: Option<String>, cx: &mut Context<Self>) -> Task<Result<()>> {
+        let api_url = OpenRouterLanguageModelProvider::api_url(cx);
+        self.api_key_state
+            .store(api_url, api_key, |this| &mut this.api_key_state, cx)
+    }
+
+    fn authenticate(&mut self, cx: &mut Context<Self>) -> Task<Result<(), AuthenticateError>> {
+        let api_url = OpenRouterLanguageModelProvider::api_url(cx);
+        let task = self
+            .api_key_state
+            .load_if_needed(api_url, |this| &mut this.api_key_state, cx);
+
         cx.spawn(async move |this, cx| {
-            credentials_provider
-                .delete_credentials(&api_url, &cx)
-                .await
-                .log_err();
-            this.update(cx, |this, cx| {
-                this.api_key = None;
-                this.api_key_from_env = false;
-                cx.notify();
-            })
+            let result = task.await;
+            this.update(cx, |this, cx| this.restart_fetch_models_task(cx))
+                .ok();
+            result
         })
     }
 
-    fn set_api_key(&mut self, api_key: String, cx: &mut Context<Self>) -> Task<Result<()>> {
-        let credentials_provider = <dyn CredentialsProvider>::global(cx);
-        let api_url = AllLanguageModelSettings::get_global(cx)
-            .open_router
-            .api_url
-            .clone();
-        cx.spawn(async move |this, cx| {
-            credentials_provider
-                .write_credentials(&api_url, "Bearer", api_key.as_bytes(), &cx)
-                .await
-                .log_err();
-            this.update(cx, |this, cx| {
-                this.api_key = Some(api_key);
-                this.restart_fetch_models_task(cx);
-                cx.notify();
-            })
-        })
-    }
-
-    fn authenticate(&self, cx: &mut Context<Self>) -> Task<Result<(), AuthenticateError>> {
-        if self.is_authenticated() {
-            return Task::ready(Ok(()));
-        }
-
-        let credentials_provider = <dyn CredentialsProvider>::global(cx);
-        let api_url = AllLanguageModelSettings::get_global(cx)
-            .open_router
-            .api_url
-            .clone();
-        cx.spawn(async move |this, cx| {
-            let (api_key, from_env) = if let Ok(api_key) = std::env::var(OPENROUTER_API_KEY_VAR) {
-                (api_key, true)
-            } else {
-                let (_, api_key) = credentials_provider
-                    .read_credentials(&api_url, &cx)
-                    .await?
-                    .ok_or(AuthenticateError::CredentialsNotFound)?;
-                (
-                    String::from_utf8(api_key)
-                        .context(format!("invalid {} API key", PROVIDER_NAME))?,
-                    false,
-                )
-            };
-            this.update(cx, |this, cx| {
-                this.api_key = Some(api_key);
-                this.api_key_from_env = from_env;
-                this.restart_fetch_models_task(cx);
-                cx.notify();
-            })?;
-
-            Ok(())
-        })
-    }
-
-    fn fetch_models(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
-        let settings = &AllLanguageModelSettings::get_global(cx).open_router;
+    fn fetch_models(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), LanguageModelCompletionError>> {
         let http_client = self.http_client.clone();
-        let api_url = settings.api_url.clone();
-
+        let api_url = OpenRouterLanguageModelProvider::api_url(cx);
+        let Some(api_key) = self.api_key_state.key(&api_url) else {
+            return Task::ready(Err(LanguageModelCompletionError::NoApiKey {
+                provider: PROVIDER_NAME,
+            }));
+        };
         cx.spawn(async move |this, cx| {
-            let models = list_models(http_client.as_ref(), &api_url).await?;
+            let models = list_models(http_client.as_ref(), &api_url, &api_key)
+                .await
+                .map_err(|e| {
+                    LanguageModelCompletionError::Other(anyhow::anyhow!(
+                        "OpenRouter error: {:?}",
+                        e
+                    ))
+                })?;
 
             this.update(cx, |this, cx| {
                 this.available_models = models;
                 cx.notify();
             })
+            .map_err(|e| LanguageModelCompletionError::Other(e))?;
+
+            Ok(())
         })
     }
 
@@ -196,31 +107,50 @@ impl State {
         if self.is_authenticated() {
             let task = self.fetch_models(cx);
             self.fetch_models_task.replace(task);
+        } else {
+            self.available_models = Vec::new();
         }
     }
 }
 
 impl OpenRouterLanguageModelProvider {
     pub fn new(http_client: Arc<dyn HttpClient>, cx: &mut App) -> Self {
-        let state = cx.new(|cx| State {
-            api_key: None,
-            api_key_from_env: false,
-            http_client: http_client.clone(),
-            available_models: Vec::new(),
-            fetch_models_task: None,
-            settings: OpenRouterSettings::default(),
-            _subscription: cx.observe_global::<SettingsStore>(|this: &mut State, cx| {
-                let current_settings = &AllLanguageModelSettings::get_global(cx).open_router;
-                let settings_changed = current_settings != &this.settings;
-                if settings_changed {
-                    this.settings = current_settings.clone();
-                    this.restart_fetch_models_task(cx);
+        let state = cx.new(|cx| {
+            cx.observe_global::<SettingsStore>({
+                let mut last_settings = OpenRouterLanguageModelProvider::settings(cx).clone();
+                move |this: &mut State, cx| {
+                    let current_settings = OpenRouterLanguageModelProvider::settings(cx);
+                    let settings_changed = current_settings != &last_settings;
+                    if settings_changed {
+                        last_settings = current_settings.clone();
+                        this.authenticate(cx).detach();
+                        cx.notify();
+                    }
                 }
-                cx.notify();
-            }),
+            })
+            .detach();
+            State {
+                api_key_state: ApiKeyState::new(Self::api_url(cx), (*API_KEY_ENV_VAR).clone()),
+                http_client: http_client.clone(),
+                available_models: Vec::new(),
+                fetch_models_task: None,
+            }
         });
 
         Self { http_client, state }
+    }
+
+    fn settings(cx: &App) -> &OpenRouterSettings {
+        &crate::AllLanguageModelSettings::get_global(cx).open_router
+    }
+
+    fn api_url(cx: &App) -> SharedString {
+        let api_url = &Self::settings(cx).api_url;
+        if api_url.is_empty() {
+            OPEN_ROUTER_API_URL.into()
+        } else {
+            SharedString::new(api_url.as_str())
+        }
     }
 
     fn create_language_model(&self, model: open_router::Model) -> Arc<dyn LanguageModel> {
@@ -237,7 +167,7 @@ impl OpenRouterLanguageModelProvider {
 impl LanguageModelProviderState for OpenRouterLanguageModelProvider {
     type ObservableEntity = State;
 
-    fn observable_entity(&self) -> Option<gpui::Entity<Self::ObservableEntity>> {
+    fn observable_entity(&self) -> Option<Entity<Self::ObservableEntity>> {
         Some(self.state.clone())
     }
 }
@@ -251,8 +181,8 @@ impl LanguageModelProvider for OpenRouterLanguageModelProvider {
         PROVIDER_NAME
     }
 
-    fn icon(&self) -> IconName {
-        IconName::AiOpenRouter
+    fn icon(&self) -> IconOrSvg {
+        IconOrSvg::Icon(IconName::AiOpenRouter)
     }
 
     fn default_model(&self, _cx: &App) -> Option<Arc<dyn LanguageModel>> {
@@ -260,24 +190,22 @@ impl LanguageModelProvider for OpenRouterLanguageModelProvider {
     }
 
     fn default_fast_model(&self, _cx: &App) -> Option<Arc<dyn LanguageModel>> {
-        Some(self.create_language_model(open_router::Model::default_fast()))
+        None
     }
 
     fn provided_models(&self, cx: &App) -> Vec<Arc<dyn LanguageModel>> {
         let mut models_from_api = self.state.read(cx).available_models.clone();
         let mut settings_models = Vec::new();
 
-        for model in &AllLanguageModelSettings::get_global(cx)
-            .open_router
-            .available_models
-        {
+        for model in &Self::settings(cx).available_models {
             settings_models.push(open_router::Model {
                 name: model.name.clone(),
                 display_name: model.display_name.clone(),
                 max_tokens: model.max_tokens,
                 supports_tools: model.supports_tools,
                 supports_images: model.supports_images,
-                mode: model.mode.clone().unwrap_or_default().into(),
+                mode: model.mode.unwrap_or_default(),
+                provider: model.provider.clone(),
             });
         }
 
@@ -306,20 +234,26 @@ impl LanguageModelProvider for OpenRouterLanguageModelProvider {
         self.state.update(cx, |state, cx| state.authenticate(cx))
     }
 
-    fn configuration_view(&self, window: &mut Window, cx: &mut App) -> AnyView {
+    fn configuration_view(
+        &self,
+        _target_agent: language_model::ConfigurationViewTargetAgent,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyView {
         cx.new(|cx| ConfigurationView::new(self.state.clone(), window, cx))
             .into()
     }
 
     fn reset_credentials(&self, cx: &mut App) -> Task<Result<()>> {
-        self.state.update(cx, |state, cx| state.reset_api_key(cx))
+        self.state
+            .update(cx, |state, cx| state.set_api_key(None, cx))
     }
 }
 
 pub struct OpenRouterLanguageModel {
     id: LanguageModelId,
     model: open_router::Model,
-    state: gpui::Entity<State>,
+    state: Entity<State>,
     http_client: Arc<dyn HttpClient>,
     request_limiter: RateLimiter,
 }
@@ -329,27 +263,33 @@ impl OpenRouterLanguageModel {
         &self,
         request: open_router::Request,
         cx: &AsyncApp,
-    ) -> BoxFuture<'static, Result<futures::stream::BoxStream<'static, Result<ResponseStreamEvent>>>>
-    {
+    ) -> BoxFuture<
+        'static,
+        Result<
+            futures::stream::BoxStream<
+                'static,
+                Result<ResponseStreamEvent, open_router::OpenRouterError>,
+            >,
+            LanguageModelCompletionError,
+        >,
+    > {
         let http_client = self.http_client.clone();
-        let Ok((api_key, api_url)) = cx.read_entity(&self.state, |state, cx| {
-            let settings = &AllLanguageModelSettings::get_global(cx).open_router;
-            (state.api_key.clone(), settings.api_url.clone())
-        }) else {
-            return futures::future::ready(Err(anyhow!(
-                "App state dropped: Unable to read API key or API URL from the application state"
-            )))
-            .boxed();
-        };
-
-        let future = self.request_limiter.stream(async move {
-            let api_key = api_key.ok_or_else(|| anyhow!("Missing OpenRouter API Key"))?;
-            let request = stream_completion(http_client.as_ref(), &api_url, &api_key, request);
-            let response = request.await?;
-            Ok(response)
+        let (api_key, api_url) = self.state.read_with(cx, |state, cx| {
+            let api_url = OpenRouterLanguageModelProvider::api_url(cx);
+            (state.api_key_state.key(&api_url), api_url)
         });
 
-        async move { Ok(future.await?.boxed()) }.boxed()
+        async move {
+            let Some(api_key) = api_key else {
+                return Err(LanguageModelCompletionError::NoApiKey {
+                    provider: PROVIDER_NAME,
+                });
+            };
+            let request =
+                open_router::stream_completion(http_client.as_ref(), &api_url, &api_key, request);
+            request.await.map_err(Into::into)
+        }
+        .boxed()
     }
 }
 
@@ -374,9 +314,17 @@ impl LanguageModel for OpenRouterLanguageModel {
         self.model.supports_tool_calls()
     }
 
+    fn supports_streaming_tools(&self) -> bool {
+        true
+    }
+
+    fn supports_thinking(&self) -> bool {
+        matches!(self.model.mode, OpenRouterModelMode::Thinking { .. })
+    }
+
     fn tool_input_format(&self) -> LanguageModelToolSchemaFormat {
         let model_id = self.model.id().trim().to_lowercase();
-        if model_id.contains("gemini") || model_id.contains("grok-4") {
+        if model_id.contains("gemini") || model_id.contains("grok") {
             LanguageModelToolSchemaFormat::JsonSchemaSubset
         } else {
             LanguageModelToolSchemaFormat::JsonSchema
@@ -429,13 +377,13 @@ impl LanguageModel for OpenRouterLanguageModel {
             LanguageModelCompletionError,
         >,
     > {
-        let request = into_open_router(request, &self.model, self.max_output_tokens());
-        let completions = self.stream_completion(request, cx);
-        async move {
-            let mapper = OpenRouterEventMapper::new();
-            Ok(mapper.map_stream(completions.await?).boxed())
-        }
-        .boxed()
+        let openrouter_request = into_open_router(request, &self.model, self.max_output_tokens());
+        let request = self.stream_completion(openrouter_request, cx);
+        let future = self.request_limiter.stream(async move {
+            let response = request.await?;
+            Ok(OpenRouterEventMapper::new().map_stream(response))
+        });
+        async move { Ok(future.await?.boxed()) }.boxed()
     }
 }
 
@@ -444,14 +392,31 @@ pub fn into_open_router(
     model: &Model,
     max_output_tokens: Option<u64>,
 ) -> open_router::Request {
+    // Anthropic models via OpenRouter don't accept reasoning_details being echoed back
+    // in requests - it's an output-only field for them. However, Gemini models require
+    // the thought signatures to be echoed back for proper reasoning chain continuity.
+    // Note: OpenRouter's model API provides an `architecture.tokenizer` field (e.g. "Claude",
+    // "Gemini") which could replace this ID prefix check, but since this is the only place
+    // we need this distinction, we're just using this less invasive check instead.
+    // If we ever have a more formal distionction between the models in the future,
+    // we should revise this to use that instead.
+    let is_anthropic_model = model.id().starts_with("anthropic/");
+
     let mut messages = Vec::new();
     for message in request.messages {
+        let reasoning_details_for_message = if is_anthropic_model {
+            None
+        } else {
+            message.reasoning_details.clone()
+        };
+
         for content in message.content {
             match content {
                 MessageContent::Text(text) => add_message_content_part(
                     open_router::MessagePart::Text { text },
                     message.role,
                     &mut messages,
+                    reasoning_details_for_message.clone(),
                 ),
                 MessageContent::Thinking { .. } => {}
                 MessageContent::RedactedThinking(_) => {}
@@ -462,6 +427,7 @@ pub fn into_open_router(
                         },
                         message.role,
                         &mut messages,
+                        reasoning_details_for_message.clone(),
                     );
                 }
                 MessageContent::ToolUse(tool_use) => {
@@ -472,6 +438,7 @@ pub fn into_open_router(
                                 name: tool_use.name.to_string(),
                                 arguments: serde_json::to_string(&tool_use.input)
                                     .unwrap_or_default(),
+                                thought_signature: tool_use.thought_signature.clone(),
                             },
                         },
                     };
@@ -484,6 +451,7 @@ pub fn into_open_router(
                         messages.push(open_router::RequestMessage::Assistant {
                             content: None,
                             tool_calls: vec![tool_call],
+                            reasoning_details: reasoning_details_for_message.clone(),
                         });
                     }
                 }
@@ -551,6 +519,7 @@ pub fn into_open_router(
             LanguageModelToolChoice::Any => open_router::ToolChoice::Required,
             LanguageModelToolChoice::None => open_router::ToolChoice::None,
         }),
+        provider: model.provider.clone(),
     }
 }
 
@@ -558,6 +527,7 @@ fn add_message_content_part(
     new_part: open_router::MessagePart,
     role: Role,
     messages: &mut Vec<open_router::RequestMessage>,
+    reasoning_details: Option<serde_json::Value>,
 ) {
     match (role, messages.last_mut()) {
         (Role::User, Some(open_router::RequestMessage::User { content }))
@@ -581,6 +551,7 @@ fn add_message_content_part(
                 Role::Assistant => open_router::RequestMessage::Assistant {
                     content: Some(open_router::MessageContent::from(vec![new_part])),
                     tool_calls: Vec::new(),
+                    reasoning_details,
                 },
                 Role::System => open_router::RequestMessage::System {
                     content: open_router::MessageContent::from(vec![new_part]),
@@ -592,24 +563,30 @@ fn add_message_content_part(
 
 pub struct OpenRouterEventMapper {
     tool_calls_by_index: HashMap<usize, RawToolCall>,
+    reasoning_details: Option<serde_json::Value>,
 }
 
 impl OpenRouterEventMapper {
     pub fn new() -> Self {
         Self {
             tool_calls_by_index: HashMap::default(),
+            reasoning_details: None,
         }
     }
 
     pub fn map_stream(
         mut self,
-        events: Pin<Box<dyn Send + Stream<Item = Result<ResponseStreamEvent>>>>,
+        events: Pin<
+            Box<
+                dyn Send + Stream<Item = Result<ResponseStreamEvent, open_router::OpenRouterError>>,
+            >,
+        >,
     ) -> impl Stream<Item = Result<LanguageModelCompletionEvent, LanguageModelCompletionError>>
     {
         events.flat_map(move |event| {
             futures::stream::iter(match event {
                 Ok(event) => self.map_event(event),
-                Err(error) => vec![Err(LanguageModelCompletionError::from(anyhow!(error)))],
+                Err(error) => vec![Err(error.into())],
             })
         })
     }
@@ -618,13 +595,29 @@ impl OpenRouterEventMapper {
         &mut self,
         event: ResponseStreamEvent,
     ) -> Vec<Result<LanguageModelCompletionEvent, LanguageModelCompletionError>> {
+        let mut events = Vec::new();
+
+        if let Some(usage) = event.usage {
+            events.push(Ok(LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
+                input_tokens: usage.prompt_tokens,
+                output_tokens: usage.completion_tokens,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            })));
+        }
+
         let Some(choice) = event.choices.first() else {
-            return vec![Err(LanguageModelCompletionError::from(anyhow!(
-                "Response contained no choices"
-            )))];
+            return events;
         };
 
-        let mut events = Vec::new();
+        if let Some(details) = choice.delta.reasoning_details.clone() {
+            // Emit reasoning_details immediately
+            events.push(Ok(LanguageModelCompletionEvent::ReasoningDetails(
+                details.clone(),
+            )));
+            self.reasoning_details = Some(details);
+        }
+
         if let Some(reasoning) = choice.delta.reasoning.clone() {
             events.push(Ok(LanguageModelCompletionEvent::Thinking {
                 text: reasoning,
@@ -656,26 +649,39 @@ impl OpenRouterEventMapper {
                     if let Some(arguments) = function.arguments.clone() {
                         entry.arguments.push_str(&arguments);
                     }
+
+                    if let Some(signature) = function.thought_signature.clone() {
+                        entry.thought_signature = Some(signature);
+                    }
+                }
+
+                if !entry.id.is_empty() && !entry.name.is_empty() {
+                    if let Ok(input) = serde_json::from_str::<serde_json::Value>(
+                        &partial_json_fixer::fix_json(&entry.arguments),
+                    ) {
+                        events.push(Ok(LanguageModelCompletionEvent::ToolUse(
+                            LanguageModelToolUse {
+                                id: entry.id.clone().into(),
+                                name: entry.name.as_str().into(),
+                                is_input_complete: false,
+                                input,
+                                raw_input: entry.arguments.clone(),
+                                thought_signature: entry.thought_signature.clone(),
+                            },
+                        )));
+                    }
                 }
             }
         }
 
-        if let Some(usage) = event.usage {
-            events.push(Ok(LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
-                input_tokens: usage.prompt_tokens,
-                output_tokens: usage.completion_tokens,
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 0,
-            })));
-        }
-
         match choice.finish_reason.as_deref() {
             Some("stop") => {
+                // Don't emit reasoning_details here - already emitted immediately when captured
                 events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
             }
             Some("tool_calls") => {
                 events.extend(self.tool_calls_by_index.drain().map(|(_, tool_call)| {
-                    match serde_json::Value::from_str(&tool_call.arguments) {
+                    match parse_tool_arguments(&tool_call.arguments) {
                         Ok(input) => Ok(LanguageModelCompletionEvent::ToolUse(
                             LanguageModelToolUse {
                                 id: tool_call.id.clone().into(),
@@ -683,6 +689,7 @@ impl OpenRouterEventMapper {
                                 is_input_complete: true,
                                 input,
                                 raw_input: tool_call.arguments.clone(),
+                                thought_signature: tool_call.thought_signature.clone(),
                             },
                         )),
                         Err(error) => Ok(LanguageModelCompletionEvent::ToolUseJsonParseError {
@@ -694,10 +701,12 @@ impl OpenRouterEventMapper {
                     }
                 }));
 
+                // Don't emit reasoning_details here - already emitted immediately when captured
                 events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::ToolUse)));
             }
             Some(stop_reason) => {
                 log::error!("Unexpected OpenRouter stop_reason: {stop_reason:?}",);
+                // Don't emit reasoning_details here - already emitted immediately when captured
                 events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
             }
             None => {}
@@ -712,6 +721,7 @@ struct RawToolCall {
     id: String,
     name: String,
     arguments: String,
+    thought_signature: Option<String>,
 }
 
 pub fn count_open_router_tokens(
@@ -741,18 +751,19 @@ pub fn count_open_router_tokens(
 }
 
 struct ConfigurationView {
-    api_key_editor: Entity<Editor>,
-    state: gpui::Entity<State>,
+    api_key_editor: Entity<InputField>,
+    state: Entity<State>,
     load_credentials_task: Option<Task<()>>,
 }
 
 impl ConfigurationView {
-    fn new(state: gpui::Entity<State>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(state: Entity<State>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let api_key_editor = cx.new(|cx| {
-            let mut editor = Editor::single_line(window, cx);
-            editor
-                .set_placeholder_text("sk_or_000000000000000000000000000000000000000000000000", cx);
-            editor
+            InputField::new(
+                window,
+                cx,
+                "sk_or_000000000000000000000000000000000000000000000000",
+            )
         });
 
         cx.observe(&state, |_, _, cx| {
@@ -763,10 +774,7 @@ impl ConfigurationView {
         let load_credentials_task = Some(cx.spawn_in(window, {
             let state = state.clone();
             async move |this, cx| {
-                if let Some(task) = state
-                    .update(cx, |state, cx| state.authenticate(cx))
-                    .log_err()
-                {
+                if let Some(task) = Some(state.update(cx, |state, cx| state.authenticate(cx))) {
                     let _ = task.await;
                 }
 
@@ -786,20 +794,22 @@ impl ConfigurationView {
     }
 
     fn save_api_key(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
-        let api_key = self.api_key_editor.read(cx).text(cx);
+        let api_key = self.api_key_editor.read(cx).text(cx).trim().to_string();
         if api_key.is_empty() {
             return;
         }
 
+        // url changes can cause the editor to be displayed again
+        self.api_key_editor
+            .update(cx, |editor, cx| editor.set_text("", window, cx));
+
         let state = self.state.clone();
         cx.spawn_in(window, async move |_, cx| {
             state
-                .update(cx, |state, cx| state.set_api_key(api_key, cx))?
+                .update(cx, |state, cx| state.set_api_key(Some(api_key), cx))
                 .await
         })
         .detach_and_log_err(cx);
-
-        cx.notify();
     }
 
     fn reset_api_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -808,36 +818,11 @@ impl ConfigurationView {
 
         let state = self.state.clone();
         cx.spawn_in(window, async move |_, cx| {
-            state.update(cx, |state, cx| state.reset_api_key(cx))?.await
+            state
+                .update(cx, |state, cx| state.set_api_key(None, cx))
+                .await
         })
         .detach_and_log_err(cx);
-
-        cx.notify();
-    }
-
-    fn render_api_key_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let settings = ThemeSettings::get_global(cx);
-        let text_style = TextStyle {
-            color: cx.theme().colors().text,
-            font_family: settings.ui_font.family.clone(),
-            font_features: settings.ui_font.features.clone(),
-            font_fallbacks: settings.ui_font.fallbacks.clone(),
-            font_size: rems(0.875).into(),
-            font_weight: settings.ui_font.weight,
-            font_style: FontStyle::Normal,
-            line_height: relative(1.3),
-            white_space: WhiteSpace::Normal,
-            ..Default::default()
-        };
-        EditorElement::new(
-            &self.api_key_editor,
-            EditorStyle {
-                background: cx.theme().colors().editor_background,
-                local_player: cx.theme().players().local(),
-                text: text_style,
-                ..Default::default()
-            },
-        )
     }
 
     fn should_render_editor(&self, cx: &mut Context<Self>) -> bool {
@@ -847,80 +832,313 @@ impl ConfigurationView {
 
 impl Render for ConfigurationView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let env_var_set = self.state.read(cx).api_key_from_env;
+        let env_var_set = self.state.read(cx).api_key_state.is_from_env_var();
+        let configured_card_label = if env_var_set {
+            format!("API key set in {API_KEY_ENV_VAR_NAME} environment variable")
+        } else {
+            let api_url = OpenRouterLanguageModelProvider::api_url(cx);
+            if api_url == OPEN_ROUTER_API_URL {
+                "API key configured".to_string()
+            } else {
+                format!("API key configured for {}", api_url)
+            }
+        };
 
         if self.load_credentials_task.is_some() {
-            div().child(Label::new("Loading credentials...")).into_any()
+            div()
+                .child(Label::new("Loading credentials..."))
+                .into_any_element()
         } else if self.should_render_editor(cx) {
             v_flex()
                 .size_full()
                 .on_action(cx.listener(Self::save_api_key))
-                .child(Label::new("To use Zed's assistant with OpenRouter, you need to add an API key. Follow these steps:"))
+                .child(Label::new("To use Zed's agent with OpenRouter, you need to add an API key. Follow these steps:"))
                 .child(
                     List::new()
-                        .child(InstructionListItem::new(
-                            "Create an API key by visiting",
-                            Some("OpenRouter's console"),
-                            Some("https://openrouter.ai/keys"),
-                        ))
-                        .child(InstructionListItem::text_only(
-                            "Ensure your OpenRouter account has credits",
-                        ))
-                        .child(InstructionListItem::text_only(
-                            "Paste your API key below and hit enter to start using the assistant",
-                        )),
+                        .child(
+                            ListBulletItem::new("")
+                                .child(Label::new("Create an API key by visiting"))
+                                .child(ButtonLink::new("OpenRouter's console", "https://openrouter.ai/keys"))
+                        )
+                        .child(ListBulletItem::new("Ensure your OpenRouter account has credits")
+                        )
+                        .child(ListBulletItem::new("Paste your API key below and hit enter to start using the assistant")
+                        ),
                 )
-                .child(
-                    h_flex()
-                        .w_full()
-                        .my_2()
-                        .px_2()
-                        .py_1()
-                        .bg(cx.theme().colors().editor_background)
-                        .border_1()
-                        .border_color(cx.theme().colors().border)
-                        .rounded_sm()
-                        .child(self.render_api_key_editor(cx)),
-                )
+                .child(self.api_key_editor.clone())
                 .child(
                     Label::new(
-                        format!("You can also assign the {OPENROUTER_API_KEY_VAR} environment variable and restart Zed."),
+                        format!("You can also set the {API_KEY_ENV_VAR_NAME} environment variable and restart Zed."),
                     )
                     .size(LabelSize::Small).color(Color::Muted),
                 )
-                .into_any()
+                .into_any_element()
         } else {
-            h_flex()
-                .mt_1()
-                .p_1()
-                .justify_between()
-                .rounded_md()
-                .border_1()
-                .border_color(cx.theme().colors().border)
-                .bg(cx.theme().colors().background)
-                .child(
-                    h_flex()
-                        .gap_1()
-                        .child(Icon::new(IconName::Check).color(Color::Success))
-                        .child(Label::new(if env_var_set {
-                            format!("API key set in {OPENROUTER_API_KEY_VAR} environment variable.")
-                        } else {
-                            "API key configured.".to_string()
-                        })),
-                )
-                .child(
-                    Button::new("reset-key", "Reset Key")
-                        .label_size(LabelSize::Small)
-                        .icon(Some(IconName::Trash))
-                        .icon_size(IconSize::Small)
-                        .icon_position(IconPosition::Start)
-                        .disabled(env_var_set)
-                        .when(env_var_set, |this| {
-                            this.tooltip(Tooltip::text(format!("To reset your API key, unset the {OPENROUTER_API_KEY_VAR} environment variable.")))
-                        })
-                        .on_click(cx.listener(|this, _, window, cx| this.reset_api_key(window, cx))),
-                )
-                .into_any()
+            ConfiguredApiCard::new(configured_card_label)
+                .disabled(env_var_set)
+                .on_click(cx.listener(|this, _, window, cx| this.reset_api_key(window, cx)))
+                .when(env_var_set, |this| {
+                    this.tooltip_label(format!("To reset your API key, unset the {API_KEY_ENV_VAR_NAME} environment variable."))
+                })
+                .into_any_element()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use open_router::{ChoiceDelta, FunctionChunk, ResponseMessageDelta, ToolCallChunk};
+
+    #[gpui::test]
+    async fn test_reasoning_details_preservation_with_tool_calls() {
+        // This test verifies that reasoning_details are properly captured and preserved
+        // when a model uses tool calling with reasoning/thinking tokens.
+        //
+        // The key regression this prevents:
+        // - OpenRouter sends multiple reasoning_details updates during streaming
+        // - First with actual content (encrypted reasoning data)
+        // - Then with empty array on completion
+        // - We must NOT overwrite the real data with the empty array
+
+        let mut mapper = OpenRouterEventMapper::new();
+
+        // Simulate the streaming events as they come from OpenRouter/Gemini
+        let events = vec![
+            // Event 1: Initial reasoning details with text
+            ResponseStreamEvent {
+                id: Some("response_123".into()),
+                created: 1234567890,
+                model: "google/gemini-3.1-pro-preview".into(),
+                choices: vec![ChoiceDelta {
+                    index: 0,
+                    delta: ResponseMessageDelta {
+                        role: None,
+                        content: None,
+                        reasoning: None,
+                        tool_calls: None,
+                        reasoning_details: Some(serde_json::json!([
+                            {
+                                "type": "reasoning.text",
+                                "text": "Let me analyze this request...",
+                                "format": "google-gemini-v1",
+                                "index": 0
+                            }
+                        ])),
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            },
+            // Event 2: More reasoning details
+            ResponseStreamEvent {
+                id: Some("response_123".into()),
+                created: 1234567890,
+                model: "google/gemini-3.1-pro-preview".into(),
+                choices: vec![ChoiceDelta {
+                    index: 0,
+                    delta: ResponseMessageDelta {
+                        role: None,
+                        content: None,
+                        reasoning: None,
+                        tool_calls: None,
+                        reasoning_details: Some(serde_json::json!([
+                            {
+                                "type": "reasoning.encrypted",
+                                "data": "EtgDCtUDAdHtim9OF5jm4aeZSBAtl/randomized123",
+                                "format": "google-gemini-v1",
+                                "index": 0,
+                                "id": "tool_call_abc123"
+                            }
+                        ])),
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            },
+            // Event 3: Tool call starts
+            ResponseStreamEvent {
+                id: Some("response_123".into()),
+                created: 1234567890,
+                model: "google/gemini-3.1-pro-preview".into(),
+                choices: vec![ChoiceDelta {
+                    index: 0,
+                    delta: ResponseMessageDelta {
+                        role: None,
+                        content: None,
+                        reasoning: None,
+                        tool_calls: Some(vec![ToolCallChunk {
+                            index: 0,
+                            id: Some("tool_call_abc123".into()),
+                            function: Some(FunctionChunk {
+                                name: Some("list_directory".into()),
+                                arguments: Some("{\"path\":\"test\"}".into()),
+                                thought_signature: Some("sha256:test_signature_xyz789".into()),
+                            }),
+                        }]),
+                        reasoning_details: None,
+                    },
+                    finish_reason: None,
+                }],
+                usage: None,
+            },
+            // Event 4: Empty reasoning_details on tool_calls finish
+            // This is the critical event - we must not overwrite with this empty array!
+            ResponseStreamEvent {
+                id: Some("response_123".into()),
+                created: 1234567890,
+                model: "google/gemini-3.1-pro-preview".into(),
+                choices: vec![ChoiceDelta {
+                    index: 0,
+                    delta: ResponseMessageDelta {
+                        role: None,
+                        content: None,
+                        reasoning: None,
+                        tool_calls: None,
+                        reasoning_details: Some(serde_json::json!([])),
+                    },
+                    finish_reason: Some("tool_calls".into()),
+                }],
+                usage: None,
+            },
+        ];
+
+        // Process all events
+        let mut collected_events = Vec::new();
+        for event in events {
+            let mapped = mapper.map_event(event);
+            collected_events.extend(mapped);
+        }
+
+        // Verify we got the expected events
+        let mut has_tool_use = false;
+        let mut reasoning_details_events = Vec::new();
+        let mut thought_signature_value = None;
+
+        for event_result in collected_events {
+            match event_result {
+                Ok(LanguageModelCompletionEvent::ToolUse(tool_use)) => {
+                    has_tool_use = true;
+                    assert_eq!(tool_use.id.to_string(), "tool_call_abc123");
+                    assert_eq!(tool_use.name.as_ref(), "list_directory");
+                    thought_signature_value = tool_use.thought_signature.clone();
+                }
+                Ok(LanguageModelCompletionEvent::ReasoningDetails(details)) => {
+                    reasoning_details_events.push(details);
+                }
+                _ => {}
+            }
+        }
+
+        // Assertions
+        assert!(has_tool_use, "Should have emitted ToolUse event");
+        assert!(
+            !reasoning_details_events.is_empty(),
+            "Should have emitted ReasoningDetails events"
+        );
+
+        // We should have received multiple reasoning_details events (text, encrypted, empty)
+        // The agent layer is responsible for keeping only the first non-empty one
+        assert!(
+            reasoning_details_events.len() >= 2,
+            "Should have multiple reasoning_details events from streaming"
+        );
+
+        // Verify at least one contains the encrypted data
+        let has_encrypted = reasoning_details_events.iter().any(|details| {
+            if let serde_json::Value::Array(arr) = details {
+                arr.iter().any(|item| {
+                    item["type"] == "reasoning.encrypted"
+                        && item["data"]
+                            .as_str()
+                            .map_or(false, |s| s.contains("EtgDCtUDAdHtim9OF5jm4aeZSBAtl"))
+                })
+            } else {
+                false
+            }
+        });
+        assert!(
+            has_encrypted,
+            "Should have at least one reasoning_details with encrypted data"
+        );
+
+        // Verify thought_signature was captured
+        assert!(
+            thought_signature_value.is_some(),
+            "Tool use should have thought_signature"
+        );
+        assert_eq!(
+            thought_signature_value.unwrap(),
+            "sha256:test_signature_xyz789"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_usage_only_chunk_with_empty_choices_does_not_error() {
+        let mut mapper = OpenRouterEventMapper::new();
+
+        let events = mapper.map_event(ResponseStreamEvent {
+            id: Some("response_123".into()),
+            created: 1234567890,
+            model: "google/gemini-3-flash-preview".into(),
+            choices: Vec::new(),
+            usage: Some(open_router::Usage {
+                prompt_tokens: 12,
+                completion_tokens: 7,
+                total_tokens: 19,
+            }),
+        });
+
+        assert_eq!(events.len(), 1);
+        match events.into_iter().next().unwrap() {
+            Ok(LanguageModelCompletionEvent::UsageUpdate(usage)) => {
+                assert_eq!(usage.input_tokens, 12);
+                assert_eq!(usage.output_tokens, 7);
+            }
+            other => panic!("Expected usage update event, got: {other:?}"),
+        }
+    }
+
+    #[gpui::test]
+    async fn test_agent_prevents_empty_reasoning_details_overwrite() {
+        // This test verifies that the agent layer prevents empty reasoning_details
+        // from overwriting non-empty ones, even though the mapper emits all events.
+
+        // Simulate what the agent does when it receives multiple ReasoningDetails events
+        let mut agent_reasoning_details: Option<serde_json::Value> = None;
+
+        let events = vec![
+            // First event: non-empty reasoning_details
+            serde_json::json!([
+                {
+                    "type": "reasoning.encrypted",
+                    "data": "real_data_here",
+                    "format": "google-gemini-v1"
+                }
+            ]),
+            // Second event: empty array (should not overwrite)
+            serde_json::json!([]),
+        ];
+
+        for details in events {
+            // This mimics the agent's logic: only store if we don't already have it
+            if agent_reasoning_details.is_none() {
+                agent_reasoning_details = Some(details);
+            }
+        }
+
+        // Verify the agent kept the first non-empty reasoning_details
+        assert!(agent_reasoning_details.is_some());
+        let final_details = agent_reasoning_details.unwrap();
+        if let serde_json::Value::Array(arr) = &final_details {
+            assert!(
+                !arr.is_empty(),
+                "Agent should have kept the non-empty reasoning_details"
+            );
+            assert_eq!(arr[0]["data"], "real_data_here");
+        } else {
+            panic!("Expected array");
         }
     }
 }

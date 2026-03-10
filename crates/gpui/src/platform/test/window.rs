@@ -1,8 +1,8 @@
 use crate::{
     AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DispatchEventResult, GpuSpecs,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
-    Point, PromptButton, RequestFrameOptions, ScaledPixels, Size, TestPlatform, TileId,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
+    Point, PromptButton, RequestFrameOptions, Size, TestPlatform, TileId, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
 };
 use collections::HashMap;
 use parking_lot::Mutex;
@@ -19,6 +19,7 @@ pub(crate) struct TestWindowState {
     pub(crate) title: Option<String>,
     pub(crate) edited: bool,
     platform: Weak<TestPlatform>,
+    // TODO: Replace with `Rc`
     sprite_atlas: Arc<dyn PlatformAtlas>,
     pub(crate) should_close_handler: Option<Box<dyn FnMut() -> bool>>,
     hit_test_window_control_callback: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
@@ -32,7 +33,7 @@ pub(crate) struct TestWindowState {
 }
 
 #[derive(Clone)]
-pub(crate) struct TestWindow(pub(crate) Rc<Mutex<TestWindowState>>);
+pub struct TestWindow(pub(crate) Rc<Mutex<TestWindowState>>);
 
 impl HasWindowHandle for TestWindow {
     fn window_handle(
@@ -51,7 +52,7 @@ impl HasDisplayHandle for TestWindow {
 }
 
 impl TestWindow {
-    pub fn new(
+    pub(crate) fn new(
         handle: AnyWindowHandle,
         params: WindowParams,
         platform: Weak<TestPlatform>,
@@ -199,6 +200,14 @@ impl PlatformWindow for TestWindow {
         false
     }
 
+    fn background_appearance(&self) -> WindowBackgroundAppearance {
+        WindowBackgroundAppearance::Opaque
+    }
+
+    fn is_subpixel_rendering_supported(&self) -> bool {
+        false
+    }
+
     fn set_title(&mut self, title: &str) {
         self.0.lock().title = Some(title.to_owned());
     }
@@ -289,7 +298,7 @@ impl PlatformWindow for TestWindow {
         unimplemented!()
     }
 
-    fn update_ime_position(&self, _bounds: Bounds<ScaledPixels>) {}
+    fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         None
@@ -341,7 +350,7 @@ impl PlatformAtlas for TestAtlas {
             crate::AtlasTile {
                 texture_id: AtlasTextureId {
                     index: texture_id,
-                    kind: crate::AtlasTextureKind::Polychrome,
+                    kind: crate::AtlasTextureKind::Monochrome,
                 },
                 tile_id: TileId(tile_id),
                 padding: 0,

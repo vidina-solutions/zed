@@ -1,8 +1,9 @@
 use crate::{
     AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DevicePixels,
-    ForegroundExecutor, Keymap, NoopTextSystem, Platform, PlatformDisplay, PlatformKeyboardLayout,
-    PlatformTextSystem, PromptButton, ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream,
-    Size, Task, TestDisplay, TestWindow, WindowAppearance, WindowParams, size,
+    DummyKeyboardMapper, ForegroundExecutor, Keymap, NoopTextSystem, Platform, PlatformDisplay,
+    PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem, PromptButton,
+    ScreenCaptureFrame, ScreenCaptureSource, ScreenCaptureStream, SourceMetadata, Task,
+    TestDisplay, TestWindow, ThermalState, WindowAppearance, WindowParams, size,
 };
 use anyhow::Result;
 use collections::VecDeque;
@@ -13,11 +14,6 @@ use std::{
     path::{Path, PathBuf},
     rc::{Rc, Weak},
     sync::Arc,
-};
-#[cfg(target_os = "windows")]
-use windows::Win32::{
-    Graphics::Imaging::{CLSID_WICImagingFactory, IWICImagingFactory},
-    System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance},
 };
 
 /// TestPlatform implements the Platform trait for use in tests.
@@ -31,12 +27,13 @@ pub(crate) struct TestPlatform {
     current_clipboard_item: Mutex<Option<ClipboardItem>>,
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     current_primary_item: Mutex<Option<ClipboardItem>>,
+    #[cfg(target_os = "macos")]
+    current_find_pasteboard_item: Mutex<Option<ClipboardItem>>,
     pub(crate) prompts: RefCell<TestPrompts>,
     screen_capture_sources: RefCell<Vec<TestScreenCaptureSource>>,
     pub opened_url: RefCell<Option<String>>,
     pub text_system: Arc<dyn PlatformTextSystem>,
-    #[cfg(target_os = "windows")]
-    bitmap_factory: std::mem::ManuallyDrop<IWICImagingFactory>,
+    pub expect_restart: RefCell<Option<oneshot::Sender<Option<PathBuf>>>>,
     weak: Weak<Self>,
 }
 
@@ -44,11 +41,17 @@ pub(crate) struct TestPlatform {
 /// A fake screen capture source, used for testing.
 pub struct TestScreenCaptureSource {}
 
+/// A fake screen capture stream, used for testing.
 pub struct TestScreenCaptureStream {}
 
 impl ScreenCaptureSource for TestScreenCaptureSource {
-    fn resolution(&self) -> Result<Size<DevicePixels>> {
-        Ok(size(DevicePixels(1), DevicePixels(1)))
+    fn metadata(&self) -> Result<SourceMetadata> {
+        Ok(SourceMetadata {
+            id: 0,
+            is_main: None,
+            label: None,
+            resolution: size(DevicePixels(1), DevicePixels(1)),
+        })
     }
 
     fn stream(
@@ -64,7 +67,11 @@ impl ScreenCaptureSource for TestScreenCaptureSource {
     }
 }
 
-impl ScreenCaptureStream for TestScreenCaptureStream {}
+impl ScreenCaptureStream for TestScreenCaptureStream {
+    fn metadata(&self) -> Result<SourceMetadata> {
+        TestScreenCaptureSource {}.metadata()
+    }
+}
 
 struct TestPrompt {
     msg: String,
@@ -81,16 +88,6 @@ pub(crate) struct TestPrompts {
 
 impl TestPlatform {
     pub fn new(executor: BackgroundExecutor, foreground_executor: ForegroundExecutor) -> Rc<Self> {
-        #[cfg(target_os = "windows")]
-        let bitmap_factory = unsafe {
-            windows::Win32::System::Ole::OleInitialize(None)
-                .expect("unable to initialize Windows OLE");
-            std::mem::ManuallyDrop::new(
-                CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)
-                    .expect("Error creating bitmap factory."),
-            )
-        };
-
         let text_system = Arc::new(NoopTextSystem);
 
         Rc::new_cyclic(|weak| TestPlatform {
@@ -101,13 +98,14 @@ impl TestPlatform {
             active_cursor: Default::default(),
             active_display: Rc::new(TestDisplay::new()),
             active_window: Default::default(),
+            expect_restart: Default::default(),
             current_clipboard_item: Mutex::new(None),
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             current_primary_item: Mutex::new(None),
+            #[cfg(target_os = "macos")]
+            current_find_pasteboard_item: Mutex::new(None),
             weak: weak.clone(),
             opened_url: Default::default(),
-            #[cfg(target_os = "windows")]
-            bitmap_factory,
             text_system,
         })
     }
@@ -122,7 +120,6 @@ impl TestPlatform {
             .new_path
             .pop_front()
             .expect("no pending new path prompt");
-        self.background_executor().set_waiting_hint(None);
         tx.send(Ok(select_path(&path))).ok();
     }
 
@@ -134,7 +131,6 @@ impl TestPlatform {
             .multiple_choice
             .pop_front()
             .expect("no pending multiple choice prompt");
-        self.background_executor().set_waiting_hint(None);
         let Some(ix) = prompt.answers.iter().position(|a| a == response) else {
             panic!(
                 "PROMPT: {}\n{:?}\n{:?}\nCannot respond with {}",
@@ -169,32 +165,30 @@ impl TestPlatform {
     ) -> oneshot::Receiver<usize> {
         let (tx, rx) = oneshot::channel();
         let answers: Vec<String> = answers.iter().map(|s| s.label().to_string()).collect();
-        self.background_executor()
-            .set_waiting_hint(Some(format!("PROMPT: {:?} {:?}", msg, detail)));
         self.prompts
             .borrow_mut()
             .multiple_choice
             .push_back(TestPrompt {
                 msg: msg.to_string(),
                 detail: detail.map(|s| s.to_string()),
-                answers: answers.clone(),
+                answers,
                 tx,
             });
         rx
     }
 
     pub(crate) fn set_active_window(&self, window: Option<TestWindow>) {
-        let executor = self.foreground_executor().clone();
+        let executor = self.foreground_executor();
         let previous_window = self.active_window.borrow_mut().take();
         self.active_window.borrow_mut().clone_from(&window);
 
         executor
             .spawn(async move {
                 if let Some(previous_window) = previous_window {
-                    if let Some(window) = window.as_ref() {
-                        if Rc::ptr_eq(&previous_window.0, &window.0) {
-                            return;
-                        }
+                    if let Some(window) = window.as_ref()
+                        && Rc::ptr_eq(&previous_window.0, &window.0)
+                    {
+                        return;
                     }
                     previous_window.simulate_active_status_change(false);
                 }
@@ -227,7 +221,17 @@ impl Platform for TestPlatform {
         Box::new(TestKeyboardLayout)
     }
 
+    fn keyboard_mapper(&self) -> Rc<dyn PlatformKeyboardMapper> {
+        Rc::new(DummyKeyboardMapper)
+    }
+
     fn on_keyboard_layout_change(&self, _: Box<dyn FnMut()>) {}
+
+    fn on_thermal_state_change(&self, _: Box<dyn FnMut()>) {}
+
+    fn thermal_state(&self) -> ThermalState {
+        ThermalState::Nominal
+    }
 
     fn run(&self, _on_finish_launching: Box<dyn FnOnce()>) {
         unimplemented!()
@@ -235,8 +239,10 @@ impl Platform for TestPlatform {
 
     fn quit(&self) {}
 
-    fn restart(&self, _: Option<PathBuf>) {
-        //
+    fn restart(&self, path: Option<PathBuf>) {
+        if let Some(tx) = self.expect_restart.take() {
+            tx.send(path).unwrap();
+        }
     }
 
     fn activate(&self, _ignoring_other_apps: bool) {
@@ -263,21 +269,19 @@ impl Platform for TestPlatform {
         Some(self.active_display.clone())
     }
 
-    #[cfg(feature = "screen-capture")]
     fn is_screen_capture_supported(&self) -> bool {
         true
     }
 
-    #[cfg(feature = "screen-capture")]
     fn screen_capture_sources(
         &self,
-    ) -> oneshot::Receiver<Result<Vec<Box<dyn ScreenCaptureSource>>>> {
+    ) -> oneshot::Receiver<Result<Vec<Rc<dyn ScreenCaptureSource>>>> {
         let (mut tx, rx) = oneshot::channel();
         tx.send(Ok(self
             .screen_capture_sources
             .borrow()
             .iter()
-            .map(|source| Box::new(source.clone()) as Box<dyn ScreenCaptureSource>)
+            .map(|source| Rc::new(source.clone()) as Rc<dyn ScreenCaptureSource>)
             .collect()))
             .ok();
         rx
@@ -326,10 +330,9 @@ impl Platform for TestPlatform {
     fn prompt_for_new_path(
         &self,
         directory: &std::path::Path,
+        _suggested_name: Option<&str>,
     ) -> oneshot::Receiver<Result<Option<std::path::PathBuf>>> {
         let (tx, rx) = oneshot::channel();
-        self.background_executor()
-            .set_waiting_hint(Some(format!("PROMPT FOR PATH: {:?}", directory)));
         self.prompts
             .borrow_mut()
             .new_path
@@ -378,9 +381,8 @@ impl Platform for TestPlatform {
         false
     }
 
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    fn write_to_primary(&self, item: ClipboardItem) {
-        *self.current_primary_item.lock() = Some(item);
+    fn read_from_clipboard(&self) -> Option<ClipboardItem> {
+        self.current_clipboard_item.lock().clone()
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
@@ -392,8 +394,19 @@ impl Platform for TestPlatform {
         self.current_primary_item.lock().clone()
     }
 
-    fn read_from_clipboard(&self) -> Option<ClipboardItem> {
-        self.current_clipboard_item.lock().clone()
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn write_to_primary(&self, item: ClipboardItem) {
+        *self.current_primary_item.lock() = Some(item);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_from_find_pasteboard(&self) -> Option<ClipboardItem> {
+        self.current_find_pasteboard_item.lock().clone()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_to_find_pasteboard(&self, item: ClipboardItem) {
+        *self.current_find_pasteboard_item.lock() = Some(item);
     }
 
     fn write_credentials(&self, _url: &str, _username: &str, _password: &[u8]) -> Task<Result<()>> {
@@ -421,16 +434,6 @@ impl TestScreenCaptureSource {
     /// Create a fake screen capture source, for testing.
     pub fn new() -> Self {
         Self {}
-    }
-}
-
-#[cfg(target_os = "windows")]
-impl Drop for TestPlatform {
-    fn drop(&mut self) {
-        unsafe {
-            std::mem::ManuallyDrop::drop(&mut self.bitmap_factory);
-            windows::Win32::System::Ole::OleUninitialize();
-        }
     }
 }
 

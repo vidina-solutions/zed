@@ -62,6 +62,8 @@ impl AgentNotification {
             app_id: Some(app_id.to_owned()),
             window_min_size: None,
             window_decorations: Some(WindowDecorations::Client),
+            tabbing_identifier: None,
+            ..Default::default()
         }
     }
 }
@@ -72,6 +74,16 @@ pub enum AgentNotificationEvent {
 }
 
 impl EventEmitter<AgentNotificationEvent> for AgentNotification {}
+
+impl AgentNotification {
+    pub fn accept(&mut self, cx: &mut Context<Self>) {
+        cx.emit(AgentNotificationEvent::Accepted);
+    }
+
+    pub fn dismiss(&mut self, cx: &mut Context<Self>) {
+        cx.emit(AgentNotificationEvent::Dismissed);
+    }
+}
 
 impl Render for AgentNotification {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -104,9 +116,6 @@ impl Render for AgentNotification {
             .font(ui_font)
             .border_color(cx.theme().colors().border)
             .rounded_xl()
-            .on_click(cx.listener(|_, _, _, cx| {
-                cx.emit(AgentNotificationEvent::Accepted);
-            }))
             .child(
                 h_flex()
                     .items_start()
@@ -175,14 +184,14 @@ impl Render for AgentNotification {
                             .style(ButtonStyle::Tinted(ui::TintColor::Accent))
                             .full_width()
                             .on_click({
-                                cx.listener(move |_this, _event, _, cx| {
-                                    cx.emit(AgentNotificationEvent::Accepted);
+                                cx.listener(move |this, _event, _, cx| {
+                                    this.accept(cx);
                                 })
                             }),
                     )
                     .child(Button::new("dismiss", "Dismiss").full_width().on_click({
-                        cx.listener(move |_, _event, _, cx| {
-                            cx.emit(AgentNotificationEvent::Dismissed);
+                        cx.listener(move |this, _event, _, cx| {
+                            this.dismiss(cx);
                         })
                     })),
             )

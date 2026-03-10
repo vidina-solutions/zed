@@ -1,7 +1,7 @@
 name = "Python"
 grammar = "python"
 path_suffixes = ["py", "pyi", "mpy"]
-first_line_pattern = '^#!.*\bpython[0-9.]*\b'
+first_line_pattern = '^#!.*((\bpython[0-9.]*\b)|(\buv run\b))'
 line_comments = ["# "]
 autoclose_before = ";:.,=}])>"
 brackets = [
@@ -28,10 +28,11 @@ brackets = [
 
 auto_indent_using_last_non_empty_line = false
 debuggers = ["Debugpy"]
-increase_indent_pattern = "^[^#].*:\\s*$"
+increase_indent_pattern = "^[^#].*:\\s*(#.*)?$"
 decrease_indent_patterns = [
-  { pattern = "^\\s*elif\\b.*:",    valid_after = ["if", "elif"] },
-  { pattern = "^\\s*else\\b.*:",    valid_after = ["if", "elif", "for", "while", "except"] },
-  { pattern = "^\\s*except\\b.*:",  valid_after = ["try", "except"] },
-  { pattern = "^\\s*finally\\b.*:", valid_after = ["try", "except", "else"] },
+  { pattern = "^\\s*elif\\b.*:\\s*(#.*)?",    valid_after = ["if", "elif"] },
+  { pattern = "^\\s*else\\b.*:\\s*(#.*)?",    valid_after = ["if", "elif", "for", "while", "except"] },
+  { pattern = "^\\s*except\\b.*:\\s*(#.*)?",  valid_after = ["try", "except"] },
+  { pattern = "^\\s*finally\\b.*:\\s*(#.*)?", valid_after = ["try", "except", "else"] },
 ]
+import_path_strip_regex = "/__init__\\.py$"

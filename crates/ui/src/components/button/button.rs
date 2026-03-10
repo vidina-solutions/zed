@@ -43,7 +43,7 @@ use super::button_icon::ButtonIcon;
 ///
 /// Button::new("button_id", "Click me!")
 ///     .icon(IconName::Check)
-///     .selected(true)
+///     .toggle_state(true)
 ///     .on_click(|event, window, cx| {
 ///         // Handle click event
 ///     });
@@ -56,7 +56,7 @@ use super::button_icon::ButtonIcon;
 /// use ui::TintColor;
 ///
 /// Button::new("button_id", "Click me!")
-///     .selected(true)
+///     .toggle_state(true)
 ///     .selected_style(ButtonStyle::Tinted(TintColor::Accent))
 ///     .on_click(|event, window, cx| {
 ///         // Handle click event
@@ -228,7 +228,7 @@ impl Toggleable for Button {
     /// use ui::prelude::*;
     ///
     /// Button::new("button_id", "Click me!")
-    ///     .selected(true)
+    ///     .toggle_state(true)
     ///     .on_click(|event, window, cx| {
     ///         // Handle click event
     ///     });
@@ -251,7 +251,7 @@ impl SelectableButton for Button {
     /// use ui::TintColor;
     ///
     /// Button::new("button_id", "Click me!")
-    ///     .selected(true)
+    ///     .toggle_state(true)
     ///     .selected_style(ButtonStyle::Tinted(TintColor::Accent))
     ///     .on_click(|event, window, cx| {
     ///         // Handle click event
@@ -285,6 +285,10 @@ impl Disableable for Button {
     /// This results in a button that is disabled and does not respond to click events.
     fn disabled(mut self, disabled: bool) -> Self {
         self.base = self.base.disabled(disabled);
+        self.key_binding = self
+            .key_binding
+            .take()
+            .map(|binding| binding.disabled(disabled));
         self
     }
 }
@@ -317,14 +321,14 @@ impl FixedWidth for Button {
     /// use ui::prelude::*;
     ///
     /// Button::new("button_id", "Click me!")
-    ///     .width(px(100.).into())
+    ///     .width(px(100.))
     ///     .on_click(|event, window, cx| {
     ///         // Handle click event
     ///     });
     /// ```
     ///
     /// This sets the button's width to be exactly 100 pixels.
-    fn width(mut self, width: DefiniteLength) -> Self {
+    fn width(mut self, width: impl Into<DefiniteLength>) -> Self {
         self.base = self.base.width(width);
         self
     }
@@ -381,7 +385,7 @@ impl ButtonCommon for Button {
     /// use ui::Tooltip;
     ///
     /// Button::new("button_id", "Click me!")
-    ///     .tooltip(Tooltip::text_f("This is a tooltip", cx))
+    ///     .tooltip(Tooltip::text("This is a tooltip"))
     ///     .on_click(|event, window, cx| {
     ///         // Handle click event
     ///     });
@@ -393,8 +397,18 @@ impl ButtonCommon for Button {
         self
     }
 
+    fn tab_index(mut self, tab_index: impl Into<isize>) -> Self {
+        self.base = self.base.tab_index(tab_index);
+        self
+    }
+
     fn layer(mut self, elevation: ElevationIndex) -> Self {
         self.base = self.base.layer(elevation);
+        self
+    }
+
+    fn track_focus(mut self, focus_handle: &gpui::FocusHandle) -> Self {
+        self.base = self.base.track_focus(focus_handle);
         self
     }
 }
@@ -420,6 +434,7 @@ impl RenderOnce for Button {
 
         self.base.child(
             h_flex()
+                .when(self.truncate, |this| this.min_w_0().overflow_hidden())
                 .gap(DynamicSpacing::Base04.rems(cx))
                 .when(self.icon_position == Some(IconPosition::Start), |this| {
                     this.children(self.icon.map(|icon| {
@@ -434,6 +449,7 @@ impl RenderOnce for Button {
                 })
                 .child(
                     h_flex()
+                        .when(self.truncate, |this| this.min_w_0().overflow_hidden())
                         .when(
                             self.key_binding_position == KeybindingPosition::Start,
                             |this| this.flex_row_reverse(),
@@ -464,7 +480,6 @@ impl RenderOnce for Button {
     }
 }
 
-// View this component preview using `workspace: open component-preview`
 impl Component for Button {
     fn scope() -> ComponentScope {
         ComponentScope::Input

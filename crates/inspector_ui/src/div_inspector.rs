@@ -14,18 +14,22 @@ use language::{
     DiagnosticSeverity, LanguageServerId, Point, ToOffset as _, ToPoint as _,
 };
 use project::lsp_store::CompletionDocumentation;
-use project::{Completion, CompletionResponse, CompletionSource, Project, ProjectPath};
+use project::{
+    Completion, CompletionDisplayOptions, CompletionResponse, CompletionSource, Project,
+    ProjectPath,
+};
 use std::fmt::Write as _;
 use std::ops::Range;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::LazyLock;
 use ui::{Label, LabelSize, Tooltip, prelude::*, styled_ext_reflection, v_flex};
+use util::rel_path::RelPath;
 use util::split_str_with_ranges;
 
 /// Path used for unsaved buffer that contains style json. To support the json language server, this
 /// matches the name used in the generated schemas.
-const ZED_INSPECTOR_STYLE_JSON: &str = "/zed-inspector-style.json";
+const ZED_INSPECTOR_STYLE_JSON: &str = util_macros::path!("/zed-inspector-style.json");
 
 pub(crate) struct DivInspector {
     state: State,
@@ -82,8 +86,8 @@ impl DivInspector {
                 // Create Rust style buffer without adding it to the project / buffer_store, so that
                 // Rust Analyzer doesn't get started for it.
                 let rust_language_result = languages.language_for_name("Rust").await;
-                let rust_style_buffer = rust_language_result.and_then(|rust_language| {
-                    cx.new(|cx| Buffer::local("", cx).with_language(rust_language, cx))
+                let rust_style_buffer = rust_language_result.map(|rust_language| {
+                    cx.new(|cx| Buffer::local("", cx).with_language_async(rust_language, cx))
                 });
 
                 match json_style_buffer.and_then(|json_style_buffer| {
@@ -93,8 +97,8 @@ impl DivInspector {
                     Ok((json_style_buffer, rust_style_buffer)) => {
                         this.update_in(cx, |this, window, cx| {
                             this.state = State::BuffersLoaded {
-                                json_style_buffer: json_style_buffer,
-                                rust_style_buffer: rust_style_buffer,
+                                json_style_buffer,
+                                rust_style_buffer,
                             };
 
                             // Initialize editors immediately instead of waiting for
@@ -200,8 +204,8 @@ impl DivInspector {
         cx.subscribe_in(&json_style_editor, window, {
             let id = id.clone();
             let rust_style_buffer = rust_style_buffer.clone();
-            move |this, editor, event: &EditorEvent, window, cx| match event {
-                EditorEvent::BufferEdited => {
+            move |this, editor, event: &EditorEvent, window, cx| {
+                if event == &EditorEvent::BufferEdited {
                     let style_json = editor.read(cx).text(cx);
                     match serde_json_lenient::from_str_lenient::<StyleRefinement>(&style_json) {
                         Ok(new_style) => {
@@ -243,7 +247,6 @@ impl DivInspector {
                         Err(err) => this.json_style_error = Some(err.to_string().into()),
                     }
                 }
-                _ => {}
             }
         })
         .detach();
@@ -251,11 +254,10 @@ impl DivInspector {
         cx.subscribe(&rust_style_editor, {
             let json_style_buffer = json_style_buffer.clone();
             let rust_style_buffer = rust_style_buffer.clone();
-            move |this, _editor, event: &EditorEvent, cx| match event {
-                EditorEvent::BufferEdited => {
+            move |this, _editor, event: &EditorEvent, cx| {
+                if let EditorEvent::BufferEdited = event {
                     this.update_json_style_from_rust(&json_style_buffer, &rust_style_buffer, cx);
                 }
-                _ => {}
             }
         })
         .detach();
@@ -271,23 +273,19 @@ impl DivInspector {
     }
 
     fn reset_style(&mut self, cx: &mut App) {
-        match &self.state {
-            State::Ready {
-                rust_style_buffer,
-                json_style_buffer,
-                ..
-            } => {
-                if let Err(err) = self.reset_style_editors(
-                    &rust_style_buffer.clone(),
-                    &json_style_buffer.clone(),
-                    cx,
-                ) {
-                    self.json_style_error = Some(format!("{err}").into());
-                } else {
-                    self.json_style_error = None;
-                }
+        if let State::Ready {
+            rust_style_buffer,
+            json_style_buffer,
+            ..
+        } = &self.state
+        {
+            if let Err(err) =
+                self.reset_style_editors(&rust_style_buffer.clone(), &json_style_buffer.clone(), cx)
+            {
+                self.json_style_error = Some(format!("{err}").into());
+            } else {
+                self.json_style_error = None;
             }
-            _ => {}
         }
     }
 
@@ -395,27 +393,27 @@ impl DivInspector {
             .zip(self.rust_completion_replace_range.as_ref())
         {
             let before_text = snapshot
-                .text_for_range(0..completion_range.start.to_offset(&snapshot))
+                .text_for_range(0..completion_range.start.to_offset(snapshot))
                 .collect::<String>();
             let after_text = snapshot
                 .text_for_range(
-                    completion_range.end.to_offset(&snapshot)
+                    completion_range.end.to_offset(snapshot)
                         ..snapshot.clip_offset(usize::MAX, Bias::Left),
                 )
                 .collect::<String>();
-            let mut method_names = split_str_with_ranges(&before_text, is_not_identifier_char)
+            let mut method_names = split_str_with_ranges(&before_text, &is_not_identifier_char)
                 .into_iter()
                 .map(|(range, name)| (Some(range), name.to_string()))
                 .collect::<Vec<_>>();
             method_names.push((None, completion.clone()));
             method_names.extend(
-                split_str_with_ranges(&after_text, is_not_identifier_char)
+                split_str_with_ranges(&after_text, &is_not_identifier_char)
                     .into_iter()
                     .map(|(range, name)| (Some(range), name.to_string())),
             );
             method_names
         } else {
-            split_str_with_ranges(&snapshot.text(), is_not_identifier_char)
+            split_str_with_ranges(&snapshot.text(), &is_not_identifier_char)
                 .into_iter()
                 .map(|(range, name)| (Some(range), name.to_string()))
                 .collect::<Vec<_>>()
@@ -464,16 +462,16 @@ impl DivInspector {
         cx: &mut AsyncWindowContext,
     ) -> Result<Entity<Buffer>> {
         let worktree = project
-            .update(cx, |project, cx| project.create_worktree(path, false, cx))?
+            .update(cx, |project, cx| project.create_worktree(path, false, cx))
             .await?;
 
         let project_path = worktree.read_with(cx, |worktree, _cx| ProjectPath {
             worktree_id: worktree.id(),
-            path: Path::new("").into(),
-        })?;
+            path: RelPath::empty().into(),
+        });
 
         let buffer = project
-            .update(cx, |project, cx| project.open_path(project_path, cx))?
+            .update(cx, |project, cx| project.open_path(project_path, cx))
             .await?
             .1;
 
@@ -578,7 +576,12 @@ fn render_layout_state(inspector_state: &DivInspectorState, cx: &App) -> Div {
         .child(
             div()
                 .text_ui(cx)
-                .child(format!("Bounds: {}", inspector_state.bounds)),
+                .child(format!(
+                    "Bounds: ⌜{} - {}⌟",
+                    inspector_state.bounds.origin,
+                    inspector_state.bounds.bottom_right()
+                ))
+                .child(format!("Size: {}", inspector_state.bounds.size)),
         )
         .child(
             div()
@@ -661,6 +664,8 @@ impl CompletionProvider for RustStyleCompletionProvider {
                     replace_range: replace_range.clone(),
                     new_text: format!(".{}()", method.name),
                     label: CodeLabel::plain(method.name.to_string(), None),
+                    match_start: None,
+                    snippet_deduplication_key: None,
                     icon_path: None,
                     documentation: method.documentation.map(|documentation| {
                         CompletionDocumentation::MultiLineMarkdown(documentation.into())
@@ -670,6 +675,7 @@ impl CompletionProvider for RustStyleCompletionProvider {
                     confirm: None,
                 })
                 .collect(),
+            display_options: CompletionDisplayOptions::default(),
             is_incomplete: false,
         }]))
     }
@@ -680,7 +686,6 @@ impl CompletionProvider for RustStyleCompletionProvider {
         position: language::Anchor,
         _text: &str,
         _trigger_in_words: bool,
-        _menu_is_open: bool,
         cx: &mut Context<Editor>,
     ) -> bool {
         completion_replace_range(&buffer.read(cx).snapshot(), &position).is_some()
@@ -702,10 +707,10 @@ impl CompletionProvider for RustStyleCompletionProvider {
 }
 
 fn completion_replace_range(snapshot: &BufferSnapshot, anchor: &Anchor) -> Option<Range<Anchor>> {
-    let point = anchor.to_point(&snapshot);
-    let offset = point.to_offset(&snapshot);
-    let line_start = Point::new(point.row, 0).to_offset(&snapshot);
-    let line_end = Point::new(point.row, snapshot.line_len(point.row)).to_offset(&snapshot);
+    let point = anchor.to_point(snapshot);
+    let offset = point.to_offset(snapshot);
+    let line_start = Point::new(point.row, 0).to_offset(snapshot);
+    let line_end = Point::new(point.row, snapshot.line_len(point.row)).to_offset(snapshot);
     let mut lines = snapshot.text_for_range(line_start..line_end).lines();
     let line = lines.next()?;
 

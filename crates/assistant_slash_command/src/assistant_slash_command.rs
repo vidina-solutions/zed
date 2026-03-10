@@ -9,16 +9,29 @@ use anyhow::Result;
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use gpui::{App, SharedString, Task, WeakEntity, Window};
+use language::CodeLabelBuilder;
 use language::HighlightId;
 use language::{BufferSnapshot, CodeLabel, LspAdapterDelegate, OffsetRangeExt};
 pub use language_model::Role;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::{
     ops::Range,
     sync::{Arc, atomic::AtomicBool},
 };
 use ui::ActiveTheme;
 use workspace::{Workspace, ui::IconName};
+
+/// Deserializes IconName, falling back to Code for unknown variants.
+/// This handles old saved data that may contain removed or renamed icon variants.
+fn deserialize_icon_with_fallback<'de, D>(deserializer: D) -> Result<IconName, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(String::deserialize(deserializer)
+        .ok()
+        .and_then(|string| serde_json::from_value(serde_json::Value::String(string)).ok())
+        .unwrap_or(IconName::Code))
+}
 
 pub fn init(cx: &mut App) {
     SlashCommandRegistry::default_global(cx);
@@ -161,7 +174,7 @@ impl SlashCommandOutput {
     }
 
     /// Returns this [`SlashCommandOutput`] as a stream of [`SlashCommandEvent`]s.
-    pub fn to_event_stream(mut self) -> BoxStream<'static, Result<SlashCommandEvent>> {
+    pub fn into_event_stream(mut self) -> BoxStream<'static, Result<SlashCommandEvent>> {
         self.ensure_valid_section_ranges();
 
         let mut events = Vec::new();
@@ -255,6 +268,7 @@ impl SlashCommandOutput {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlashCommandOutputSection<T> {
     pub range: Range<T>,
+    #[serde(deserialize_with = "deserialize_icon_with_fallback")]
     pub icon: IconName,
     pub label: SharedString,
     pub metadata: Option<serde_json::Value>,
@@ -328,15 +342,15 @@ impl SlashCommandLine {
 }
 
 pub fn create_label_for_command(command_name: &str, arguments: &[&str], cx: &App) -> CodeLabel {
-    let mut label = CodeLabel::default();
+    let mut label = CodeLabelBuilder::default();
     label.push_str(command_name, None);
+    label.respan_filter_range(None);
     label.push_str(" ", None);
     label.push_str(
         &arguments.join(" "),
         cx.theme().syntax().highlight_id("comment").map(HighlightId),
     );
-    label.filter_range = 0..command_name.len();
-    label
+    label.build()
 }
 
 #[cfg(test)]
@@ -363,7 +377,7 @@ mod tests {
                 run_commands_in_text: false,
             };
 
-            let events = output.clone().to_event_stream().collect::<Vec<_>>().await;
+            let events = output.clone().into_event_stream().collect::<Vec<_>>().await;
             let events = events
                 .into_iter()
                 .filter_map(|event| event.ok())
@@ -386,7 +400,7 @@ mod tests {
             );
 
             let new_output =
-                SlashCommandOutput::from_event_stream(output.clone().to_event_stream())
+                SlashCommandOutput::from_event_stream(output.clone().into_event_stream())
                     .await
                     .unwrap();
 
@@ -415,7 +429,7 @@ mod tests {
                 run_commands_in_text: false,
             };
 
-            let events = output.clone().to_event_stream().collect::<Vec<_>>().await;
+            let events = output.clone().into_event_stream().collect::<Vec<_>>().await;
             let events = events
                 .into_iter()
                 .filter_map(|event| event.ok())
@@ -452,7 +466,7 @@ mod tests {
             );
 
             let new_output =
-                SlashCommandOutput::from_event_stream(output.clone().to_event_stream())
+                SlashCommandOutput::from_event_stream(output.clone().into_event_stream())
                     .await
                     .unwrap();
 
@@ -493,7 +507,7 @@ mod tests {
                 run_commands_in_text: false,
             };
 
-            let events = output.clone().to_event_stream().collect::<Vec<_>>().await;
+            let events = output.clone().into_event_stream().collect::<Vec<_>>().await;
             let events = events
                 .into_iter()
                 .filter_map(|event| event.ok())
@@ -562,11 +576,42 @@ mod tests {
             );
 
             let new_output =
-                SlashCommandOutput::from_event_stream(output.clone().to_event_stream())
+                SlashCommandOutput::from_event_stream(output.clone().into_event_stream())
                     .await
                     .unwrap();
 
             assert_eq!(new_output, output);
         }
+    }
+
+    #[test]
+    fn test_deserialize_with_valid_icon_pascal_case() {
+        // Test that PascalCase icons (serde default) deserialize correctly
+        let json = json!({
+            "range": {
+                "start": 0,
+                "end": 5
+            },
+            "icon": "AcpRegistry",
+            "label": "Test",
+            "metadata": null
+        });
+        let section: SlashCommandOutputSection<usize> = serde_json::from_value(json).unwrap();
+        assert_eq!(section.icon, IconName::AcpRegistry);
+    }
+    #[test]
+    fn test_deserialize_with_unknown_icon() {
+        // Test that unknown icon variants fall back to Code
+        let json = json!({
+            "range": {
+                "start": 0,
+                "end": 5
+            },
+            "icon": "removed_icon",
+            "label": "Old Icon",
+            "metadata": null
+        });
+        let section: SlashCommandOutputSection<usize> = serde_json::from_value(json).unwrap();
+        assert_eq!(section.icon, IconName::Code);
     }
 }

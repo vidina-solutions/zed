@@ -23,7 +23,7 @@ pub fn rgba(hex: u32) -> Rgba {
 }
 
 /// Swap from RGBA with premultiplied alpha to BGRA
-pub(crate) fn swap_rgba_pa_to_bgra(color: &mut [u8]) {
+pub fn swap_rgba_pa_to_bgra(color: &mut [u8]) {
     color.swap(0, 2);
     if color[3] > 0 {
         let a = color[3] as f32 / 255.;
@@ -35,6 +35,7 @@ pub(crate) fn swap_rgba_pa_to_bgra(color: &mut [u8]) {
 
 /// An RGBA color
 #[derive(PartialEq, Clone, Copy, Default)]
+#[repr(C)]
 pub struct Rgba {
     /// The red component of the color, in the range 0.0 to 1.0
     pub r: f32,
@@ -150,9 +151,9 @@ impl From<Hsla> for Rgba {
         };
 
         Rgba {
-            r,
-            g,
-            b,
+            r: r.clamp(0., 1.),
+            g: g.clamp(0., 1.),
+            b: b.clamp(0., 1.),
             a: color.a,
         }
     }
@@ -361,7 +362,7 @@ pub const fn transparent_black() -> Hsla {
     }
 }
 
-/// Transparent black in [`Hsla`]
+/// Transparent white in [`Hsla`]
 pub const fn transparent_white() -> Hsla {
     Hsla {
         h: 0.,
@@ -472,6 +473,11 @@ impl Hsla {
         self.a == 0.0
     }
 
+    /// Returns true if the HSLA color is fully opaque, false otherwise.
+    pub fn is_opaque(&self) -> bool {
+        self.a == 1.0
+    }
+
     /// Blends `other` on top of `self` based on `other`'s alpha value. The resulting color is a combination of `self`'s and `other`'s colors.
     ///
     /// If `other`'s alpha value is 1.0 or greater, `other` color is fully opaque, thus `other` is returned as the output color.
@@ -531,9 +537,10 @@ impl Hsla {
     ///
     /// Example:
     /// ```
-    /// let color = hlsa(0.7, 1.0, 0.5, 0.7); // A saturated blue
+    /// use gpui::hsla;
+    /// let color = hsla(0.7, 1.0, 0.5, 0.7); // A saturated blue
     /// let faded_color = color.opacity(0.16);
-    /// assert_eq!(faded_color.a, 0.112);
+    /// assert!((faded_color.a - 0.112).abs() < 1e-6);
     /// ```
     ///
     /// This will return a blue color with around ~10% opacity,
@@ -562,6 +569,7 @@ impl Hsla {
     ///
     /// Example:
     /// ```
+    /// use gpui::hsla;
     /// let color = hsla(0.7, 1.0, 0.5, 0.7); // A saturated blue
     /// let faded_color = color.alpha(0.25);
     /// assert_eq!(faded_color.a, 0.25);
@@ -650,6 +658,7 @@ pub(crate) enum BackgroundTag {
     Solid = 0,
     LinearGradient = 1,
     PatternSlash = 2,
+    Checkerboard = 3,
 }
 
 /// A color space for color interpolation.
@@ -693,20 +702,21 @@ impl std::fmt::Debug for Background {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.tag {
             BackgroundTag::Solid => write!(f, "Solid({:?})", self.solid),
-            BackgroundTag::LinearGradient => {
-                write!(
-                    f,
-                    "LinearGradient({}, {:?}, {:?})",
-                    self.gradient_angle_or_pattern_height, self.colors[0], self.colors[1]
-                )
-            }
-            BackgroundTag::PatternSlash => {
-                write!(
-                    f,
-                    "PatternSlash({:?}, {})",
-                    self.solid, self.gradient_angle_or_pattern_height
-                )
-            }
+            BackgroundTag::LinearGradient => write!(
+                f,
+                "LinearGradient({}, {:?}, {:?})",
+                self.gradient_angle_or_pattern_height, self.colors[0], self.colors[1]
+            ),
+            BackgroundTag::PatternSlash => write!(
+                f,
+                "PatternSlash({:?}, {})",
+                self.solid, self.gradient_angle_or_pattern_height
+            ),
+            BackgroundTag::Checkerboard => write!(
+                f,
+                "Checkerboard({:?}, {})",
+                self.solid, self.gradient_angle_or_pattern_height
+            ),
         }
     }
 }
@@ -726,15 +736,25 @@ impl Default for Background {
 }
 
 /// Creates a hash pattern background
-pub fn pattern_slash(color: Hsla, width: f32, interval: f32) -> Background {
+pub fn pattern_slash(color: impl Into<Hsla>, width: f32, interval: f32) -> Background {
     let width_scaled = (width * 255.0) as u32;
     let interval_scaled = (interval * 255.0) as u32;
     let height = ((width_scaled * 0xFFFF) + interval_scaled) as f32;
 
     Background {
         tag: BackgroundTag::PatternSlash,
-        solid: color,
+        solid: color.into(),
         gradient_angle_or_pattern_height: height,
+        ..Default::default()
+    }
+}
+
+/// Creates a checkerboard pattern background
+pub fn checkerboard(color: impl Into<Hsla>, size: f32) -> Background {
+    Background {
+        tag: BackgroundTag::Checkerboard,
+        solid: color.into(),
+        gradient_angle_or_pattern_height: size,
         ..Default::default()
     }
 }
@@ -825,6 +845,7 @@ impl Background {
             BackgroundTag::Solid => self.solid.is_transparent(),
             BackgroundTag::LinearGradient => self.colors.iter().all(|c| c.color.is_transparent()),
             BackgroundTag::PatternSlash => self.solid.is_transparent(),
+            BackgroundTag::Checkerboard => self.solid.is_transparent(),
         }
     }
 }
@@ -904,9 +925,9 @@ mod tests {
         assert_eq!(background.solid, color);
 
         assert_eq!(background.opacity(0.5).solid, color.opacity(0.5));
-        assert_eq!(background.is_transparent(), false);
+        assert!(!background.is_transparent());
         background.solid = hsla(0.0, 0.0, 0.0, 0.0);
-        assert_eq!(background.is_transparent(), true);
+        assert!(background.is_transparent());
     }
 
     #[test]
@@ -920,7 +941,7 @@ mod tests {
 
         assert_eq!(background.opacity(0.5).colors[0], from.opacity(0.5));
         assert_eq!(background.opacity(0.5).colors[1], to.opacity(0.5));
-        assert_eq!(background.is_transparent(), false);
-        assert_eq!(background.opacity(0.0).is_transparent(), true);
+        assert!(!background.is_transparent());
+        assert!(background.opacity(0.0).is_transparent());
     }
 }

@@ -4,11 +4,13 @@ pub use pulldown_cmark::TagEnd as MarkdownTagEnd;
 use pulldown_cmark::{
     Alignment, CowStr, HeadingLevel, LinkType, MetadataBlockKind, Options, Parser,
 };
-use std::{collections::HashSet, ops::Range, path::Path, sync::Arc};
+use std::{ops::Range, sync::Arc};
+
+use collections::HashSet;
 
 use crate::path_range::PathWithRange;
 
-const PARSE_OPTIONS: Options = Options::ENABLE_TABLES
+pub const PARSE_OPTIONS: Options = Options::ENABLE_TABLES
     .union(Options::ENABLE_FOOTNOTES)
     .union(Options::ENABLE_STRIKETHROUGH)
     .union(Options::ENABLE_TASKLISTS)
@@ -16,18 +18,20 @@ const PARSE_OPTIONS: Options = Options::ENABLE_TABLES
     .union(Options::ENABLE_HEADING_ATTRIBUTES)
     .union(Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS)
     .union(Options::ENABLE_OLD_FOOTNOTES)
-    .union(Options::ENABLE_GFM);
+    .union(Options::ENABLE_GFM)
+    .union(Options::ENABLE_SUPERSCRIPT)
+    .union(Options::ENABLE_SUBSCRIPT);
 
 pub fn parse_markdown(
     text: &str,
 ) -> (
     Vec<(Range<usize>, MarkdownEvent)>,
     HashSet<SharedString>,
-    HashSet<Arc<Path>>,
+    HashSet<Arc<str>>,
 ) {
     let mut events = Vec::new();
-    let mut language_names = HashSet::new();
-    let mut language_paths = HashSet::new();
+    let mut language_names = HashSet::default();
+    let mut language_paths = HashSet::default();
     let mut within_link = false;
     let mut within_metadata = false;
     let mut parser = Parser::new_ext(text, PARSE_OPTIONS)
@@ -67,7 +71,7 @@ pub fn parse_markdown(
                         MarkdownTag::CodeBlock {
                             kind: CodeBlockKind::Indented,
                             metadata: CodeBlockMetadata {
-                                content_range: range.start + 1..range.end + 1,
+                                content_range: range.clone(),
                                 line_count: 1,
                             },
                         }
@@ -147,6 +151,8 @@ pub fn parse_markdown(
                     pulldown_cmark::Tag::Emphasis => MarkdownTag::Emphasis,
                     pulldown_cmark::Tag::Strong => MarkdownTag::Strong,
                     pulldown_cmark::Tag::Strikethrough => MarkdownTag::Strikethrough,
+                    pulldown_cmark::Tag::Superscript => MarkdownTag::Superscript,
+                    pulldown_cmark::Tag::Subscript => MarkdownTag::Subscript,
                     pulldown_cmark::Tag::Image {
                         link_type,
                         dest_url,
@@ -247,7 +253,7 @@ pub fn parse_markdown(
                             events.push(event_for(
                                 text,
                                 range.source_range.start..range.source_range.start + prefix_len,
-                                &head,
+                                head,
                             ));
                             range.parsed = CowStr::Boxed(tail.into());
                             range.merged_range.start += prefix_len;
@@ -452,6 +458,8 @@ pub enum MarkdownTag {
     Emphasis,
     Strong,
     Strikethrough,
+    Superscript,
+    Subscript,
 
     /// A link.
     Link {
@@ -546,7 +554,8 @@ mod tests {
 
     const UNWANTED_OPTIONS: Options = Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
         .union(Options::ENABLE_MATH)
-        .union(Options::ENABLE_DEFINITION_LIST);
+        .union(Options::ENABLE_DEFINITION_LIST)
+        .union(Options::ENABLE_WIKILINKS);
 
     #[test]
     fn all_options_considered() {
@@ -579,8 +588,8 @@ mod tests {
                     (30..37, Text),
                     (30..37, End(MarkdownTagEnd::Paragraph))
                 ],
-                HashSet::new(),
-                HashSet::new()
+                HashSet::default(),
+                HashSet::default()
             )
         )
     }
@@ -613,8 +622,8 @@ mod tests {
                     (46..51, Text),
                     (0..51, End(MarkdownTagEnd::Paragraph))
                 ],
-                HashSet::new(),
-                HashSet::new()
+                HashSet::default(),
+                HashSet::default()
             )
         );
     }
@@ -670,8 +679,8 @@ mod tests {
                     (43..53, SubstitutedText("–––––".into())),
                     (0..53, End(MarkdownTagEnd::Paragraph))
                 ],
-                HashSet::new(),
-                HashSet::new()
+                HashSet::default(),
+                HashSet::default()
             )
         )
     }
@@ -695,10 +704,35 @@ mod tests {
                     (8..34, Text),
                     (0..37, End(MarkdownTagEnd::CodeBlock)),
                 ],
-                HashSet::from(["rust".into()]),
-                HashSet::new()
+                {
+                    let mut h = HashSet::default();
+                    h.insert("rust".into());
+                    h
+                },
+                HashSet::default()
             )
-        )
+        );
+        assert_eq!(
+            parse_markdown("    fn main() {}"),
+            (
+                vec![
+                    (
+                        4..16,
+                        Start(CodeBlock {
+                            kind: CodeBlockKind::Indented,
+                            metadata: CodeBlockMetadata {
+                                content_range: 4..16,
+                                line_count: 1
+                            }
+                        })
+                    ),
+                    (4..16, Text),
+                    (4..16, End(MarkdownTagEnd::CodeBlock))
+                ],
+                HashSet::default(),
+                HashSet::default()
+            )
+        );
     }
 
     #[test]

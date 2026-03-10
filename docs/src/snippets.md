@@ -1,6 +1,11 @@
+---
+title: Snippets - Zed
+description: Create and use code snippets in Zed with tab stops, placeholders, variables, and language-scoped triggers.
+---
+
 # Snippets
 
-Use the {#action snippets::ConfigureSnippets} action to create a new snippets file or edit a existing snippets file for a specified [scope](#scopes).
+Use the {#action snippets::ConfigureSnippets} action to create a new snippets file or edit an existing snippets file for a specified [scope](#scopes).
 
 The snippets are located in `~/.config/zed/snippets` directory to which you can navigate to with the {#action snippets::OpenFolder} action.
 
@@ -13,6 +18,7 @@ The snippets are located in `~/.config/zed/snippets` directory to which you can 
   // Use placeholders like $1, $2 or ${1:defaultValue} to define tab stops.
   // The $0 determines the final cursor position.
   // Placeholders with the same value are linked.
+  // If the snippet contains the $ symbol outside of a placeholder, it must be escaped with two slashes (e.g. \\$var).
   "Log to console": {
     "prefix": "log",
     "body": ["console.info(\"Hello, ${1:World}!\")", "$0"],
@@ -31,13 +37,9 @@ The scope is determined by the language name in lowercase e.g. `python.json` for
 | JSX        | javascript.json |
 | Plain Text | plaintext.json  |
 
-To create JSX snippets you have to use `javascript.json` snippets file, instead of `jsx.json`, but this does not apply to TSX and Typescript which follow the above rule.
+To create JSX snippets you have to use `javascript.json` snippets file, instead of `jsx.json`, but this does not apply to TSX and TypeScript which follow the above rule.
 
 ## Known Limitations
 
-- Only the first prefix is used when an list of prefixes is passed in.
-- Currently only the `json` snippet file format is supported, even though the `simple-completion-language-server` supports both `json` and `toml` file formats.
-
-## See also
-
-For more configuration information, see the [`simple-completion-language-server` instructions](https://github.com/zed-industries/simple-completion-language-server/tree/main).
+- Only the first prefix is used when a list of prefixes is passed in.
+- Currently only the `json` snippet file format is supported.

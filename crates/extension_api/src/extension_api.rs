@@ -100,6 +100,28 @@ pub trait Extension: Send + Sync {
         Ok(None)
     }
 
+    /// Returns the JSON schema for the initialization options.
+    ///
+    /// The schema must conform to the JSON Schema speification.
+    fn language_server_initialization_options_schema(
+        &mut self,
+        _language_server_id: &LanguageServerId,
+        _worktree: &Worktree,
+    ) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Returns the JSON schema for the workspace configuration.
+    ///
+    /// The schema must conform to the JSON Schema specification.
+    fn language_server_workspace_configuration_schema(
+        &mut self,
+        _language_server_id: &LanguageServerId,
+        _worktree: &Worktree,
+    ) -> Option<serde_json::Value> {
+        None
+    }
+
     /// Returns the initialization options to pass to the other language server.
     fn language_server_additional_initialization_options(
         &mut self,
@@ -232,10 +254,10 @@ pub trait Extension: Send + Sync {
     ///
     /// To work through a real-world example, take a `cargo run` task and a hypothetical `cargo` locator:
     /// 1. We may need to modify the task; in this case, it is problematic that `cargo run` spawns a binary. We should turn `cargo run` into a debug scenario with
-    /// `cargo build` task. This is the decision we make at `dap_locator_create_scenario` scope.
+    ///    `cargo build` task. This is the decision we make at `dap_locator_create_scenario` scope.
     /// 2. Then, after the build task finishes, we will run `run_dap_locator` of the locator that produced the build task to find the program to be debugged. This function
-    /// should give us a debugger-agnostic configuration for launching a debug target (that we end up resolving with [`Extension::dap_config_to_scenario`]). It's almost as if the user
-    /// found the artifact path by themselves.
+    ///    should give us a debugger-agnostic configuration for launching a debug target (that we end up resolving with [`Extension::dap_config_to_scenario`]). It's almost as if the user
+    ///    found the artifact path by themselves.
     ///
     /// Note that you're not obliged to use build tasks with locators. Specifically, it is sufficient to provide a debug configuration directly in the return value of
     /// `dap_locator_create_scenario` if you're able to do that. Make sure to not fill out `build` field in that case, as that will prevent Zed from running second phase of resolution in such case.
@@ -267,9 +289,43 @@ pub trait Extension: Send + Sync {
 #[macro_export]
 macro_rules! register_extension {
     ($extension_type:ty) => {
+        #[cfg(target_os = "wasi")]
+        mod wasi_ext {
+            unsafe extern "C" {
+                static mut errno: i32;
+                pub static mut __wasilibc_cwd: *mut std::ffi::c_char;
+            }
+
+            pub fn init_cwd() {
+                unsafe {
+                    // Ensure that our chdir function is linked, instead of the
+                    // one from wasi-libc in the chdir.o translation unit. Otherwise
+                    // we risk linking in `__wasilibc_find_relpath_alloc` which
+                    // is a weak symbol and is being used by
+                    // `__wasilibc_find_relpath`, which we do not want on
+                    // Windows.
+                    chdir(std::ptr::null());
+
+                    __wasilibc_cwd = std::ffi::CString::new(std::env::var("PWD").unwrap())
+                        .unwrap()
+                        .into_raw()
+                        .cast();
+                }
+            }
+
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn chdir(raw_path: *const std::ffi::c_char) -> i32 {
+                // Forbid extensions from changing CWD and so return an appropriate error code.
+                errno = 58; // NOTSUP
+                return -1;
+            }
+        }
+
         #[unsafe(export_name = "init-extension")]
         pub extern "C" fn __init_extension() {
-            std::env::set_current_dir(std::env::var("PWD").unwrap()).unwrap();
+            #[cfg(target_os = "wasi")]
+            wasi_ext::init_cwd();
+
             zed_extension_api::register_extension(|| {
                 Box::new(<$extension_type as zed_extension_api::Extension>::new())
             });
@@ -297,10 +353,9 @@ static mut EXTENSION: Option<Box<dyn Extension>> = None;
 pub static ZED_API_VERSION: [u8; 6] = *include_bytes!(concat!(env!("OUT_DIR"), "/version_bytes"));
 
 mod wit {
-
     wit_bindgen::generate!({
         skip: ["init-extension"],
-        path: "./wit/since_v0.6.0",
+        path: "./wit/since_v0.8.0",
     });
 }
 
@@ -335,6 +390,26 @@ impl wit::Guest for Component {
         Ok(extension()
             .language_server_workspace_configuration(&language_server_id, worktree)?
             .and_then(|value| serde_json::to_string(&value).ok()))
+    }
+
+    fn language_server_initialization_options_schema(
+        language_server_id: String,
+        worktree: &Worktree,
+    ) -> Option<String> {
+        let language_server_id = LanguageServerId(language_server_id);
+        extension()
+            .language_server_initialization_options_schema(&language_server_id, worktree)
+            .and_then(|value| serde_json::to_string(&value).ok())
+    }
+
+    fn language_server_workspace_configuration_schema(
+        language_server_id: String,
+        worktree: &Worktree,
+    ) -> Option<String> {
+        let language_server_id = LanguageServerId(language_server_id);
+        extension()
+            .language_server_workspace_configuration_schema(&language_server_id, worktree)
+            .and_then(|value| serde_json::to_string(&value).ok())
     }
 
     fn language_server_additional_initialization_options(
@@ -490,6 +565,12 @@ impl wit::Guest for Component {
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
 pub struct LanguageServerId(String);
 
+impl LanguageServerId {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+}
+
 impl AsRef<str> for LanguageServerId {
     fn as_ref(&self) -> &str {
         &self.0
@@ -505,6 +586,12 @@ impl fmt::Display for LanguageServerId {
 /// The ID of a context server.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
 pub struct ContextServerId(String);
+
+impl ContextServerId {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+}
 
 impl AsRef<str> for ContextServerId {
     fn as_ref(&self) -> &str {

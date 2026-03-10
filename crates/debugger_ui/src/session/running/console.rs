@@ -6,23 +6,26 @@ use alacritty_terminal::vte::ansi;
 use anyhow::Result;
 use collections::HashMap;
 use dap::{CompletionItem, CompletionItemType, OutputEvent};
-use editor::{Bias, CompletionProvider, Editor, EditorElement, EditorStyle, ExcerptId};
+use editor::{
+    Bias, CompletionProvider, Editor, EditorElement, EditorMode, EditorStyle, ExcerptId,
+    HighlightKey, MultiBufferOffset, SizingBehavior,
+};
 use fuzzy::StringMatchCandidate;
 use gpui::{
     Action as _, AppContext, Context, Corner, Entity, FocusHandle, Focusable, HighlightStyle, Hsla,
     Render, Subscription, Task, TextStyle, WeakEntity, actions,
 };
-use language::{Anchor, Buffer, CodeLabel, TextBufferSnapshot, ToOffset};
+use language::{Anchor, Buffer, CharScopeContext, CodeLabel, TextBufferSnapshot, ToOffset};
 use menu::{Confirm, SelectNext, SelectPrevious};
 use project::{
-    Completion, CompletionResponse,
+    CompletionDisplayOptions, CompletionResponse,
     debugger::session::{CompletionsQuery, OutputToken, Session},
     lsp_store::CompletionDocumentation,
     search_history::{SearchHistory, SearchHistoryCursor},
 };
 use settings::Settings;
 use std::fmt::Write;
-use std::{cell::RefCell, ops::Range, rc::Rc, usize};
+use std::{ops::Range, rc::Rc, usize};
 use theme::{Theme, ThemeSettings};
 use ui::{ContextMenu, Divider, PopoverMenu, SplitButton, Tooltip, prelude::*};
 use util::ResultExt;
@@ -59,6 +62,11 @@ impl Console {
     ) -> Self {
         let console = cx.new(|cx| {
             let mut editor = Editor::multi_line(window, cx);
+            editor.set_mode(EditorMode::Full {
+                scale_ui_elements_with_buffer_font_size: true,
+                show_active_line_background: true,
+                sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
+            });
             editor.move_to_end(&editor::actions::MoveToEnd, window, cx);
             editor.set_read_only(true);
             editor.disable_scrollbars_and_minimap(window, cx);
@@ -83,7 +91,7 @@ impl Console {
         let this = cx.weak_entity();
         let query_bar = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Evaluate an expression", cx);
+            editor.set_placeholder_text("Evaluate an expression", window, cx);
             editor.set_use_autoclose(false);
             editor.set_show_gutter(false, cx);
             editor.set_show_wrap_guides(false, cx);
@@ -97,7 +105,7 @@ impl Console {
             cx.subscribe(&stack_frame_list, Self::handle_stack_frame_list_events),
             cx.on_focus(&focus_handle, window, |console, window, cx| {
                 if console.is_running(cx) {
-                    console.query_bar.focus_handle(cx).focus(window);
+                    console.query_bar.focus_handle(cx).focus(window, cx);
                 }
             }),
         ];
@@ -153,7 +161,9 @@ impl Console {
     ) -> Task<Result<()>> {
         self.console.update(cx, |_, cx| {
             cx.spawn_in(window, async move |console, cx| {
-                let mut len = console.update(cx, |this, cx| this.buffer().read(cx).len(cx))?;
+                let mut len = console
+                    .update(cx, |this, cx| this.buffer().read(cx).len(cx))?
+                    .0;
                 let (output, spans, background_spans) = cx
                     .background_spawn(async move {
                         let mut all_spans = Vec::new();
@@ -212,15 +222,13 @@ impl Console {
                     console.insert(&output, window, cx);
                     console.set_read_only(true);
 
-                    struct ConsoleAnsiHighlight;
-
                     let buffer = console.buffer().read(cx).snapshot(cx);
 
                     for (range, color) in spans {
                         let Some(color) = color else { continue };
                         let start_offset = range.start;
-                        let range =
-                            buffer.anchor_after(range.start)..buffer.anchor_before(range.end);
+                        let range = buffer.anchor_after(MultiBufferOffset(range.start))
+                            ..buffer.anchor_before(MultiBufferOffset(range.end));
                         let style = HighlightStyle {
                             color: Some(terminal_view::terminal_element::convert_color(
                                 &color,
@@ -228,10 +236,11 @@ impl Console {
                             )),
                             ..Default::default()
                         };
-                        console.highlight_text_key::<ConsoleAnsiHighlight>(
-                            start_offset,
+                        console.highlight_text_key(
+                            HighlightKey::ConsoleAnsiHighlight(start_offset),
                             vec![range],
                             style,
+                            false,
                             cx,
                         );
                     }
@@ -239,12 +248,13 @@ impl Console {
                     for (range, color) in background_spans {
                         let Some(color) = color else { continue };
                         let start_offset = range.start;
-                        let range =
-                            buffer.anchor_after(range.start)..buffer.anchor_before(range.end);
-                        console.highlight_background_key::<ConsoleAnsiHighlight>(
-                            start_offset,
+                        let range = buffer.anchor_after(MultiBufferOffset(range.start))
+                            ..buffer.anchor_before(MultiBufferOffset(range.end));
+                        let color_fn = color_fetcher(color);
+                        console.highlight_background(
+                            HighlightKey::ConsoleAnsiHighlight(start_offset),
                             &[range],
-                            color_fetcher(color),
+                            move |_, theme| color_fn(theme),
                             cx,
                         );
                     }
@@ -352,7 +362,7 @@ impl Console {
                     .child(
                         div()
                             .px_1()
-                            .child(Icon::new(IconName::ChevronDownSmall).size(IconSize::XSmall)),
+                            .child(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
                     ),
             )
             .when(
@@ -365,9 +375,9 @@ impl Console {
                         Some(ContextMenu::build(window, cx, |context_menu, _, _| {
                             context_menu
                                 .when_some(keybinding_target.clone(), |el, keybinding_target| {
-                                    el.context(keybinding_target.clone())
+                                    el.context(keybinding_target)
                                 })
-                                .action("Watch expression", WatchExpression.boxed_clone())
+                                .action("Watch Expression", WatchExpression.boxed_clone())
                         }))
                     })
                 },
@@ -452,18 +462,22 @@ impl Render for Console {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let query_focus_handle = self.query_bar.focus_handle(cx);
         self.update_output(window, cx);
+
         v_flex()
             .track_focus(&self.focus_handle)
             .key_context("DebugConsole")
             .on_action(cx.listener(Self::evaluate))
             .on_action(cx.listener(Self::watch_expression))
             .size_full()
+            .border_2()
+            .bg(cx.theme().colors().editor_background)
             .child(self.render_console(cx))
             .when(self.is_running(cx), |this| {
                 this.child(Divider::horizontal()).child(
                     h_flex()
                         .on_action(cx.listener(Self::previous_query))
                         .on_action(cx.listener(Self::next_query))
+                        .p_1()
                         .gap_1()
                         .bg(cx.theme().colors().editor_background)
                         .child(self.render_query_bar(cx))
@@ -474,22 +488,21 @@ impl Render for Console {
                             .on_click(move |_, window, cx| {
                                 window.dispatch_action(Box::new(Confirm), cx)
                             })
+                            .layer(ui::ElevationIndex::ModalSurface)
+                            .size(ui::ButtonSize::Compact)
+                            .child(Label::new("Evaluate"))
                             .tooltip({
                                 let query_focus_handle = query_focus_handle.clone();
 
-                                move |window, cx| {
+                                move |_window, cx| {
                                     Tooltip::for_action_in(
                                         "Evaluate",
                                         &Confirm,
                                         &query_focus_handle,
-                                        window,
                                         cx,
                                     )
                                 }
-                            })
-                            .layer(ui::ElevationIndex::ModalSurface)
-                            .size(ui::ButtonSize::Compact)
-                            .child(Label::new("Evaluate")),
+                            }),
                             self.render_submit_menu(
                                 ElementId::Name("split-button-right-confirm-button".into()),
                                 Some(query_focus_handle.clone()),
@@ -499,7 +512,6 @@ impl Render for Console {
                         )),
                 )
             })
-            .border_2()
     }
 }
 
@@ -540,24 +552,12 @@ impl CompletionProvider for ConsoleQueryBarCompletionProvider {
         }
     }
 
-    fn apply_additional_edits_for_completion(
-        &self,
-        _buffer: Entity<Buffer>,
-        _completions: Rc<RefCell<Box<[Completion]>>>,
-        _completion_index: usize,
-        _push_to_history: bool,
-        _cx: &mut Context<Editor>,
-    ) -> gpui::Task<anyhow::Result<Option<language::Transaction>>> {
-        Task::ready(Ok(None))
-    }
-
     fn is_completion_trigger(
         &self,
         buffer: &Entity<Buffer>,
         position: language::Anchor,
         text: &str,
         trigger_in_words: bool,
-        menu_is_open: bool,
         cx: &mut Context<Editor>,
     ) -> bool {
         let mut chars = text.chars();
@@ -568,11 +568,10 @@ impl CompletionProvider for ConsoleQueryBarCompletionProvider {
         };
 
         let snapshot = buffer.read(cx).snapshot();
-        if !menu_is_open && !snapshot.settings_at(position, cx).show_completions_on_input {
-            return false;
-        }
 
-        let classifier = snapshot.char_classifier_at(position).for_completion(true);
+        let classifier = snapshot
+            .char_classifier_at(position)
+            .scope_context(Some(CharScopeContext::Completion));
         if trigger_in_words && classifier.is_word(char) {
             return true;
         }
@@ -608,17 +607,16 @@ impl ConsoleQueryBarCompletionProvider {
             for variable in console.variable_list.update(cx, |variable_list, cx| {
                 variable_list.completion_variables(cx)
             }) {
-                if let Some(evaluate_name) = &variable.evaluate_name {
-                    if variables
+                if let Some(evaluate_name) = &variable.evaluate_name
+                    && variables
                         .insert(evaluate_name.clone(), variable.value.clone())
                         .is_none()
-                    {
-                        string_matches.push(StringMatchCandidate {
-                            id: 0,
-                            string: evaluate_name.clone(),
-                            char_bag: evaluate_name.chars().collect(),
-                        });
-                    }
+                {
+                    string_matches.push(StringMatchCandidate {
+                        id: 0,
+                        string: evaluate_name.clone(),
+                        char_bag: evaluate_name.chars().collect(),
+                    });
                 }
 
                 if variables
@@ -665,11 +663,9 @@ impl ConsoleQueryBarCompletionProvider {
                             &snapshot,
                         ),
                         new_text: string_match.string.clone(),
-                        label: CodeLabel {
-                            filter_range: 0..string_match.string.len(),
-                            text: string_match.string.clone(),
-                            runs: Vec::new(),
-                        },
+                        label: CodeLabel::plain(string_match.string.clone(), None),
+                        match_start: None,
+                        snippet_deduplication_key: None,
                         icon_path: None,
                         documentation: Some(CompletionDocumentation::MultiLineMarkdown(
                             variable_value.into(),
@@ -683,6 +679,7 @@ impl ConsoleQueryBarCompletionProvider {
 
             Ok(vec![project::CompletionResponse {
                 is_incomplete: completions.len() >= LIMIT,
+                display_options: CompletionDisplayOptions::default(),
                 completions,
             }])
         })
@@ -694,7 +691,7 @@ impl ConsoleQueryBarCompletionProvider {
         new_bytes: &[u8],
         snapshot: &TextBufferSnapshot,
     ) -> Range<Anchor> {
-        let buffer_offset = buffer_position.to_offset(&snapshot);
+        let buffer_offset = buffer_position.to_offset(snapshot);
         let buffer_bytes = &buffer_text.as_bytes()[0..buffer_offset];
 
         let mut prefix_len = 0;
@@ -777,15 +774,13 @@ impl ConsoleQueryBarCompletionProvider {
                             &snapshot,
                         ),
                         new_text,
-                        label: CodeLabel {
-                            filter_range: 0..completion.label.len(),
-                            text: completion.label,
-                            runs: Vec::new(),
-                        },
+                        label: CodeLabel::plain(completion.label, None),
                         icon_path: None,
                         documentation: completion.detail.map(|detail| {
                             CompletionDocumentation::MultiLineMarkdown(detail.into())
                         }),
+                        match_start: None,
+                        snippet_deduplication_key: None,
                         confirm: None,
                         source: project::CompletionSource::Dap { sort_text },
                         insert_text_mode: None,
@@ -795,6 +790,7 @@ impl ConsoleQueryBarCompletionProvider {
 
             Ok(vec![project::CompletionResponse {
                 completions,
+                display_options: CompletionDisplayOptions::default(),
                 is_incomplete: false,
             }])
         })
@@ -952,7 +948,7 @@ fn color_fetcher(color: ansi::Color) -> fn(&Theme) -> Hsla {
 mod tests {
     use super::*;
     use crate::tests::init_test;
-    use editor::test::editor_test_context::EditorTestContext;
+    use editor::{MultiBufferOffset, test::editor_test_context::EditorTestContext};
     use gpui::TestAppContext;
     use language::Point;
 
@@ -965,8 +961,12 @@ mod tests {
     ) {
         cx.set_state(input);
 
-        let buffer_position =
-            cx.editor(|editor, _, cx| editor.selections.newest::<Point>(cx).start);
+        let buffer_position = cx.editor(|editor, _, cx| {
+            editor
+                .selections
+                .newest::<Point>(&editor.display_snapshot(cx))
+                .start
+        });
 
         let snapshot = &cx.buffer_snapshot();
 
@@ -974,14 +974,14 @@ mod tests {
             &cx.buffer_text(),
             snapshot.anchor_before(buffer_position),
             replacement.as_bytes(),
-            &snapshot,
+            snapshot,
         );
 
         cx.update_editor(|editor, _, cx| {
             editor.edit(
                 vec![(
-                    snapshot.offset_for_anchor(&replace_range.start)
-                        ..snapshot.offset_for_anchor(&replace_range.end),
+                    MultiBufferOffset(snapshot.offset_for_anchor(&replace_range.start))
+                        ..MultiBufferOffset(snapshot.offset_for_anchor(&replace_range.end)),
                     replacement,
                 )],
                 cx,

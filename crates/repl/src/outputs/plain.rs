@@ -22,7 +22,7 @@ use alacritty_terminal::{
     term::Config,
     vte::ansi::Processor,
 };
-use gpui::{Bounds, ClipboardItem, Entity, FontStyle, TextStyle, WhiteSpace, canvas, size};
+use gpui::{Bounds, ClipboardItem, Entity, FontStyle, Pixels, TextStyle, WhiteSpace, canvas, size};
 use language::Buffer;
 use settings::Settings as _;
 use terminal::terminal_settings::TerminalSettings;
@@ -31,6 +31,7 @@ use theme::ThemeSettings;
 use ui::{IntoElement, prelude::*};
 
 use crate::outputs::OutputContent;
+use crate::repl_settings::ReplSettings;
 
 /// The `TerminalOutput` struct handles the parsing and rendering of text input,
 /// simulating a basic terminal environment within REPL output.
@@ -53,11 +54,8 @@ pub struct TerminalOutput {
     handler: alacritty_terminal::Term<VoidListener>,
 }
 
-const DEFAULT_NUM_LINES: usize = 32;
-const DEFAULT_NUM_COLUMNS: usize = 128;
-
 /// Returns the default text style for the terminal output.
-pub fn text_style(window: &mut Window, cx: &mut App) -> TextStyle {
+pub fn text_style(window: &mut Window, cx: &App) -> TextStyle {
     let settings = ThemeSettings::get_global(cx).clone();
 
     let font_size = settings.buffer_font_size(cx).into();
@@ -68,7 +66,7 @@ pub fn text_style(window: &mut Window, cx: &mut App) -> TextStyle {
 
     let theme = cx.theme();
 
-    let text_style = TextStyle {
+    TextStyle {
         font_family,
         font_features,
         font_weight,
@@ -81,9 +79,7 @@ pub fn text_style(window: &mut Window, cx: &mut App) -> TextStyle {
         // These are going to be overridden per-cell
         color: theme.colors().terminal_foreground,
         ..Default::default()
-    };
-
-    text_style
+    }
 }
 
 /// Returns the default terminal size for the terminal output.
@@ -98,11 +94,11 @@ pub fn terminal_size(window: &mut Window, cx: &mut App) -> terminal::TerminalBou
 
     let cell_width = text_system
         .advance(font_id, font_pixels, 'w')
-        .unwrap()
-        .width;
+        .map(|advance| advance.width)
+        .unwrap_or(Pixels::ZERO);
 
-    let num_lines = DEFAULT_NUM_LINES;
-    let columns = DEFAULT_NUM_COLUMNS;
+    let num_lines = ReplSettings::get_global(cx).max_lines;
+    let columns = ReplSettings::get_global(cx).max_columns;
 
     // Reversed math from terminal::TerminalSize to get pixel width according to terminal width
     let width = columns as f32 * cell_width;
@@ -116,6 +112,27 @@ pub fn terminal_size(window: &mut Window, cx: &mut App) -> terminal::TerminalBou
             size: size(width, height),
         },
     }
+}
+
+pub fn max_width_for_columns(
+    columns: usize,
+    window: &mut Window,
+    cx: &App,
+) -> Option<gpui::Pixels> {
+    if columns == 0 {
+        return None;
+    }
+
+    let text_style = text_style(window, cx);
+    let text_system = window.text_system();
+    let font_pixels = text_style.font_size.to_pixels(window.rem_size());
+    let font_id = text_system.resolve_font(&text_style.font());
+    let cell_width = text_system
+        .advance(font_id, font_pixels, 'w')
+        .map(|advance| advance.width)
+        .unwrap_or(Pixels::ZERO);
+
+    Some(cell_width * columns as f32)
 }
 
 impl TerminalOutput {
@@ -173,9 +190,9 @@ impl TerminalOutput {
     ///
     /// Then append_text will be called twice, with the following arguments:
     ///
-    /// ```rust
-    /// terminal_output.append_text("Hello,")
-    /// terminal_output.append_text(" world!")
+    /// ```ignore
+    /// terminal_output.append_text("Hello,");
+    /// terminal_output.append_text(" world!");
     /// ```
     /// Resulting in a single output of "Hello, world!".
     ///
@@ -201,8 +218,17 @@ impl TerminalOutput {
         }
     }
 
-    fn full_text(&self) -> String {
-        let mut full_text = String::new();
+    pub fn full_text(&self) -> String {
+        fn sanitize(mut line: String) -> Option<String> {
+            line.retain(|ch| ch != '\u{0}' && ch != '\r');
+            if line.trim().is_empty() {
+                return None;
+            }
+            let trimmed = line.trim_end_matches([' ', '\t']);
+            Some(trimmed.to_owned())
+        }
+
+        let mut lines = Vec::new();
 
         // Get the total number of lines, including history
         let total_lines = self.handler.grid().total_lines();
@@ -214,11 +240,8 @@ impl TerminalOutput {
             let line_index = Line(-(line as i32) - 1);
             let start = Point::new(line_index, Column(0));
             let end = Point::new(line_index, Column(self.handler.columns() - 1));
-            let line_content = self.handler.bounds_to_string(start, end);
-
-            if !line_content.trim().is_empty() {
-                full_text.push_str(&line_content);
-                full_text.push('\n');
+            if let Some(cleaned) = sanitize(self.handler.bounds_to_string(start, end)) {
+                lines.push(cleaned);
             }
         }
 
@@ -227,16 +250,66 @@ impl TerminalOutput {
             let line_index = Line(line as i32);
             let start = Point::new(line_index, Column(0));
             let end = Point::new(line_index, Column(self.handler.columns() - 1));
-            let line_content = self.handler.bounds_to_string(start, end);
-
-            if !line_content.trim().is_empty() {
-                full_text.push_str(&line_content);
-                full_text.push('\n');
+            if let Some(cleaned) = sanitize(self.handler.bounds_to_string(start, end)) {
+                lines.push(cleaned);
             }
         }
 
-        // Trim any trailing newlines
-        full_text.trim_end().to_string()
+        if lines.is_empty() {
+            String::new()
+        } else {
+            let mut full_text = lines.join("\n");
+            full_text.push('\n');
+            full_text
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{TestAppContext, VisualTestContext};
+    use settings::SettingsStore;
+
+    fn init_test(cx: &mut TestAppContext) -> &mut VisualTestContext {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme::init(theme::LoadThemes::JustBase, cx);
+        });
+        cx.add_empty_window()
+    }
+
+    #[gpui::test]
+    fn test_max_width_for_columns_zero(cx: &mut TestAppContext) {
+        let cx = init_test(cx);
+        let result = cx.update(|window, cx| max_width_for_columns(0, window, cx));
+        assert!(result.is_none());
+    }
+
+    #[gpui::test]
+    fn test_max_width_for_columns_matches_cell_width(cx: &mut TestAppContext) {
+        let cx = init_test(cx);
+        let columns = 5;
+        let (result, expected) = cx.update(|window, cx| {
+            let text_style = text_style(window, cx);
+            let text_system = window.text_system();
+            let font_pixels = text_style.font_size.to_pixels(window.rem_size());
+            let font_id = text_system.resolve_font(&text_style.font());
+            let cell_width = text_system
+                .advance(font_id, font_pixels, 'w')
+                .map(|advance| advance.width)
+                .unwrap_or(gpui::Pixels::ZERO);
+            let result = max_width_for_columns(columns, window, cx);
+            (result, cell_width * columns as f32)
+        });
+
+        let Some(result) = result else {
+            panic!("expected max width for columns {columns}");
+        };
+        let result_f32: f32 = result.into();
+        let expected_f32: f32 = expected.into();
+        assert!((result_f32 - expected_f32).abs() < 0.01);
     }
 }
 
@@ -278,7 +351,7 @@ impl Render for TerminalOutput {
         let cell_width = text_system
             .advance(font_id, font_pixels, 'w')
             .map(|advance| advance.width)
-            .unwrap_or(Pixels(0.0));
+            .unwrap_or(Pixels::ZERO);
 
         canvas(
             // prepaint

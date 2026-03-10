@@ -11,17 +11,19 @@ use gpui::BackgroundExecutor;
 use language::LanguageName;
 use language::{BinaryStatus, language_settings::AllLanguageSettings};
 use project::project_settings::ProjectSettings;
-use semantic_version::SemanticVersion;
+use semver::Version;
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
 };
+use util::paths::PathStyle;
+use util::rel_path::RelPath;
 use util::{archive::extract_zip, fs::make_file_executable, maybe};
 use wasmtime::component::{Linker, Resource};
 
-use super::latest;
+use super::{latest, since_v0_6_0};
 
-pub const MIN_VERSION: SemanticVersion = SemanticVersion::new(0, 1, 0);
+pub const MIN_VERSION: Version = Version::new(0, 1, 0);
 
 wasmtime::component::bindgen!({
     async: true,
@@ -31,7 +33,7 @@ wasmtime::component::bindgen!({
          "worktree": ExtensionWorktree,
          "key-value-store": ExtensionKeyValueStore,
          "zed:extension/http-client/http-response-stream": ExtensionHttpResponseStream,
-         "zed:extension/github": latest::zed::extension::github,
+         "zed:extension/github": since_v0_6_0::zed::extension::github,
          "zed:extension/nodejs": latest::zed::extension::nodejs,
          "zed:extension/platform": latest::zed::extension::platform,
          "zed:extension/slash-command": latest::zed::extension::slash_command,
@@ -421,11 +423,15 @@ impl ExtensionImports for WasmState {
     ) -> wasmtime::Result<Result<String, String>> {
         self.on_main_thread(|cx| {
             async move {
-                let location = location
+                let path = location.as_ref().and_then(|location| {
+                    RelPath::new(Path::new(&location.path), PathStyle::Posix).ok()
+                });
+                let location = path
                     .as_ref()
-                    .map(|location| ::settings::SettingsLocation {
+                    .zip(location.as_ref())
+                    .map(|(path, location)| ::settings::SettingsLocation {
                         worktree_id: WorktreeId::from_proto(location.worktree_id),
-                        path: Path::new(&location.path),
+                        path,
                     });
 
                 cx.update(|cx| match category.as_str() {
@@ -465,7 +471,7 @@ impl ExtensionImports for WasmState {
             }
             .boxed_local()
         })
-        .await?
+        .await
         .to_wasmtime_result()
     }
 
@@ -502,7 +508,8 @@ impl ExtensionImports for WasmState {
 
             let destination_path = self
                 .host
-                .writeable_path_from_extension(&self.manifest.id, &path)?;
+                .writeable_path_from_extension(&self.manifest.id, &path)
+                .await?;
 
             let mut response = self
                 .host
@@ -514,7 +521,7 @@ impl ExtensionImports for WasmState {
             anyhow::ensure!(
                 response.status().is_success(),
                 "download failed with status {}",
-                response.status().to_string()
+                response.status()
             );
             let body = BufReader::new(response.body_mut());
 
@@ -559,7 +566,8 @@ impl ExtensionImports for WasmState {
     async fn make_file_executable(&mut self, path: String) -> wasmtime::Result<Result<(), String>> {
         let path = self
             .host
-            .writeable_path_from_extension(&self.manifest.id, Path::new(&path))?;
+            .writeable_path_from_extension(&self.manifest.id, Path::new(&path))
+            .await?;
 
         make_file_executable(&path)
             .await

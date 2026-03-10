@@ -1,13 +1,16 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+
 use std::{
     ops::{Deref, DerefMut},
     sync::Arc,
 };
 
 use gpui::{
-    AbsoluteLength, App, Application, Context, DefiniteLength, ElementId, Global, Hsla, Menu,
-    SharedString, TextStyle, TitlebarOptions, Window, WindowBounds, WindowOptions, bounds,
-    colors::DefaultColors, div, point, prelude::*, px, relative, rgb, size,
+    AbsoluteLength, App, Context, DefiniteLength, ElementId, Global, Hsla, Menu, SharedString,
+    TextStyle, TitlebarOptions, Window, WindowBounds, WindowOptions, bounds, colors::DefaultColors,
+    div, point, prelude::*, px, relative, rgb, size,
 };
+use gpui_platform::application;
 use std::iter;
 
 #[derive(Clone, Debug)]
@@ -132,11 +135,11 @@ impl RenderOnce for Specimen {
         let mut line_height = global_style.line_height;
 
         if let Some(style_override) = style_override {
-            font_size = style_override.font_size.to_pixels(rem_size).0;
+            font_size = style_override.font_size.to_pixels(rem_size).into();
             line_height = match style_override.line_height {
                 DefiniteLength::Absolute(absolute_len) => match absolute_len {
-                    AbsoluteLength::Rems(absolute_len) => absolute_len.to_pixels(rem_size).0,
-                    AbsoluteLength::Pixels(absolute_len) => absolute_len.0,
+                    AbsoluteLength::Rems(absolute_len) => absolute_len.to_pixels(rem_size).into(),
+                    AbsoluteLength::Pixels(absolute_len) => absolute_len.into(),
                 },
                 DefiniteLength::Fraction(value) => value,
             };
@@ -155,7 +158,7 @@ impl RenderOnce for Specimen {
             .text_size(px(font_size * scale))
             .line_height(relative(line_height))
             .p(px(10.0))
-            .child(self.string.clone())
+            .child(self.string)
     }
 }
 
@@ -198,7 +201,7 @@ impl RenderOnce for CharacterGrid {
             "χ", "ψ", "∂", "а", "в", "Ж", "ж", "З", "з", "К", "к", "л", "м", "Н", "н", "Р", "р",
             "У", "у", "ф", "ч", "ь", "ы", "Э", "э", "Я", "я", "ij", "öẋ", ".,", "⣝⣑", "~", "*",
             "_", "^", "`", "'", "(", "{", "«", "#", "&", "@", "$", "¢", "%", "|", "?", "¶", "µ",
-            "❮", "<=", "!=", "==", "--", "++", "=>", "->",
+            "❮", "<=", "!=", "==", "--", "++", "=>", "->", "🏀", "🎊", "😍", "❤️", "👍", "👎",
         ];
 
         let columns = 11;
@@ -297,8 +300,8 @@ impl Render for TextExample {
     }
 }
 
-fn main() {
-    Application::new().run(|cx: &mut App| {
+fn run_example() {
+    application().run(|cx: &mut App| {
         cx.set_menus(vec![Menu {
             name: "GPUI Typography".into(),
             items: vec![],
@@ -330,4 +333,16 @@ fn main() {
             })
             .unwrap();
     });
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn main() {
+    run_example();
+}
+
+#[cfg(target_family = "wasm")]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+pub fn start() {
+    gpui_platform::web_init();
+    run_example();
 }

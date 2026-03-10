@@ -11,6 +11,7 @@ pub(super) fn bash_task_context() -> ContextProviderWithTasks {
         TaskTemplate {
             label: format!("run '{}'", VariableName::File.template_value()),
             command: VariableName::File.template_value(),
+            tags: vec!["bash-script".to_owned()],
             ..TaskTemplate::default()
         },
     ]))
@@ -19,7 +20,7 @@ pub(super) fn bash_task_context() -> ContextProviderWithTasks {
 #[cfg(test)]
 mod tests {
     use gpui::{AppContext as _, BorrowAppContext, Context, TestAppContext};
-    use language::{AutoindentMode, Buffer, language_settings::AllLanguageSettings};
+    use language::{AutoindentMode, Buffer};
     use settings::SettingsStore;
     use std::num::NonZeroU32;
     use unindent::Unindent;
@@ -32,10 +33,9 @@ mod tests {
         cx.update(|cx| {
             let test_settings = SettingsStore::test(cx);
             cx.set_global(test_settings);
-            language::init(cx);
             cx.update_global::<SettingsStore, _>(|store, cx| {
-                store.update_user_settings::<AllLanguageSettings>(cx, |s| {
-                    s.defaults.tab_size = NonZeroU32::new(2)
+                store.update_user_settings(cx, |s| {
+                    s.project.all_languages.defaults.tab_size = NonZeroU32::new(2)
                 });
             });
         });
@@ -45,7 +45,11 @@ mod tests {
 
             let expect_indents_to =
                 |buffer: &mut Buffer, cx: &mut Context<Buffer>, input: &str, expected: &str| {
-                    buffer.edit( [(0..buffer.len(), input)], Some(AutoindentMode::EachLine), cx, );
+                    buffer.edit(
+                        [(0..buffer.len(), input)],
+                        Some(AutoindentMode::EachLine),
+                        cx,
+                    );
                     assert_eq!(buffer.text(), expected);
                 };
 

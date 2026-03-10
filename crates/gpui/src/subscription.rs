@@ -1,11 +1,11 @@
 use collections::{BTreeMap, BTreeSet};
+use gpui_util::post_inc;
 use std::{
     cell::{Cell, RefCell},
     fmt::Debug,
     mem,
     rc::Rc,
 };
-use util::post_inc;
 
 pub(crate) struct SubscriberSet<EmitterKey, Callback>(
     Rc<RefCell<SubscriberSetState<EmitterKey, Callback>>>,
@@ -199,5 +199,11 @@ impl Drop for Subscription {
         if let Some(unsubscribe) = self.unsubscribe.take() {
             unsubscribe();
         }
+    }
+}
+
+impl std::fmt::Debug for Subscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Subscription").finish()
     }
 }

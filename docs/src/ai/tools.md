@@ -1,12 +1,23 @@
+---
+title: AI Agent Tools - Zed
+description: Built-in tools for Zed's AI agent including file editing, code search, terminal commands, web search, and diagnostics.
+---
+
 # Tools
 
-Zed's Agent has access to a variety of tools that allow it to interact with your codebase and perform tasks.
+Zed's built-in agent has access to these tools for reading, searching, and editing your codebase. These tools are used in the [Agent Panel](./agent-panel.md) during conversations with AI agents.
+
+You can configure permissions for tool actions, including situations where they are automatically approved, automatically denied, or require your confirmation on a case-by-case basis. See [Tool Permissions](./tool-permissions.md) for the list of permission-gated tools and details.
+
+To add custom tools beyond these built-in ones, see [MCP servers](./mcp.md).
 
 ## Read & Search Tools
 
 ### `diagnostics`
 
 Gets errors and warnings for either a specific file or the entire project, useful after making edits to determine if further changes are needed.
+When a path is provided, shows all diagnostics for that specific file.
+When no path is provided, shows a summary of error and warning counts for all files in the project.
 
 ### `fetch`
 
@@ -54,10 +65,6 @@ Copies a file or directory recursively in the project, more efficient than manua
 
 Creates a new directory at the specified path within the project, creating all necessary parent directories (similar to `mkdir -p`).
 
-### `create_file`
-
-Creates a new file at a specified path with given text content, the most efficient way to create new files or completely replace existing ones.
-
 ### `delete_path`
 
 Deletes a file or directory (including contents recursively) at the specified path and confirms the deletion.
@@ -70,6 +77,20 @@ Edits files by replacing specific text with new content.
 
 Moves or renames a file or directory in the project, performing a rename if only the filename differs.
 
+### `restore_file_from_disk`
+
+Discards unsaved changes in open buffers by reloading file contents from disk. Useful for resetting files to their on-disk state before retrying an edit.
+
+### `save_file`
+
+Saves files that have unsaved changes. Used when files need to be saved before further edits can be made.
+
 ### `terminal`
 
 Executes shell commands and returns the combined output, creating a new shell process for each invocation.
+
+## Other Tools
+
+### `spawn_agent`
+
+Spawns a subagent with its own context window to perform a delegated task. Each subagent has access to the same tools as the parent agent.

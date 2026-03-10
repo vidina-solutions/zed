@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use collections::FxHashMap;
-use gpui::{App, Global, SharedString};
+use gpui::{App, BackgroundExecutor, Global, SharedString};
 use language::LanguageName;
 use parking_lot::RwLock;
 use task::{
@@ -23,7 +23,11 @@ pub trait DapLocator: Send + Sync {
         adapter: &DebugAdapterName,
     ) -> Option<DebugScenario>;
 
-    async fn run(&self, build_config: SpawnInTerminal) -> Result<DebugRequest>;
+    async fn run(
+        &self,
+        build_config: SpawnInTerminal,
+        executor: BackgroundExecutor,
+    ) -> Result<DebugRequest>;
 }
 
 #[derive(Default)]
@@ -46,6 +50,7 @@ impl DapRegistry {
         let name = adapter.name();
         let _previous_value = self.0.write().adapters.insert(name, adapter);
     }
+
     pub fn add_locator(&self, locator: Arc<dyn DapLocator>) {
         self.0.write().locators.insert(locator.name(), locator);
     }
@@ -63,19 +68,19 @@ impl DapRegistry {
             .and_then(|adapter| adapter.adapter_language_name())
     }
 
-    pub async fn adapters_schema(&self) -> task::AdapterSchemas {
-        let mut schemas = AdapterSchemas(vec![]);
+    pub fn adapters_schema(&self) -> task::AdapterSchemas {
+        let mut schemas = vec![];
 
-        let adapters = self.0.read().adapters.clone();
+        let adapters = &self.0.read().adapters;
 
         for (name, adapter) in adapters.into_iter() {
-            schemas.0.push(AdapterSchema {
-                adapter: name.into(),
+            schemas.push(AdapterSchema {
+                adapter: name.clone().into(),
                 schema: adapter.dap_schema(),
             });
         }
 
-        schemas
+        AdapterSchemas(schemas)
     }
 
     pub fn locators(&self) -> FxHashMap<SharedString, Arc<dyn DapLocator>> {
@@ -86,7 +91,7 @@ impl DapRegistry {
         self.0.read().adapters.get(name).cloned()
     }
 
-    pub fn enumerate_adapters(&self) -> Vec<DebugAdapterName> {
+    pub fn enumerate_adapters<B: FromIterator<DebugAdapterName>>(&self) -> B {
         self.0.read().adapters.keys().cloned().collect()
     }
 }

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::pin::Pin;
 
 use anyhow::{Context as _, Result};
@@ -7,9 +8,12 @@ use futures::{
     AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, Stream, StreamExt as _,
 };
 use gpui::AsyncApp;
+use settings::Settings as _;
 use smol::channel;
 use smol::process::Child;
+use terminal::terminal_settings::TerminalSettings;
 use util::TryFutureExt as _;
+use util::shell_builder::ShellBuilder;
 
 use crate::client::ModelContextServerBinary;
 use crate::transport::Transport;
@@ -22,22 +26,30 @@ pub struct StdioTransport {
 }
 
 impl StdioTransport {
-    pub fn new(binary: ModelContextServerBinary, cx: &AsyncApp) -> Result<Self> {
-        let mut command = util::command::new_smol_command(&binary.executable);
+    pub fn new(
+        binary: ModelContextServerBinary,
+        working_directory: &Option<PathBuf>,
+        cx: &AsyncApp,
+    ) -> Result<Self> {
+        let shell = cx.update(|cx| TerminalSettings::get(None, cx).shell.clone());
+        let builder = ShellBuilder::new(&shell, cfg!(windows)).non_interactive();
+        let mut command =
+            builder.build_smol_command(Some(binary.executable.display().to_string()), &binary.args);
+
         command
-            .args(&binary.args)
             .envs(binary.env.unwrap_or_default())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
 
-        let mut server = command.spawn().with_context(|| {
-            format!(
-                "failed to spawn command. (path={:?}, args={:?})",
-                binary.executable, &binary.args
-            )
-        })?;
+        if let Some(working_directory) = working_directory {
+            command.current_dir(working_directory);
+        }
+
+        let mut server = command
+            .spawn()
+            .with_context(|| format!("failed to spawn command {command:?})",))?;
 
         let stdin = server.stdin.take().unwrap();
         let stdout = server.stdout.take().unwrap();

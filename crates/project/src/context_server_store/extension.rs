@@ -38,14 +38,14 @@ fn extension_project(
     worktree_store: Entity<WorktreeStore>,
     cx: &mut AsyncApp,
 ) -> Result<Arc<ExtensionProject>> {
-    worktree_store.update(cx, |worktree_store, cx| {
+    Ok(worktree_store.update(cx, |worktree_store, cx| {
         Arc::new(ExtensionProject {
             worktree_ids: worktree_store
                 .visible_worktrees(cx)
                 .map(|worktree| worktree.read(cx).id().to_proto())
                 .collect(),
         })
-    })
+    }))
 }
 
 impl registry::ContextServerDescriptor for ContextServerDescriptor {
@@ -61,17 +61,15 @@ impl registry::ContextServerDescriptor for ContextServerDescriptor {
             let mut command = extension
                 .context_server_command(id.clone(), extension_project.clone())
                 .await?;
-            command.command = extension
-                .path_from_extension(command.command.as_ref())
-                .to_string_lossy()
-                .to_string();
+            command.command = extension.path_from_extension(&command.command);
 
-            log::info!("loaded command for context server {id}: {command:?}");
+            log::debug!("loaded command for context server {id}: {command:?}");
 
             Ok(ContextServerCommand {
                 path: command.command,
                 args: command.args,
                 env: Some(command.env.into_iter().collect()),
+                timeout: None,
             })
         })
     }

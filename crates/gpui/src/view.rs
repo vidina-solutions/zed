@@ -25,59 +25,6 @@ struct ViewCacheKey {
     text_style: TextStyle,
 }
 
-impl<V: Render> Element for Entity<V> {
-    type RequestLayoutState = AnyElement;
-    type PrepaintState = ();
-
-    fn id(&self) -> Option<ElementId> {
-        Some(ElementId::View(self.entity_id()))
-    }
-
-    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (LayoutId, Self::RequestLayoutState) {
-        let mut element = self.update(cx, |view, cx| view.render(window, cx).into_any_element());
-        let layout_id = window.with_rendered_view(self.entity_id(), |window| {
-            element.request_layout(window, cx)
-        });
-        (layout_id, element)
-    }
-
-    fn prepaint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        _: Bounds<Pixels>,
-        element: &mut Self::RequestLayoutState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        window.set_view_id(self.entity_id());
-        window.with_rendered_view(self.entity_id(), |window| element.prepaint(window, cx));
-    }
-
-    fn paint(
-        &mut self,
-        _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&InspectorElementId>,
-        _: Bounds<Pixels>,
-        element: &mut Self::RequestLayoutState,
-        _: &mut Self::PrepaintState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        window.with_rendered_view(self.entity_id(), |window| element.paint(window, cx));
-    }
-}
-
 /// A dynamically-typed handle to a view, which can be downcast to a [Entity] for a specific type.
 #[derive(Clone, Debug)]
 pub struct AnyView {
@@ -205,22 +152,21 @@ impl Element for AnyView {
                     let content_mask = window.content_mask();
                     let text_style = window.text_style();
 
-                    if let Some(mut element_state) = element_state {
-                        if element_state.cache_key.bounds == bounds
-                            && element_state.cache_key.content_mask == content_mask
-                            && element_state.cache_key.text_style == text_style
-                            && !window.dirty_views.contains(&self.entity_id())
-                            && !window.refreshing
-                        {
-                            let prepaint_start = window.prepaint_index();
-                            window.reuse_prepaint(element_state.prepaint_range.clone());
-                            cx.entities
-                                .extend_accessed(&element_state.accessed_entities);
-                            let prepaint_end = window.prepaint_index();
-                            element_state.prepaint_range = prepaint_start..prepaint_end;
+                    if let Some(mut element_state) = element_state
+                        && element_state.cache_key.bounds == bounds
+                        && element_state.cache_key.content_mask == content_mask
+                        && element_state.cache_key.text_style == text_style
+                        && !window.dirty_views.contains(&self.entity_id())
+                        && !window.refreshing
+                    {
+                        let prepaint_start = window.prepaint_index();
+                        window.reuse_prepaint(element_state.prepaint_range.clone());
+                        cx.entities
+                            .extend_accessed(&element_state.accessed_entities);
+                        let prepaint_end = window.prepaint_index();
+                        element_state.prepaint_range = prepaint_start..prepaint_end;
 
-                            return (None, element_state);
-                        }
+                        return (None, element_state);
                     }
 
                     let refreshing = mem::replace(&mut window.refreshing, true);
@@ -295,10 +241,10 @@ impl Element for AnyView {
 }
 
 impl<V: 'static + Render> IntoElement for Entity<V> {
-    type Element = Entity<V>;
+    type Element = AnyView;
 
     fn into_element(self) -> Self::Element {
-        self
+        self.into()
     }
 }
 

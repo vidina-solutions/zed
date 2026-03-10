@@ -5,33 +5,28 @@ mod env_config;
 pub mod filter;
 pub mod sink;
 
-pub use sink::{flush, init_output_file, init_output_stdout};
+pub use sink::{flush, init_output_file, init_output_stderr, init_output_stdout};
 
 pub const SCOPE_DEPTH_MAX: usize = 4;
 
 pub fn init() {
-    match try_init() {
-        Err(err) => {
-            log::error!("{err}");
-            eprintln!("{err}");
-        }
-        Ok(()) => {}
+    if let Err(err) = try_init(None) {
+        log::error!("{err}");
+        eprintln!("{err}");
     }
 }
 
-pub fn try_init() -> anyhow::Result<()> {
+pub fn try_init(filter: Option<String>) -> anyhow::Result<()> {
     log::set_logger(&ZLOG)?;
     log::set_max_level(log::LevelFilter::max());
-    process_env();
+    process_env(filter);
     filter::refresh_from_settings(&std::collections::HashMap::default());
     Ok(())
 }
 
 pub fn init_test() {
-    if get_env_config().is_some() {
-        if try_init().is_ok() {
-            init_output_stdout();
-        }
+    if get_env_config().is_some() && try_init(None).is_ok() {
+        init_output_stdout();
     }
 }
 
@@ -39,10 +34,17 @@ fn get_env_config() -> Option<String> {
     std::env::var("ZED_LOG")
         .or_else(|_| std::env::var("RUST_LOG"))
         .ok()
+        .or_else(|| {
+            if std::env::var("CI").is_ok() {
+                Some("info".to_owned())
+            } else {
+                None
+            }
+        })
 }
 
-pub fn process_env() {
-    let Some(env_config) = get_env_config() else {
+pub fn process_env(filter: Option<String>) {
+    let Some(env_config) = get_env_config().or(filter) else {
         return;
     };
     match env_config::parse(&env_config) {
@@ -68,18 +70,21 @@ impl log::Log for Zlog {
         if !self.enabled(record.metadata()) {
             return;
         }
-        let (crate_name_scope, module_scope) = match record.module_path_static() {
+        let module_path = record.module_path().or(record.file());
+        let (crate_name_scope, module_scope) = match module_path {
             Some(module_path) => {
                 let crate_name = private::extract_crate_name_from_module_path(module_path);
-                let crate_name_scope = private::scope_new(&[crate_name]);
-                let module_scope = private::scope_new(&[module_path]);
+                let crate_name_scope = private::scope_ref_new(&[crate_name]);
+                let module_scope = private::scope_ref_new(&[module_path]);
                 (crate_name_scope, module_scope)
             }
-            // TODO: when do we hit this
-            None => (private::scope_new(&[]), private::scope_new(&["*unknown*"])),
+            None => {
+                // TODO: when do we hit this
+                (private::scope_new(&[]), private::scope_new(&["*unknown*"]))
+            }
         };
         let level = record.metadata().level();
-        if !filter::is_scope_enabled(&crate_name_scope, record.module_path(), level) {
+        if !filter::is_scope_enabled(&crate_name_scope, Some(record.target()), level) {
             return;
         }
         sink::submit(sink::Record {
@@ -87,7 +92,8 @@ impl log::Log for Zlog {
             level,
             message: record.args(),
             // PERF(batching): store non-static paths in a cache + leak them and pass static str here
-            module_path: record.module_path().or(record.file()),
+            module_path,
+            line: record.line(),
         });
     }
 
@@ -108,6 +114,7 @@ macro_rules! log {
                 level,
                 message: &format_args!($($arg)+),
                 module_path: Some(module_path!()),
+                line: Some(line!()),
             });
         }
     }
@@ -179,32 +186,34 @@ macro_rules! time {
         $crate::Timer::new($logger, $name)
     };
     ($name:expr) => {
-        time!($crate::default_logger!() => $name)
+        $crate::time!($crate::default_logger!() => $name)
     };
 }
 
 #[macro_export]
 macro_rules! scoped {
     ($parent:expr => $name:expr) => {{
-        let parent = $parent;
-        let name = $name;
-        let mut scope = parent.scope;
-        let mut index = 1; // always have crate/module name
-        while index < scope.len() && !scope[index].is_empty() {
-            index += 1;
-        }
-        if index >= scope.len() {
-            #[cfg(debug_assertions)]
-            {
-                unreachable!("Scope overflow trying to add scope... ignoring scope");
-            }
-        }
-        scope[index] = name;
-        $crate::Logger { scope }
+        $crate::scoped_logger($parent, $name)
     }};
     ($name:expr) => {
         $crate::scoped!($crate::default_logger!() => $name)
     };
+}
+
+pub const fn scoped_logger(parent: Logger, name: &'static str) -> Logger {
+    let mut scope = parent.scope;
+    let mut index = 1; // always have crate/module name
+    while index < scope.len() && !scope[index].is_empty() {
+        index += 1;
+    }
+    if index >= scope.len() {
+        #[cfg(debug_assertions)]
+        {
+            panic!("Scope overflow trying to add scope... ignoring scope");
+        }
+    }
+    scope[index] = name;
+    Logger { scope }
 }
 
 #[macro_export]
@@ -242,10 +251,14 @@ pub mod private {
         let Some((crate_name, _)) = module_path.split_at_checked(index) else {
             return module_path;
         };
-        return crate_name;
+        crate_name
     }
 
     pub const fn scope_new(scopes: &[&'static str]) -> Scope {
+        scope_ref_new(scopes)
+    }
+
+    pub const fn scope_ref_new<'a>(scopes: &[&'a str]) -> ScopeRef<'a> {
         assert!(scopes.len() <= SCOPE_DEPTH_MAX);
         let mut scope = [""; SCOPE_DEPTH_MAX];
         let mut i = 0;
@@ -264,13 +277,14 @@ pub mod private {
     }
 
     pub fn scope_to_alloc(scope: &Scope) -> ScopeAlloc {
-        return scope.map(|s| s.to_string());
+        scope.map(|s| s.to_string())
     }
 }
 
 pub type Scope = [&'static str; SCOPE_DEPTH_MAX];
+pub type ScopeRef<'a> = [&'a str; SCOPE_DEPTH_MAX];
 pub type ScopeAlloc = [String; SCOPE_DEPTH_MAX];
-const SCOPE_STRING_SEP_STR: &'static str = ".";
+const SCOPE_STRING_SEP_STR: &str = ".";
 const SCOPE_STRING_SEP_CHAR: char = '.';
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -288,7 +302,7 @@ impl log::Log for Logger {
             return;
         }
         let level = record.metadata().level();
-        if !filter::is_scope_enabled(&self.scope, record.module_path(), level) {
+        if !filter::is_scope_enabled(&self.scope, Some(record.target()), level) {
             return;
         }
         sink::submit(sink::Record {
@@ -296,6 +310,7 @@ impl log::Log for Logger {
             level,
             message: record.args(),
             module_path: record.module_path(),
+            line: record.line(),
         });
     }
 
@@ -321,18 +336,18 @@ impl Drop for Timer {
 impl Timer {
     #[must_use = "Timer will stop when dropped, the result of this function should be saved in a variable prefixed with `_` if it should stop when dropped"]
     pub fn new(logger: Logger, name: &'static str) -> Self {
-        return Self {
+        Self {
             logger,
             name,
             start_time: std::time::Instant::now(),
             warn_if_longer_than: None,
             done: false,
-        };
+        }
     }
 
     pub fn warn_if_gt(mut self, warn_limit: std::time::Duration) -> Self {
         self.warn_if_longer_than = Some(warn_limit);
-        return self;
+        self
     }
 
     pub fn end(mut self) {
@@ -344,18 +359,18 @@ impl Timer {
             return;
         }
         let elapsed = self.start_time.elapsed();
-        if let Some(warn_limit) = self.warn_if_longer_than {
-            if elapsed > warn_limit {
-                crate::warn!(
-                    self.logger =>
-                    "Timer '{}' took {:?}. Which was longer than the expected limit of {:?}",
-                    self.name,
-                    elapsed,
-                    warn_limit
-                );
-                self.done = true;
-                return;
-            }
+        if let Some(warn_limit) = self.warn_if_longer_than
+            && elapsed > warn_limit
+        {
+            crate::warn!(
+                self.logger =>
+                "Timer '{}' took {:?}. Which was longer than the expected limit of {:?}",
+                self.name,
+                elapsed,
+                warn_limit
+            );
+            self.done = true;
+            return;
         }
         crate::trace!(
             self.logger =>

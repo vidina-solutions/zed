@@ -1,10 +1,13 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+
 use std::{ops::Range, rc::Rc, time::Duration};
 
 use gpui::{
-    App, Application, Bounds, Context, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    Render, SharedString, UniformListScrollHandle, Window, WindowBounds, WindowOptions, canvas,
-    div, point, prelude::*, px, rgb, size, uniform_list,
+    App, Bounds, Context, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
+    SharedString, UniformListScrollHandle, Window, WindowBounds, WindowOptions, canvas, div, point,
+    prelude::*, px, rgb, size, uniform_list,
 };
+use gpui_platform::application;
 
 const TOTAL_ITEMS: usize = 10000;
 const SCROLLBAR_THUMB_WIDTH: Pixels = px(8.);
@@ -38,58 +41,58 @@ pub struct Quote {
 impl Quote {
     pub fn random() -> Self {
         use rand::Rng;
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         // simulate a base price in a realistic range
-        let prev_close = rng.gen_range(100.0..200.0);
-        let change = rng.gen_range(-5.0..5.0);
+        let prev_close = rng.random_range(100.0..200.0);
+        let change = rng.random_range(-5.0..5.0);
         let last_done = prev_close + change;
-        let open = prev_close + rng.gen_range(-3.0..3.0);
-        let high = (prev_close + rng.gen_range::<f64, _>(0.0..10.0)).max(open);
-        let low = (prev_close - rng.gen_range::<f64, _>(0.0..10.0)).min(open);
-        let timestamp = Duration::from_secs(rng.gen_range(0..86400));
-        let volume = rng.gen_range(1_000_000..100_000_000);
+        let open = prev_close + rng.random_range(-3.0..3.0);
+        let high = (prev_close + rng.random_range::<f64, _>(0.0..10.0)).max(open);
+        let low = (prev_close - rng.random_range::<f64, _>(0.0..10.0)).min(open);
+        let timestamp = Duration::from_secs(rng.random_range(0..86400));
+        let volume = rng.random_range(1_000_000..100_000_000);
         let turnover = last_done * volume as f64;
         let symbol = {
             let mut ticker = String::new();
-            if rng.gen_bool(0.5) {
+            if rng.random_bool(0.5) {
                 ticker.push_str(&format!(
                     "{:03}.{}",
-                    rng.gen_range(100..1000),
-                    rng.gen_range(0..10)
+                    rng.random_range(100..1000),
+                    rng.random_range(0..10)
                 ));
             } else {
                 ticker.push_str(&format!(
                     "{}{}",
-                    rng.gen_range('A'..='Z'),
-                    rng.gen_range('A'..='Z')
+                    rng.random_range('A'..='Z'),
+                    rng.random_range('A'..='Z')
                 ));
             }
-            ticker.push_str(&format!(".{}", rng.gen_range('A'..='Z')));
+            ticker.push_str(&format!(".{}", rng.random_range('A'..='Z')));
             ticker
         };
         let name = format!(
             "{} {} - #{}",
             symbol,
-            rng.gen_range(1..100),
-            rng.gen_range(10000..100000)
+            rng.random_range(1..100),
+            rng.random_range(10000..100000)
         );
-        let ttm = rng.gen_range(0.0..10.0);
-        let market_cap = rng.gen_range(1_000_000.0..10_000_000.0);
-        let float_cap = market_cap + rng.gen_range(1_000.0..10_000.0);
-        let shares = rng.gen_range(100.0..1000.0);
+        let ttm = rng.random_range(0.0..10.0);
+        let market_cap = rng.random_range(1_000_000.0..10_000_000.0);
+        let float_cap = market_cap + rng.random_range(1_000.0..10_000.0);
+        let shares = rng.random_range(100.0..1000.0);
         let pb = market_cap / shares;
         let pe = market_cap / shares;
         let eps = market_cap / shares;
-        let dividend = rng.gen_range(0.0..10.0);
-        let dividend_yield = rng.gen_range(0.0..10.0);
-        let dividend_per_share = rng.gen_range(0.0..10.0);
+        let dividend = rng.random_range(0.0..10.0);
+        let dividend_yield = rng.random_range(0.0..10.0);
+        let dividend_per_share = rng.random_range(0.0..10.0);
         let dividend_date = SharedString::new(format!(
             "{}-{}-{}",
-            rng.gen_range(2000..2023),
-            rng.gen_range(1..12),
-            rng.gen_range(1..28)
+            rng.random_range(2000..2023),
+            rng.random_range(1..12),
+            rng.random_range(1..28)
         ));
-        let dividend_payment = rng.gen_range(0.0..10.0);
+        let dividend_payment = rng.random_range(0.0..10.0);
 
         Self {
             name: name.into(),
@@ -238,7 +241,7 @@ impl RenderOnce for TableRow {
             .flex_row()
             .border_b_1()
             .border_color(rgb(0xE0E0E0))
-            .bg(if self.ix % 2 == 0 {
+            .bg(if self.ix.is_multiple_of(2) {
                 rgb(0xFFFFFF)
             } else {
                 rgb(0xFAFAFA)
@@ -374,7 +377,6 @@ impl DataTable {
 impl Render for DataTable {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .font_family(".SystemUIFont")
             .bg(gpui::white())
             .text_sm()
             .size_full()
@@ -439,7 +441,7 @@ impl Render for DataTable {
                                     }),
                                 )
                                 .size_full()
-                                .track_scroll(self.scroll_handle.clone()),
+                                .track_scroll(&self.scroll_handle),
                             )
                             .child(self.render_scrollbar(window, cx)),
                     ),
@@ -447,8 +449,8 @@ impl Render for DataTable {
     }
 }
 
-fn main() {
-    Application::new().run(|cx: &mut App| {
+fn run_example() {
+    application().run(|cx: &mut App| {
         cx.open_window(
             WindowOptions {
                 focus: true,
@@ -471,4 +473,16 @@ fn main() {
 
         cx.activate(true);
     });
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn main() {
+    run_example();
+}
+
+#[cfg(target_family = "wasm")]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+pub fn start() {
+    gpui_platform::web_init();
+    run_example();
 }

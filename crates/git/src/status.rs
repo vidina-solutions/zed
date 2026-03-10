@@ -1,8 +1,10 @@
-use crate::repository::RepoPath;
-use anyhow::Result;
+use crate::{Oid, repository::RepoPath};
+use anyhow::{Result, anyhow};
+use collections::HashMap;
+use gpui::SharedString;
 use serde::{Deserialize, Serialize};
-use std::{path::Path, str::FromStr, sync::Arc};
-use util::ResultExt;
+use std::{str::FromStr, sync::Arc};
+use util::{ResultExt, rel_path::RelPath};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FileStatus {
@@ -62,23 +64,23 @@ pub enum StageStatus {
 }
 
 impl StageStatus {
-    pub fn is_fully_staged(&self) -> bool {
+    pub const fn is_fully_staged(&self) -> bool {
         matches!(self, StageStatus::Staged)
     }
 
-    pub fn is_fully_unstaged(&self) -> bool {
+    pub const fn is_fully_unstaged(&self) -> bool {
         matches!(self, StageStatus::Unstaged)
     }
 
-    pub fn has_staged(&self) -> bool {
+    pub const fn has_staged(&self) -> bool {
         matches!(self, StageStatus::Staged | StageStatus::PartiallyStaged)
     }
 
-    pub fn has_unstaged(&self) -> bool {
+    pub const fn has_unstaged(&self) -> bool {
         matches!(self, StageStatus::Unstaged | StageStatus::PartiallyStaged)
     }
 
-    pub fn as_bool(self) -> Option<bool> {
+    pub const fn as_bool(self) -> Option<bool> {
         match self {
             StageStatus::Staged => Some(true),
             StageStatus::Unstaged => Some(false),
@@ -153,17 +155,11 @@ impl FileStatus {
     }
 
     pub fn is_conflicted(self) -> bool {
-        match self {
-            FileStatus::Unmerged { .. } => true,
-            _ => false,
-        }
+        matches!(self, FileStatus::Unmerged { .. })
     }
 
     pub fn is_ignored(self) -> bool {
-        match self {
-            FileStatus::Ignored => true,
-            _ => false,
-        }
+        matches!(self, FileStatus::Ignored)
     }
 
     pub fn has_changes(&self) -> bool {
@@ -176,40 +172,35 @@ impl FileStatus {
 
     pub fn is_modified(self) -> bool {
         match self {
-            FileStatus::Tracked(tracked) => match (tracked.index_status, tracked.worktree_status) {
-                (StatusCode::Modified, _) | (_, StatusCode::Modified) => true,
-                _ => false,
-            },
+            FileStatus::Tracked(tracked) => matches!(
+                (tracked.index_status, tracked.worktree_status),
+                (StatusCode::Modified, _) | (_, StatusCode::Modified)
+            ),
             _ => false,
         }
     }
 
     pub fn is_created(self) -> bool {
         match self {
-            FileStatus::Tracked(tracked) => match (tracked.index_status, tracked.worktree_status) {
-                (StatusCode::Added, _) | (_, StatusCode::Added) => true,
-                _ => false,
-            },
+            FileStatus::Tracked(tracked) => matches!(
+                (tracked.index_status, tracked.worktree_status),
+                (StatusCode::Added, _) | (_, StatusCode::Added)
+            ),
             FileStatus::Untracked => true,
             _ => false,
         }
     }
 
     pub fn is_deleted(self) -> bool {
-        match self {
-            FileStatus::Tracked(tracked) => match (tracked.index_status, tracked.worktree_status) {
-                (StatusCode::Deleted, _) | (_, StatusCode::Deleted) => true,
-                _ => false,
-            },
-            _ => false,
-        }
+        let FileStatus::Tracked(tracked) = self else {
+            return false;
+        };
+        tracked.index_status == StatusCode::Deleted && tracked.worktree_status != StatusCode::Added
+            || tracked.worktree_status == StatusCode::Deleted
     }
 
     pub fn is_untracked(self) -> bool {
-        match self {
-            FileStatus::Untracked => true,
-            _ => false,
-        }
+        matches!(self, FileStatus::Untracked)
     }
 
     pub fn summary(self) -> GitSummary {
@@ -393,14 +384,12 @@ impl From<FileStatus> for GitSummary {
     }
 }
 
-impl sum_tree::Summary for GitSummary {
-    type Context = ();
-
-    fn zero(_: &Self::Context) -> Self {
+impl sum_tree::ContextLessSummary for GitSummary {
+    fn zero() -> Self {
         Default::default()
     }
 
-    fn add_summary(&mut self, rhs: &Self, _: &Self::Context) {
+    fn add_summary(&mut self, rhs: &Self) {
         *self += *rhs;
     }
 }
@@ -464,11 +453,12 @@ impl FromStr for GitStatus {
                 }
                 let status = entry.as_bytes()[0..2].try_into().unwrap();
                 let status = FileStatus::from_bytes(status).log_err()?;
-                let path = RepoPath(Path::new(path).into());
+                // git-status outputs `/`-delimited repo paths, even on Windows.
+                let path = RepoPath::from_rel_path(RelPath::unix(path).log_err()?);
                 Some((path, status))
             })
             .collect::<Vec<_>>();
-        entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(&b));
+        entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
         // When a file exists in HEAD, is deleted in the index, and exists again in the working copy,
         // git produces two lines for it, one reading `D ` (deleted in index, unmodified in working copy)
         // and the other reading `??` (untracked). Merge these two into the equivalent of `DA`.
@@ -485,7 +475,12 @@ impl FromStr for GitStatus {
                     }
                     .into();
                 }
-                _ => panic!("Unexpected duplicated status entries: {a_status:?} and {b_status:?}"),
+                (x, y) if x == y => {}
+                _ => {
+                    log::warn!(
+                        "Unexpected duplicated status entries: {a_status:?} and {b_status:?}"
+                    );
+                }
             }
             true
         });
@@ -500,5 +495,281 @@ impl Default for GitStatus {
         Self {
             entries: Arc::new([]),
         }
+    }
+}
+
+pub enum DiffTreeType {
+    MergeBase {
+        base: SharedString,
+        head: SharedString,
+    },
+    Since {
+        base: SharedString,
+        head: SharedString,
+    },
+}
+
+impl DiffTreeType {
+    pub fn base(&self) -> &SharedString {
+        match self {
+            DiffTreeType::MergeBase { base, .. } => base,
+            DiffTreeType::Since { base, .. } => base,
+        }
+    }
+
+    pub fn head(&self) -> &SharedString {
+        match self {
+            DiffTreeType::MergeBase { head, .. } => head,
+            DiffTreeType::Since { head, .. } => head,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub struct TreeDiff {
+    pub entries: HashMap<RepoPath, TreeDiffStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TreeDiffStatus {
+    Added,
+    Modified { old: Oid },
+    Deleted { old: Oid },
+}
+
+impl FromStr for TreeDiff {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let mut fields = s.split('\0');
+        let mut parsed = HashMap::default();
+        while let Some((status, path)) = fields.next().zip(fields.next()) {
+            let path = RepoPath::from_rel_path(RelPath::unix(path)?);
+
+            let mut fields = status.split(" ").skip(2);
+            let old_sha = fields
+                .next()
+                .ok_or_else(|| anyhow!("expected to find old_sha"))?
+                .to_owned()
+                .parse()?;
+            let _new_sha = fields
+                .next()
+                .ok_or_else(|| anyhow!("expected to find new_sha"))?;
+            let status = fields
+                .next()
+                .and_then(|s| {
+                    if s.len() == 1 {
+                        s.as_bytes().first()
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| anyhow!("expected to find status"))?;
+
+            let result = match StatusCode::from_byte(*status)? {
+                StatusCode::Modified => TreeDiffStatus::Modified { old: old_sha },
+                StatusCode::Added => TreeDiffStatus::Added,
+                StatusCode::Deleted => TreeDiffStatus::Deleted { old: old_sha },
+                _status => continue,
+            };
+
+            parsed.insert(path, result);
+        }
+
+        Ok(Self { entries: parsed })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DiffStat {
+    pub added: u32,
+    pub deleted: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct GitDiffStat {
+    pub entries: Arc<[(RepoPath, DiffStat)]>,
+}
+
+/// Parses the output of `git diff --numstat` where output looks like:
+///
+/// ```text
+/// 24   12   dir/file.txt
+/// ```
+pub fn parse_numstat(output: &str) -> GitDiffStat {
+    let mut entries = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(3, '\t');
+        let (Some(added_str), Some(deleted_str), Some(path_str)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let Ok(added) = added_str.parse::<u32>() else {
+            continue;
+        };
+        let Ok(deleted) = deleted_str.parse::<u32>() else {
+            continue;
+        };
+        let Ok(path) = RepoPath::new(path_str) else {
+            continue;
+        };
+        entries.push((path, DiffStat { added, deleted }));
+    }
+    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    entries.dedup_by(|(a, _), (b, _)| a == b);
+
+    GitDiffStat {
+        entries: entries.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use crate::{
+        repository::RepoPath,
+        status::{FileStatus, GitStatus, TreeDiff, TreeDiffStatus},
+    };
+
+    use super::{DiffStat, parse_numstat};
+
+    fn lookup<'a>(entries: &'a [(RepoPath, DiffStat)], path: &str) -> Option<&'a DiffStat> {
+        let path = RepoPath::new(path).unwrap();
+        entries.iter().find(|(p, _)| p == &path).map(|(_, s)| s)
+    }
+
+    #[test]
+    fn test_parse_numstat_normal() {
+        let input = "10\t5\tsrc/main.rs\n3\t1\tREADME.md\n";
+        let result = parse_numstat(input);
+        assert_eq!(result.entries.len(), 2);
+        assert_eq!(
+            lookup(&result.entries, "src/main.rs"),
+            Some(&DiffStat {
+                added: 10,
+                deleted: 5
+            })
+        );
+        assert_eq!(
+            lookup(&result.entries, "README.md"),
+            Some(&DiffStat {
+                added: 3,
+                deleted: 1
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_numstat_binary_files_skipped() {
+        // git diff --numstat outputs "-\t-\tpath" for binary files
+        let input = "-\t-\timage.png\n5\t2\tsrc/lib.rs\n";
+        let result = parse_numstat(input);
+        assert_eq!(result.entries.len(), 1);
+        assert!(lookup(&result.entries, "image.png").is_none());
+        assert_eq!(
+            lookup(&result.entries, "src/lib.rs"),
+            Some(&DiffStat {
+                added: 5,
+                deleted: 2
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_numstat_empty_input() {
+        assert!(parse_numstat("").entries.is_empty());
+        assert!(parse_numstat("\n\n").entries.is_empty());
+        assert!(parse_numstat("   \n  \n").entries.is_empty());
+    }
+
+    #[test]
+    fn test_parse_numstat_malformed_lines_skipped() {
+        let input = "not_a_number\t5\tfile.rs\n10\t5\tvalid.rs\n";
+        let result = parse_numstat(input);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(
+            lookup(&result.entries, "valid.rs"),
+            Some(&DiffStat {
+                added: 10,
+                deleted: 5
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_numstat_incomplete_lines_skipped() {
+        // Lines with fewer than 3 tab-separated fields are skipped
+        let input = "10\t5\n7\t3\tok.rs\n";
+        let result = parse_numstat(input);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(
+            lookup(&result.entries, "ok.rs"),
+            Some(&DiffStat {
+                added: 7,
+                deleted: 3
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_numstat_zero_stats() {
+        let input = "0\t0\tunchanged_but_present.rs\n";
+        let result = parse_numstat(input);
+        assert_eq!(
+            lookup(&result.entries, "unchanged_but_present.rs"),
+            Some(&DiffStat {
+                added: 0,
+                deleted: 0
+            })
+        );
+    }
+
+    #[test]
+    fn test_duplicate_untracked_entries() {
+        // Regression test for ZED-2XA: git can produce duplicate untracked entries
+        // for the same path. This should deduplicate them instead of panicking.
+        let input = "?? file.txt\0?? file.txt";
+        let status: GitStatus = input.parse().unwrap();
+        assert_eq!(status.entries.len(), 1);
+        assert_eq!(status.entries[0].1, FileStatus::Untracked);
+    }
+
+    #[test]
+    fn test_tree_diff_parsing() {
+        let input = ":000000 100644 0000000000000000000000000000000000000000 0062c311b8727c3a2e3cd7a41bc9904feacf8f98 A\x00.zed/settings.json\x00".to_owned() +
+            ":100644 000000 bb3e9ed2e97a8c02545bae243264d342c069afb3 0000000000000000000000000000000000000000 D\x00README.md\x00" +
+            ":100644 100644 42f097005a1f21eb2260fad02ec8c991282beee8 a437d85f63bb8c62bd78f83f40c506631fabf005 M\x00parallel.go\x00";
+
+        let output: TreeDiff = input.parse().unwrap();
+        assert_eq!(
+            output,
+            TreeDiff {
+                entries: [
+                    (
+                        RepoPath::new(".zed/settings.json").unwrap(),
+                        TreeDiffStatus::Added,
+                    ),
+                    (
+                        RepoPath::new("README.md").unwrap(),
+                        TreeDiffStatus::Deleted {
+                            old: "bb3e9ed2e97a8c02545bae243264d342c069afb3".parse().unwrap()
+                        }
+                    ),
+                    (
+                        RepoPath::new("parallel.go").unwrap(),
+                        TreeDiffStatus::Modified {
+                            old: "42f097005a1f21eb2260fad02ec8c991282beee8".parse().unwrap(),
+                        }
+                    ),
+                ]
+                .into_iter()
+                .collect()
+            }
+        )
     }
 }

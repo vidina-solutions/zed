@@ -64,6 +64,8 @@ impl ShapedLine {
         &self,
         origin: Point<Pixels>,
         line_height: Pixels,
+        align: TextAlign,
+        align_width: Option<Pixels>,
         window: &mut Window,
         cx: &mut App,
     ) -> Result<()> {
@@ -71,8 +73,8 @@ impl ShapedLine {
             origin,
             &self.layout,
             line_height,
-            TextAlign::default(),
-            None,
+            align,
+            align_width,
             &self.decoration_runs,
             &[],
             window,
@@ -87,6 +89,8 @@ impl ShapedLine {
         &self,
         origin: Point<Pixels>,
         line_height: Pixels,
+        align: TextAlign,
+        align_width: Option<Pixels>,
         window: &mut Window,
         cx: &mut App,
     ) -> Result<()> {
@@ -94,8 +98,8 @@ impl ShapedLine {
             origin,
             &self.layout,
             line_height,
-            TextAlign::default(),
-            None,
+            align,
+            align_width,
             &self.decoration_runs,
             &[],
             window,
@@ -107,14 +111,14 @@ impl ShapedLine {
 }
 
 /// A line of text that has been shaped, decorated, and wrapped by the text layout system.
-#[derive(Clone, Default, Debug, Deref, DerefMut)]
+#[derive(Default, Debug, Deref, DerefMut)]
 pub struct WrappedLine {
     #[deref]
     #[deref_mut]
     pub(crate) layout: Arc<WrappedLineLayout>,
     /// The text that was shaped for this line.
     pub text: SharedString,
-    pub(crate) decoration_runs: SmallVec<[DecorationRun; 32]>,
+    pub(crate) decoration_runs: Vec<DecorationRun>,
 }
 
 impl WrappedLine {
@@ -292,10 +296,10 @@ fn paint_line(
                     }
 
                     if let Some(style_run) = style_run {
-                        if let Some((_, underline_style)) = &mut current_underline {
-                            if style_run.underline.as_ref() != Some(underline_style) {
-                                finished_underline = current_underline.take();
-                            }
+                        if let Some((_, underline_style)) = &mut current_underline
+                            && style_run.underline.as_ref() != Some(underline_style)
+                        {
+                            finished_underline = current_underline.take();
                         }
                         if let Some(run_underline) = style_run.underline.as_ref() {
                             current_underline.get_or_insert((
@@ -310,10 +314,10 @@ fn paint_line(
                                 },
                             ));
                         }
-                        if let Some((_, strikethrough_style)) = &mut current_strikethrough {
-                            if style_run.strikethrough.as_ref() != Some(strikethrough_style) {
-                                finished_strikethrough = current_strikethrough.take();
-                            }
+                        if let Some((_, strikethrough_style)) = &mut current_strikethrough
+                            && style_run.strikethrough.as_ref() != Some(strikethrough_style)
+                        {
+                            finished_strikethrough = current_strikethrough.take();
                         }
                         if let Some(run_strikethrough) = style_run.strikethrough.as_ref() {
                             current_strikethrough.get_or_insert((
@@ -369,16 +373,17 @@ fn paint_line(
 
                 let content_mask = window.content_mask();
                 if max_glyph_bounds.intersects(&content_mask.bounds) {
+                    let vertical_offset = point(px(0.0), glyph.position.y);
                     if glyph.is_emoji {
                         window.paint_emoji(
-                            glyph_origin + baseline_offset,
+                            glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
                             layout.font_size,
                         )?;
                     } else {
                         window.paint_glyph(
-                            glyph_origin + baseline_offset,
+                            glyph_origin + baseline_offset + vertical_offset,
                             run.font_id,
                             glyph.id,
                             layout.font_size,
@@ -509,10 +514,10 @@ fn paint_line_background(
                     }
 
                     if let Some(style_run) = style_run {
-                        if let Some((_, background_color)) = &mut current_background {
-                            if style_run.background_color.as_ref() != Some(background_color) {
-                                finished_background = current_background.take();
-                            }
+                        if let Some((_, background_color)) = &mut current_background
+                            && style_run.background_color.as_ref() != Some(background_color)
+                        {
+                            finished_background = current_background.take();
                         }
                         if let Some(run_background) = style_run.background_color {
                             current_background.get_or_insert((
@@ -585,7 +590,7 @@ fn aligned_origin_x(
 
     match align {
         TextAlign::Left => origin.x,
-        TextAlign::Center => (2.0 * origin.x + align_width - line_width) / 2.0,
+        TextAlign::Center => (origin.x * 2.0 + align_width - line_width) / 2.0,
         TextAlign::Right => origin.x + align_width - line_width,
     }
 }

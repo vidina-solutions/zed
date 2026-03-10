@@ -1,8 +1,13 @@
+---
+title: Tasks - Run Commands in Zed
+description: Run and rerun shell commands from Zed with task definitions. Supports variables, templates, and language-specific tasks.
+---
+
 # Tasks
 
-Zed supports ways to spawn (and rerun) commands using its integrated terminal to output the results. These commands can read a limited subset of Zed state (such as a path to the file currently being edited or selected text).
+Zed supports ways to spawn (and rerun) commands using its integrated [terminal](./terminal.md) to output the results. These commands can read a limited subset of Zed state (such as a path to the file currently being edited or selected text).
 
-```json
+```json [tasks]
 [
   {
     "label": "Example task",
@@ -45,9 +50,9 @@ Zed supports ways to spawn (and rerun) commands using its integrated terminal to
     // Whether to show the task line in the output of the spawned task, defaults to `true`.
     "show_summary": true,
     // Whether to show the command line in the output of the spawned task, defaults to `true`.
-    "show_output": true,
+    "show_command": true
     // Represents the tags for inline runnable indicators, or spawning multiple tasks at once.
-    "tags": []
+    // "tags": []
   }
 ]
 ```
@@ -89,7 +94,7 @@ These variables allow you to pull information from the current editor and use it
 
 To use a variable in a task, prefix it with a dollar sign (`$`):
 
-```json
+```json [tasks]
 {
   "label": "echo current file's path",
   "command": "echo $ZED_FILE"
@@ -106,7 +111,7 @@ When working with paths containing spaces or other special characters, please en
 
 For example, instead of this (which will fail if the path has a space):
 
-```json
+```json [tasks]
 {
   "label": "stat current file",
   "command": "stat $ZED_FILE"
@@ -115,7 +120,7 @@ For example, instead of this (which will fail if the path has a space):
 
 Provide the following:
 
-```json
+```json [tasks]
 {
   "label": "stat current file",
   "command": "stat",
@@ -125,10 +130,31 @@ Provide the following:
 
 Or explicitly include escaped quotes like so:
 
-```json
+```json [tasks]
 {
   "label": "stat current file",
   "command": "stat \"$ZED_FILE\""
+}
+```
+
+### Task filtering based on variables
+
+Task definitions with variables which are not present at the moment the task list is determined are filtered out.
+For example, the following task will appear in the spawn modal only if there is a text selection:
+
+```json [tasks]
+{
+  "label": "selected text",
+  "command": "echo \"$ZED_SELECTED_TEXT\""
+}
+```
+
+Set default values to such variables to have such tasks always displayed:
+
+```json [tasks]
+{
+  "label": "selected text with default",
+  "command": "echo \"${ZED_SELECTED_TEXT:no text selected}\""
 }
 ```
 
@@ -145,11 +171,26 @@ You can also adjust the currently selected task in a modal (`tab` is the default
 You can use the `cmd` modifier when spawning a task via a modal; tasks spawned this way will not have their usage count increased (thus, they will not be respawned with `task: rerun` and they won't have a high rank in the task modal).
 The intended use of ephemeral tasks is to stay in the flow with continuous `task: rerun` usage.
 
+### More task rerun control
+
+By default, tasks capture their variables into a context once, and this "resolved task" is being rerun always.
+
+This can be controlled with the `"reevaluate_context"` argument to the task: setting it to `true` will force the task to be reevaluated before each run.
+
+```json [keymap]
+{
+  "context": "Workspace",
+  "bindings": {
+    "alt-t": ["task::Rerun", { "reevaluate_context": true }]
+  }
+}
+```
+
 ## Custom keybindings for tasks
 
 You can define your own keybindings for your tasks via an additional argument to `task::Spawn`. If you wanted to bind the aforementioned `echo current file's path` task to `alt-g`, you would add the following snippet in your [`keymap.json`](./key-bindings.md) file:
 
-```json
+```json [keymap]
 {
   "context": "Workspace",
   "bindings": {
@@ -161,7 +202,7 @@ You can define your own keybindings for your tasks via an additional argument to
 Note that these tasks can also have a 'target' specified to control where the spawned task should show up.
 This could be useful for launching a terminal application that you want to use in the center area:
 
-```json
+```json [tasks]
 // In tasks.json
 {
   "label": "start lazygit",
@@ -169,7 +210,7 @@ This could be useful for launching a terminal application that you want to use i
 }
 ```
 
-```json
+```json [keymap]
 // In keymap.json
 {
   "context": "Workspace",
@@ -182,6 +223,35 @@ This could be useful for launching a terminal application that you want to use i
 }
 ```
 
+## VS Code Task Format
+
+When importing VS Code tasks from `.vscode/tasks.json`, you can omit the `label` field. Zed automatically generates labels based on the task type:
+
+- **npm tasks**: `npm: <script>` (e.g., `npm: start`)
+- **gulp tasks**: `gulp: <task>` (e.g., `gulp: build`)
+- **shell tasks**: Uses the `command` string directly (e.g., `echo hello`), or `shell` if the command is empty
+- **Tasks without type**: `Untitled Task`
+
+Example task file with auto-generated labels:
+
+```json
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "type": "npm",
+      "script": "start"
+    },
+    {
+      "type": "shell",
+      "command": "cargo build --release"
+    }
+  ]
+}
+```
+
+These tasks appear in the task picker as "npm: start" and "cargo build --release". You can override the generated label by providing an explicit `label` field.
+
 ## Binding runnable tags to task templates
 
 Zed supports overriding the default action for inline runnable indicators via workspace-local and global `tasks.json` file with the following precedence hierarchy:
@@ -192,7 +262,7 @@ Zed supports overriding the default action for inline runnable indicators via wo
 
 To tag a task, add the runnable tag name to the `tags` field on the task template:
 
-```json
+```json [tasks]
 {
   "label": "echo current file's path",
   "command": "echo $ZED_FILE",
@@ -205,3 +275,48 @@ In doing so, you can change which task is shown in the runnables indicator.
 ## Keybindings to run tasks bound to runnables
 
 When you have a task definition that is bound to the runnable, you can quickly run it using [Code Actions](https://zed.dev/docs/configuring-languages?#code-actions) that you can trigger either via `editor: Toggle Code Actions` command or by the `cmd-.`/`ctrl-.` shortcut. Your task will be the first in the dropdown. The task will run immediately if there are no additional Code Actions for this line.
+
+## Running Bash Scripts
+
+You can run bash scripts directly from Zed. When you open a `.sh` or `.bash` file, Zed automatically detects the script as runnable and makes it available in the task picker.
+
+To run a bash script:
+
+1. Open the command palette with {#kb command_palette::Toggle}
+2. Search for "task" and select **task: spawn**
+3. Select the script from the list
+
+Bash scripts are tagged with `bash-script`, allowing you to filter or reference them in task configurations.
+
+If you need to pass arguments or customize the execution environment, add a task configuration in your `.zed/tasks.json`:
+
+```json
+[
+  {
+    "label": "run my-script.sh with args",
+    "command": "./my-script.sh",
+    "args": ["--verbose", "--output=results.txt"],
+    "tags": ["bash-script"]
+  }
+]
+```
+
+## Shell Initialization
+
+When Zed runs a task, it launches the command in a login shell. This ensures your shell's initialization files (`.bash_profile`, `.zshrc`, etc.) are sourced before the task executes.
+
+This behavior gives tasks access to the same environment variables, aliases, and PATH modifications you've configured in your shell profile. If a task fails to find a command that works in your terminal, verify your shell configuration files are properly set up.
+
+To override the shell used for tasks, configure the `terminal.shell` setting:
+
+```json
+{
+  "terminal": {
+    "shell": {
+      "program": "/bin/zsh"
+    }
+  }
+}
+```
+
+See [Terminal configuration](./terminal.md) for complete shell options.

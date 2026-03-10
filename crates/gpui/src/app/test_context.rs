@@ -5,42 +5,39 @@ use crate::{
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     Platform, Point, Render, Result, Size, Task, TestDispatcher, TestPlatform,
     TestScreenCaptureSource, TestWindow, TextSystem, VisualContext, Window, WindowBounds,
-    WindowHandle, WindowOptions,
+    WindowHandle, WindowOptions, app::GpuiMode, window::ElementArenaScope,
 };
 use anyhow::{anyhow, bail};
 use futures::{Stream, StreamExt, channel::oneshot};
-use std::{cell::RefCell, future::Future, ops::Deref, rc::Rc, sync::Arc, time::Duration};
+
+use std::{
+    cell::RefCell, future::Future, ops::Deref, path::PathBuf, rc::Rc, sync::Arc, time::Duration,
+};
 
 /// A TestAppContext is provided to tests created with `#[gpui::test]`, it provides
 /// an implementation of `Context` with additional methods that are useful in tests.
 #[derive(Clone)]
 pub struct TestAppContext {
     #[doc(hidden)]
-    pub app: Rc<AppCell>,
-    #[doc(hidden)]
     pub background_executor: BackgroundExecutor,
     #[doc(hidden)]
     pub foreground_executor: ForegroundExecutor,
-    #[doc(hidden)]
-    pub dispatcher: TestDispatcher,
+    dispatcher: TestDispatcher,
     test_platform: Rc<TestPlatform>,
     text_system: Arc<TextSystem>,
     fn_name: Option<&'static str>,
     on_quit: Rc<RefCell<Vec<Box<dyn FnOnce() + 'static>>>>,
+    #[doc(hidden)]
+    pub app: Rc<AppCell>,
 }
 
 impl AppContext for TestAppContext {
-    type Result<T> = T;
-
-    fn new<T: 'static>(
-        &mut self,
-        build_entity: impl FnOnce(&mut Context<T>) -> T,
-    ) -> Self::Result<Entity<T>> {
+    fn new<T: 'static>(&mut self, build_entity: impl FnOnce(&mut Context<T>) -> T) -> Entity<T> {
         let mut app = self.app.borrow_mut();
         app.new(build_entity)
     }
 
-    fn reserve_entity<T: 'static>(&mut self) -> Self::Result<crate::Reservation<T>> {
+    fn reserve_entity<T: 'static>(&mut self) -> crate::Reservation<T> {
         let mut app = self.app.borrow_mut();
         app.reserve_entity()
     }
@@ -49,7 +46,7 @@ impl AppContext for TestAppContext {
         &mut self,
         reservation: crate::Reservation<T>,
         build_entity: impl FnOnce(&mut Context<T>) -> T,
-    ) -> Self::Result<Entity<T>> {
+    ) -> Entity<T> {
         let mut app = self.app.borrow_mut();
         app.insert_entity(reservation, build_entity)
     }
@@ -58,16 +55,19 @@ impl AppContext for TestAppContext {
         &mut self,
         handle: &Entity<T>,
         update: impl FnOnce(&mut T, &mut Context<T>) -> R,
-    ) -> Self::Result<R> {
+    ) -> R {
         let mut app = self.app.borrow_mut();
         app.update_entity(handle, update)
     }
 
-    fn read_entity<T, R>(
-        &self,
-        handle: &Entity<T>,
-        read: impl FnOnce(&T, &App) -> R,
-    ) -> Self::Result<R>
+    fn as_mut<'a, T>(&'a mut self, _: &Entity<T>) -> super::GpuiBorrow<'a, T>
+    where
+        T: 'static,
+    {
+        panic!("Cannot use as_mut with a test app context. Try calling update() first")
+    }
+
+    fn read_entity<T, R>(&self, handle: &Entity<T>, read: impl FnOnce(&T, &App) -> R) -> R
     where
         T: 'static,
     {
@@ -102,7 +102,7 @@ impl AppContext for TestAppContext {
         self.background_executor.spawn(future)
     }
 
-    fn read_global<G, R>(&self, callback: impl FnOnce(&G, &App) -> R) -> Self::Result<R>
+    fn read_global<G, R>(&self, callback: impl FnOnce(&G, &App) -> R) -> R
     where
         G: Global,
     {
@@ -122,16 +122,30 @@ impl TestAppContext {
         let http_client = http_client::FakeHttpClient::with_404_response();
         let text_system = Arc::new(TextSystem::new(platform.text_system()));
 
+        let app = App::new_app(platform.clone(), asset_source, http_client);
+        app.borrow_mut().mode = GpuiMode::test();
+
         Self {
-            app: App::new_app(platform.clone(), asset_source, http_client),
+            app,
             background_executor,
             foreground_executor,
-            dispatcher: dispatcher.clone(),
+            dispatcher,
             test_platform: platform,
             text_system,
             fn_name,
             on_quit: Rc::new(RefCell::new(Vec::default())),
         }
+    }
+
+    /// Skip all drawing operations for the duration of this test.
+    pub fn skip_drawing(&mut self) {
+        self.app.borrow_mut().mode = GpuiMode::Test { skip_drawing: true };
+    }
+
+    /// Create a single TestAppContext, for non-multi-client tests
+    pub fn single() -> Self {
+        let dispatcher = TestDispatcher::new(0);
+        Self::build(dispatcher, None)
     }
 
     /// The name of the test function that created this `TestAppContext`
@@ -178,6 +192,7 @@ impl TestAppContext {
         &self.foreground_executor
     }
 
+    #[expect(clippy::wrong_self_convention)]
     fn new<T: 'static>(&mut self, build_entity: impl FnOnce(&mut Context<T>) -> T) -> Entity<T> {
         let mut cx = self.app.borrow_mut();
         cx.new(build_entity)
@@ -205,7 +220,7 @@ impl TestAppContext {
         let mut cx = self.app.borrow_mut();
 
         // Some tests rely on the window size matching the bounds of the test display
-        let bounds = Bounds::maximized(None, &mut cx);
+        let bounds = Bounds::maximized(None, &cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -219,7 +234,7 @@ impl TestAppContext {
     /// Adds a new window with no content.
     pub fn add_empty_window(&mut self) -> &mut VisualTestContext {
         let mut cx = self.app.borrow_mut();
-        let bounds = Bounds::maximized(None, &mut cx);
+        let bounds = Bounds::maximized(None, &cx);
         let window = cx
             .open_window(
                 WindowOptions {
@@ -230,7 +245,7 @@ impl TestAppContext {
             )
             .unwrap();
         drop(cx);
-        let cx = VisualTestContext::from_window(*window.deref(), self).as_mut();
+        let cx = VisualTestContext::from_window(*window.deref(), self).into_mut();
         cx.run_until_parked();
         cx
     }
@@ -247,7 +262,7 @@ impl TestAppContext {
         V: 'static + Render,
     {
         let mut cx = self.app.borrow_mut();
-        let bounds = Bounds::maximized(None, &mut cx);
+        let bounds = Bounds::maximized(None, &cx);
         let window = cx
             .open_window(
                 WindowOptions {
@@ -259,7 +274,7 @@ impl TestAppContext {
             .unwrap();
         drop(cx);
         let view = window.root(self).unwrap();
-        let cx = VisualTestContext::from_window(*window.deref(), self).as_mut();
+        let cx = VisualTestContext::from_window(*window.deref(), self).into_mut();
         cx.run_until_parked();
 
         // it might be nice to try and cleanup these at the end of each test.
@@ -316,6 +331,13 @@ impl TestAppContext {
         self.test_window(window_handle).simulate_resize(size);
     }
 
+    /// Returns true if there's an alert dialog open.
+    pub fn expect_restart(&self) -> oneshot::Receiver<Option<PathBuf>> {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.test_platform.expect_restart.borrow_mut().replace(tx);
+        rx
+    }
+
     /// Causes the given sources to be returned if the application queries for screen
     /// capture sources.
     pub fn set_screen_capture_sources(&self, sources: Vec<TestScreenCaptureSource>) {
@@ -324,7 +346,7 @@ impl TestAppContext {
 
     /// Returns all windows open in the test.
     pub fn windows(&self) -> Vec<AnyWindowHandle> {
-        self.app.borrow().windows().clone()
+        self.app.borrow().windows()
     }
 
     /// Run the given task on the main thread.
@@ -379,8 +401,8 @@ impl TestAppContext {
     }
 
     /// Wait until there are no more pending tasks.
-    pub fn run_until_parked(&mut self) {
-        self.background_executor.run_until_parked()
+    pub fn run_until_parked(&self) {
+        self.dispatcher.run_until_parked();
     }
 
     /// Simulate dispatching an action to the currently focused node in the window.
@@ -440,7 +462,7 @@ impl TestAppContext {
             .windows
             .get_mut(window.id)
             .unwrap()
-            .as_mut()
+            .as_deref_mut()
             .unwrap()
             .platform_window
             .as_test()
@@ -498,22 +520,25 @@ impl TestAppContext {
         let mut notifications = self.notifications(entity);
 
         use futures::FutureExt as _;
-        use smol::future::FutureExt as _;
+        use futures_concurrency::future::Race as _;
 
-        async {
-            loop {
-                if entity.update(self, &mut predicate) {
-                    return Ok(());
-                }
+        (
+            async {
+                loop {
+                    if entity.update(self, &mut predicate) {
+                        return Ok(());
+                    }
 
-                if notifications.next().await.is_none() {
-                    bail!("entity dropped")
+                    if notifications.next().await.is_none() {
+                        bail!("entity dropped")
+                    }
                 }
-            }
-        }
-        .race(timer.map(|_| Err(anyhow!("condition timed out"))))
-        .await
-        .unwrap();
+            },
+            timer.map(|_| Err(anyhow!("condition timed out"))),
+        )
+            .race()
+            .await
+            .unwrap();
     }
 
     /// Set a name for this App.
@@ -562,20 +587,13 @@ impl<V: 'static> Entity<V> {
             tx.try_send(()).ok();
         });
 
-        let duration = if std::env::var("CI").is_ok() {
-            Duration::from_secs(5)
-        } else {
-            Duration::from_secs(1)
-        };
-
         cx.executor().advance_clock(advance_clock_by);
 
         async move {
-            let notification = crate::util::timeout(duration, rx.recv())
+            rx.recv()
                 .await
-                .expect("next notification timed out");
+                .expect("entity dropped while test was waiting for its next notification");
             drop(subscription);
-            notification.expect("entity dropped while test was waiting for its next notification")
         }
     }
 }
@@ -604,7 +622,7 @@ impl<V> Entity<V> {
                 }
             }),
             cx.subscribe(self, {
-                let mut tx = tx.clone();
+                let mut tx = tx;
                 move |_, _: &Evt, _| {
                     tx.blocking_send(()).ok();
                 }
@@ -615,31 +633,25 @@ impl<V> Entity<V> {
         let handle = self.downgrade();
 
         async move {
-            crate::util::timeout(Duration::from_secs(1), async move {
-                loop {
-                    {
-                        let cx = cx.borrow();
-                        let cx = &*cx;
-                        if predicate(
-                            handle
-                                .upgrade()
-                                .expect("view dropped with pending condition")
-                                .read(cx),
-                            cx,
-                        ) {
-                            break;
-                        }
+            loop {
+                {
+                    let cx = cx.borrow();
+                    let cx = &*cx;
+                    if predicate(
+                        handle
+                            .upgrade()
+                            .expect("view dropped with pending condition")
+                            .read(cx),
+                        cx,
+                    ) {
+                        break;
                     }
-
-                    cx.borrow().background_executor().start_waiting();
-                    rx.recv()
-                        .await
-                        .expect("view dropped with pending condition");
-                    cx.borrow().background_executor().finish_waiting();
                 }
-            })
-            .await
-            .expect("condition timed out");
+
+                rx.recv()
+                    .await
+                    .expect("view dropped with pending condition");
+            }
             drop(subscriptions);
         }
     }
@@ -806,6 +818,8 @@ impl VisualTestContext {
         E: Element,
     {
         self.update(|window, cx| {
+            let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
+
             window.invalidator.set_phase(DrawPhase::Prepaint);
             let mut element = Drawable::new(f(window, cx));
             element.layout_as_root(space.into(), window, cx);
@@ -817,11 +831,14 @@ impl VisualTestContext {
             window.invalidator.set_phase(DrawPhase::None);
             window.refresh();
 
+            drop(element);
+            cx.element_arena.borrow_mut().clear();
+
             (request_layout_state, prepaint_state)
         })
     }
 
-    /// Simulate an event from the platform, e.g. a SrollWheelEvent
+    /// Simulate an event from the platform, e.g. a ScrollWheelEvent
     /// Make sure you've called [VisualTestContext::draw] first!
     pub fn simulate_event<E: InputEvent>(&mut self, event: E) {
         self.test_window(self.window)
@@ -868,12 +885,14 @@ impl VisualTestContext {
 
     /// Get an &mut VisualTestContext (which is mostly what you need to pass to other methods).
     /// This method internally retains the VisualTestContext until the end of the test.
-    pub fn as_mut(self) -> &'static mut Self {
+    pub fn into_mut(self) -> &'static mut Self {
         let ptr = Box::into_raw(Box::new(self));
         // safety: on_quit will be called after the test has finished.
         // the executor will ensure that all tasks related to the test have stopped.
         // so there is no way for cx to be accessed after on_quit is called.
-        let cx = Box::leak(unsafe { Box::from_raw(ptr) });
+        // todo: This is unsound under stacked borrows (also tree borrows probably?)
+        // the mutable reference invalidates `ptr` which is later used in the closure
+        let cx = unsafe { &mut *ptr };
         cx.on_quit(move || unsafe {
             drop(Box::from_raw(ptr));
         });
@@ -882,16 +901,11 @@ impl VisualTestContext {
 }
 
 impl AppContext for VisualTestContext {
-    type Result<T> = <TestAppContext as AppContext>::Result<T>;
-
-    fn new<T: 'static>(
-        &mut self,
-        build_entity: impl FnOnce(&mut Context<T>) -> T,
-    ) -> Self::Result<Entity<T>> {
+    fn new<T: 'static>(&mut self, build_entity: impl FnOnce(&mut Context<T>) -> T) -> Entity<T> {
         self.cx.new(build_entity)
     }
 
-    fn reserve_entity<T: 'static>(&mut self) -> Self::Result<crate::Reservation<T>> {
+    fn reserve_entity<T: 'static>(&mut self) -> crate::Reservation<T> {
         self.cx.reserve_entity()
     }
 
@@ -899,7 +913,7 @@ impl AppContext for VisualTestContext {
         &mut self,
         reservation: crate::Reservation<T>,
         build_entity: impl FnOnce(&mut Context<T>) -> T,
-    ) -> Self::Result<Entity<T>> {
+    ) -> Entity<T> {
         self.cx.insert_entity(reservation, build_entity)
     }
 
@@ -907,18 +921,21 @@ impl AppContext for VisualTestContext {
         &mut self,
         handle: &Entity<T>,
         update: impl FnOnce(&mut T, &mut Context<T>) -> R,
-    ) -> Self::Result<R>
+    ) -> R
     where
         T: 'static,
     {
         self.cx.update_entity(handle, update)
     }
 
-    fn read_entity<T, R>(
-        &self,
-        handle: &Entity<T>,
-        read: impl FnOnce(&T, &App) -> R,
-    ) -> Self::Result<R>
+    fn as_mut<'a, T>(&'a mut self, handle: &Entity<T>) -> super::GpuiBorrow<'a, T>
+    where
+        T: 'static,
+    {
+        self.cx.as_mut(handle)
+    }
+
+    fn read_entity<T, R>(&self, handle: &Entity<T>, read: impl FnOnce(&T, &App) -> R) -> R
     where
         T: 'static,
     {
@@ -950,7 +967,7 @@ impl AppContext for VisualTestContext {
         self.cx.background_spawn(future)
     }
 
-    fn read_global<G, R>(&self, callback: impl FnOnce(&G, &App) -> R) -> Self::Result<R>
+    fn read_global<G, R>(&self, callback: impl FnOnce(&G, &App) -> R) -> R
     where
         G: Global,
     {
@@ -959,6 +976,8 @@ impl AppContext for VisualTestContext {
 }
 
 impl VisualContext for VisualTestContext {
+    type Result<T> = T;
+
     /// Get the underlying window handle underlying this context.
     fn window_handle(&self) -> AnyWindowHandle {
         self.window
@@ -967,30 +986,30 @@ impl VisualContext for VisualTestContext {
     fn new_window_entity<T: 'static>(
         &mut self,
         build_entity: impl FnOnce(&mut Window, &mut Context<T>) -> T,
-    ) -> Self::Result<Entity<T>> {
+    ) -> Entity<T> {
         self.window
             .update(&mut self.cx, |_, window, cx| {
                 cx.new(|cx| build_entity(window, cx))
             })
-            .unwrap()
+            .expect("window was unexpectedly closed")
     }
 
     fn update_window_entity<V: 'static, R>(
         &mut self,
         view: &Entity<V>,
         update: impl FnOnce(&mut V, &mut Window, &mut Context<V>) -> R,
-    ) -> Self::Result<R> {
+    ) -> R {
         self.window
             .update(&mut self.cx, |_, window, cx| {
                 view.update(cx, |v, cx| update(v, window, cx))
             })
-            .unwrap()
+            .expect("window was unexpectedly closed")
     }
 
     fn replace_root_view<V>(
         &mut self,
         build_view: impl FnOnce(&mut Window, &mut Context<V>) -> V,
-    ) -> Self::Result<Entity<V>>
+    ) -> Entity<V>
     where
         V: 'static + Render,
     {
@@ -998,15 +1017,15 @@ impl VisualContext for VisualTestContext {
             .update(&mut self.cx, |_, window, cx| {
                 window.replace_root(cx, build_view)
             })
-            .unwrap()
+            .expect("window was unexpectedly closed")
     }
 
-    fn focus<V: crate::Focusable>(&mut self, view: &Entity<V>) -> Self::Result<()> {
+    fn focus<V: crate::Focusable>(&mut self, view: &Entity<V>) {
         self.window
             .update(&mut self.cx, |_, window, cx| {
-                view.read(cx).focus_handle(cx).clone().focus(window)
+                view.read(cx).focus_handle(cx).focus(window, cx)
             })
-            .unwrap()
+            .expect("window was unexpectedly closed")
     }
 }
 

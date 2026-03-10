@@ -1,512 +1,1018 @@
 mod agent_profile;
 
-use std::sync::Arc;
+use std::path::{Component, Path};
+use std::sync::{Arc, LazyLock};
 
-use anyhow::{Result, bail};
-use collections::IndexMap;
-use gpui::{App, Pixels, SharedString};
+use agent_client_protocol::ModelId;
+use collections::{HashSet, IndexMap};
+use gpui::{App, Pixels, px};
 use language_model::LanguageModel;
-use schemars::{JsonSchema, json_schema};
+use project::DisableAiSettings;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use settings::{Settings, SettingsSources};
-use std::borrow::Cow;
+use settings::{
+    DefaultAgentView, DockPosition, LanguageModelParameters, LanguageModelSelection,
+    NotifyWhenAgentWaiting, RegisterSetting, Settings, ToolPermissionMode,
+};
 
 pub use crate::agent_profile::*;
 
-pub fn init(cx: &mut App) {
-    AgentSettings::register(cx);
-}
+pub const SUMMARIZE_THREAD_PROMPT: &str = include_str!("prompts/summarize_thread_prompt.txt");
+pub const SUMMARIZE_THREAD_DETAILED_PROMPT: &str =
+    include_str!("prompts/summarize_thread_detailed_prompt.txt");
 
-#[derive(Copy, Clone, Default, Debug, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentDockPosition {
-    Left,
-    #[default]
-    Right,
-    Bottom,
-}
-
-#[derive(Copy, Clone, Default, Debug, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum DefaultView {
-    #[default]
-    Thread,
-    TextThread,
-}
-
-#[derive(Copy, Clone, Default, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum NotifyWhenAgentWaiting {
-    #[default]
-    PrimaryScreen,
-    AllScreens,
-    Never,
-}
-
-#[derive(Default, Clone, Debug)]
+#[derive(Clone, Debug, RegisterSetting)]
 pub struct AgentSettings {
     pub enabled: bool,
     pub button: bool,
-    pub dock: AgentDockPosition,
+    pub dock: DockPosition,
     pub default_width: Pixels,
     pub default_height: Pixels,
     pub default_model: Option<LanguageModelSelection>,
     pub inline_assistant_model: Option<LanguageModelSelection>,
+    pub inline_assistant_use_streaming_tools: bool,
     pub commit_message_model: Option<LanguageModelSelection>,
     pub thread_summary_model: Option<LanguageModelSelection>,
     pub inline_alternatives: Vec<LanguageModelSelection>,
-    pub using_outdated_settings_version: bool,
+    pub favorite_models: Vec<LanguageModelSelection>,
     pub default_profile: AgentProfileId,
-    pub default_view: DefaultView,
+    pub default_view: DefaultAgentView,
     pub profiles: IndexMap<AgentProfileId, AgentProfileSettings>,
-    pub always_allow_tool_actions: bool,
+
     pub notify_when_agent_waiting: NotifyWhenAgentWaiting,
     pub play_sound_when_agent_done: bool,
-    pub stream_edits: bool,
     pub single_file_review: bool,
     pub model_parameters: Vec<LanguageModelParameters>,
-    pub preferred_completion_mode: CompletionMode,
     pub enable_feedback: bool,
     pub expand_edit_card: bool,
     pub expand_terminal_card: bool,
+    pub cancel_generation_on_terminal_stop: bool,
+    pub use_modifier_to_send: bool,
+    pub message_editor_min_lines: usize,
+    pub show_turn_stats: bool,
+    pub tool_permissions: ToolPermissions,
 }
 
 impl AgentSettings {
+    pub fn enabled(&self, cx: &App) -> bool {
+        self.enabled && !DisableAiSettings::get_global(cx).disable_ai
+    }
+
     pub fn temperature_for_model(model: &Arc<dyn LanguageModel>, cx: &App) -> Option<f32> {
         let settings = Self::get_global(cx);
-        settings
-            .model_parameters
+        for setting in settings.model_parameters.iter().rev() {
+            if let Some(provider) = &setting.provider
+                && provider.0 != model.provider_id().0
+            {
+                continue;
+            }
+            if let Some(setting_model) = &setting.model
+                && *setting_model != model.id().0
+            {
+                continue;
+            }
+            return setting.temperature;
+        }
+        return None;
+    }
+
+    pub fn set_message_editor_max_lines(&self) -> usize {
+        self.message_editor_min_lines * 2
+    }
+
+    pub fn favorite_model_ids(&self) -> HashSet<ModelId> {
+        self.favorite_models
             .iter()
-            .rfind(|setting| setting.matches(model))
-            .and_then(|m| m.temperature)
-    }
-
-    pub fn set_inline_assistant_model(&mut self, provider: String, model: String) {
-        self.inline_assistant_model = Some(LanguageModelSelection {
-            provider: provider.into(),
-            model,
-        });
-    }
-
-    pub fn set_commit_message_model(&mut self, provider: String, model: String) {
-        self.commit_message_model = Some(LanguageModelSelection {
-            provider: provider.into(),
-            model,
-        });
-    }
-
-    pub fn set_thread_summary_model(&mut self, provider: String, model: String) {
-        self.thread_summary_model = Some(LanguageModelSelection {
-            provider: provider.into(),
-            model,
-        });
+            .map(|sel| ModelId::new(format!("{}/{}", sel.provider.0, sel.model)))
+            .collect()
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
-pub struct LanguageModelParameters {
-    pub provider: Option<LanguageModelProviderSetting>,
-    pub model: Option<SharedString>,
-    pub temperature: Option<f32>,
-}
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AgentProfileId(pub Arc<str>);
 
-impl LanguageModelParameters {
-    pub fn matches(&self, model: &Arc<dyn LanguageModel>) -> bool {
-        if let Some(provider) = &self.provider {
-            if provider.0 != model.provider_id().0 {
-                return false;
-            }
-        }
-        if let Some(setting_model) = &self.model {
-            if *setting_model != model.id().0 {
-                return false;
-            }
-        }
-        true
+impl AgentProfileId {
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
-impl AgentSettingsContent {
-    pub fn set_dock(&mut self, dock: AgentDockPosition) {
-        self.dock = Some(dock);
-    }
-
-    pub fn set_model(&mut self, language_model: Arc<dyn LanguageModel>) {
-        let model = language_model.id().0.to_string();
-        let provider = language_model.provider_id().0.to_string();
-
-        self.default_model = Some(LanguageModelSelection {
-            provider: provider.into(),
-            model,
-        });
-    }
-
-    pub fn set_inline_assistant_model(&mut self, provider: String, model: String) {
-        self.inline_assistant_model = Some(LanguageModelSelection {
-            provider: provider.into(),
-            model,
-        });
-    }
-
-    pub fn set_commit_message_model(&mut self, provider: String, model: String) {
-        self.commit_message_model = Some(LanguageModelSelection {
-            provider: provider.into(),
-            model,
-        });
-    }
-
-    pub fn set_thread_summary_model(&mut self, provider: String, model: String) {
-        self.thread_summary_model = Some(LanguageModelSelection {
-            provider: provider.into(),
-            model,
-        });
-    }
-
-    pub fn set_always_allow_tool_actions(&mut self, allow: bool) {
-        self.always_allow_tool_actions = Some(allow);
-    }
-
-    pub fn set_play_sound_when_agent_done(&mut self, allow: bool) {
-        self.play_sound_when_agent_done = Some(allow);
-    }
-
-    pub fn set_single_file_review(&mut self, allow: bool) {
-        self.single_file_review = Some(allow);
-    }
-
-    pub fn set_profile(&mut self, profile_id: AgentProfileId) {
-        self.default_profile = Some(profile_id);
-    }
-
-    pub fn create_profile(
-        &mut self,
-        profile_id: AgentProfileId,
-        profile_settings: AgentProfileSettings,
-    ) -> Result<()> {
-        let profiles = self.profiles.get_or_insert_default();
-        if profiles.contains_key(&profile_id) {
-            bail!("profile with ID '{profile_id}' already exists");
-        }
-
-        profiles.insert(
-            profile_id,
-            AgentProfileContent {
-                name: profile_settings.name.into(),
-                tools: profile_settings.tools,
-                enable_all_context_servers: Some(profile_settings.enable_all_context_servers),
-                context_servers: profile_settings
-                    .context_servers
-                    .into_iter()
-                    .map(|(server_id, preset)| {
-                        (
-                            server_id,
-                            ContextServerPresetContent {
-                                tools: preset.tools,
-                            },
-                        )
-                    })
-                    .collect(),
-            },
-        );
-
-        Ok(())
+impl std::fmt::Display for AgentProfileId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, JsonSchema, Debug, Default)]
-pub struct AgentSettingsContent {
-    /// Whether the Agent is enabled.
-    ///
-    /// Default: true
-    enabled: Option<bool>,
-    /// Whether to show the agent panel button in the status bar.
-    ///
-    /// Default: true
-    button: Option<bool>,
-    /// Where to dock the agent panel.
-    ///
-    /// Default: right
-    dock: Option<AgentDockPosition>,
-    /// Default width in pixels when the agent panel is docked to the left or right.
-    ///
-    /// Default: 640
-    default_width: Option<f32>,
-    /// Default height in pixels when the agent panel is docked to the bottom.
-    ///
-    /// Default: 320
-    default_height: Option<f32>,
-    /// The default model to use when creating new chats and for other features when a specific model is not specified.
-    default_model: Option<LanguageModelSelection>,
-    /// Model to use for the inline assistant. Defaults to default_model when not specified.
-    inline_assistant_model: Option<LanguageModelSelection>,
-    /// Model to use for generating git commit messages. Defaults to default_model when not specified.
-    commit_message_model: Option<LanguageModelSelection>,
-    /// Model to use for generating thread summaries. Defaults to default_model when not specified.
-    thread_summary_model: Option<LanguageModelSelection>,
-    /// Additional models with which to generate alternatives when performing inline assists.
-    inline_alternatives: Option<Vec<LanguageModelSelection>>,
-    /// The default profile to use in the Agent.
-    ///
-    /// Default: write
-    default_profile: Option<AgentProfileId>,
-    /// Which view type to show by default in the agent panel.
-    ///
-    /// Default: "thread"
-    default_view: Option<DefaultView>,
-    /// The available agent profiles.
-    pub profiles: Option<IndexMap<AgentProfileId, AgentProfileContent>>,
-    /// Whenever a tool action would normally wait for your confirmation
-    /// that you allow it, always choose to allow it.
-    ///
-    /// Default: false
-    always_allow_tool_actions: Option<bool>,
-    /// Where to show a popup notification when the agent is waiting for user input.
-    ///
-    /// Default: "primary_screen"
-    notify_when_agent_waiting: Option<NotifyWhenAgentWaiting>,
-    /// Whether to play a sound when the agent has either completed its response, or needs user input.
-    ///
-    /// Default: false
-    play_sound_when_agent_done: Option<bool>,
-    /// Whether to stream edits from the agent as they are received.
-    ///
-    /// Default: false
-    stream_edits: Option<bool>,
-    /// Whether to display agent edits in single-file editors in addition to the review multibuffer pane.
-    ///
-    /// Default: true
-    single_file_review: Option<bool>,
-    /// Additional parameters for language model requests. When making a request
-    /// to a model, parameters will be taken from the last entry in this list
-    /// that matches the model's provider and name. In each entry, both provider
-    /// and model are optional, so that you can specify parameters for either
-    /// one.
-    ///
-    /// Default: []
-    #[serde(default)]
-    model_parameters: Vec<LanguageModelParameters>,
-    /// What completion mode to enable for new threads
-    ///
-    /// Default: normal
-    preferred_completion_mode: Option<CompletionMode>,
-    /// Whether to show thumb buttons for feedback in the agent panel.
-    ///
-    /// Default: true
-    enable_feedback: Option<bool>,
-    /// Whether to have edit cards in the agent panel expanded, showing a preview of the full diff.
-    ///
-    /// Default: true
-    expand_edit_card: Option<bool>,
-    /// Whether to have terminal cards in the agent panel expanded, showing the whole command output.
-    ///
-    /// Default: true
-    expand_terminal_card: Option<bool>,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum CompletionMode {
-    #[default]
-    Normal,
-    #[serde(alias = "max")]
-    Burn,
-}
-
-impl From<CompletionMode> for zed_llm_client::CompletionMode {
-    fn from(value: CompletionMode) -> Self {
-        match value {
-            CompletionMode::Normal => zed_llm_client::CompletionMode::Normal,
-            CompletionMode::Burn => zed_llm_client::CompletionMode::Max,
-        }
+impl Default for AgentProfileId {
+    fn default() -> Self {
+        Self("write".into())
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
-pub struct LanguageModelSelection {
-    pub provider: LanguageModelProviderSetting,
-    pub model: String,
+#[derive(Clone, Debug, Default)]
+pub struct ToolPermissions {
+    /// Global default permission when no tool-specific rules or patterns match.
+    pub default: ToolPermissionMode,
+    pub tools: collections::HashMap<Arc<str>, ToolRules>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct LanguageModelProviderSetting(pub String);
-
-impl JsonSchema for LanguageModelProviderSetting {
-    fn schema_name() -> Cow<'static, str> {
-        "LanguageModelProviderSetting".into()
+impl ToolPermissions {
+    /// Returns all invalid regex patterns across all tools.
+    pub fn invalid_patterns(&self) -> Vec<&InvalidRegexPattern> {
+        self.tools
+            .values()
+            .flat_map(|rules| rules.invalid_patterns.iter())
+            .collect()
     }
 
-    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        json_schema!({
-            "enum": [
-                "anthropic",
-                "amazon-bedrock",
-                "google",
-                "lmstudio",
-                "ollama",
-                "openai",
-                "zed.dev",
-                "copilot_chat",
-                "deepseek",
-                "openrouter",
-                "mistral",
-                "vercel"
-            ]
+    /// Returns true if any tool has invalid regex patterns.
+    pub fn has_invalid_patterns(&self) -> bool {
+        self.tools
+            .values()
+            .any(|rules| !rules.invalid_patterns.is_empty())
+    }
+}
+
+/// Represents a regex pattern that failed to compile.
+#[derive(Clone, Debug)]
+pub struct InvalidRegexPattern {
+    /// The pattern string that failed to compile.
+    pub pattern: String,
+    /// Which rule list this pattern was in (e.g., "always_deny", "always_allow", "always_confirm").
+    pub rule_type: String,
+    /// The error message from the regex compiler.
+    pub error: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ToolRules {
+    pub default: Option<ToolPermissionMode>,
+    pub always_allow: Vec<CompiledRegex>,
+    pub always_deny: Vec<CompiledRegex>,
+    pub always_confirm: Vec<CompiledRegex>,
+    /// Patterns that failed to compile. If non-empty, tool calls should be blocked.
+    pub invalid_patterns: Vec<InvalidRegexPattern>,
+}
+
+#[derive(Clone)]
+pub struct CompiledRegex {
+    pub pattern: String,
+    pub case_sensitive: bool,
+    pub regex: regex::Regex,
+}
+
+impl std::fmt::Debug for CompiledRegex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledRegex")
+            .field("pattern", &self.pattern)
+            .field("case_sensitive", &self.case_sensitive)
+            .finish()
+    }
+}
+
+impl CompiledRegex {
+    pub fn new(pattern: &str, case_sensitive: bool) -> Option<Self> {
+        Self::try_new(pattern, case_sensitive).ok()
+    }
+
+    pub fn try_new(pattern: &str, case_sensitive: bool) -> Result<Self, regex::Error> {
+        let regex = regex::RegexBuilder::new(pattern)
+            .case_insensitive(!case_sensitive)
+            .build()?;
+        Ok(Self {
+            pattern: pattern.to_string(),
+            case_sensitive,
+            regex,
         })
     }
-}
 
-impl From<String> for LanguageModelProviderSetting {
-    fn from(provider: String) -> Self {
-        Self(provider)
+    pub fn is_match(&self, input: &str) -> bool {
+        self.regex.is_match(input)
     }
 }
 
-impl From<&str> for LanguageModelProviderSetting {
-    fn from(provider: &str) -> Self {
-        Self(provider.to_string())
+pub const HARDCODED_SECURITY_DENIAL_MESSAGE: &str = "Blocked by built-in security rule. This operation is considered too \
+     harmful to be allowed, and cannot be overridden by settings.";
+
+/// Security rules that are always enforced and cannot be overridden by any setting.
+/// These protect against catastrophic operations like wiping filesystems.
+pub struct HardcodedSecurityRules {
+    pub terminal_deny: Vec<CompiledRegex>,
+}
+
+pub static HARDCODED_SECURITY_RULES: LazyLock<HardcodedSecurityRules> = LazyLock::new(|| {
+    const FLAGS: &str = r"(--[a-zA-Z0-9][-a-zA-Z0-9_]*(=[^\s]*)?\s+|-[a-zA-Z]+\s+)*";
+    const TRAILING_FLAGS: &str = r"(\s+--[a-zA-Z0-9][-a-zA-Z0-9_]*(=[^\s]*)?|\s+-[a-zA-Z]+)*\s*";
+
+    HardcodedSecurityRules {
+        terminal_deny: vec![
+            // Recursive deletion of root - "rm -rf /", "rm -rf /*"
+            CompiledRegex::new(
+                &format!(r"\brm\s+{FLAGS}(--\s+)?/\*?{TRAILING_FLAGS}$"),
+                false,
+            )
+            .expect("hardcoded regex should compile"),
+            // Recursive deletion of home via tilde - "rm -rf ~", "rm -rf ~/"
+            CompiledRegex::new(
+                &format!(r"\brm\s+{FLAGS}(--\s+)?~/?\*?{TRAILING_FLAGS}$"),
+                false,
+            )
+            .expect("hardcoded regex should compile"),
+            // Recursive deletion of home via env var - "rm -rf $HOME", "rm -rf ${HOME}"
+            CompiledRegex::new(
+                &format!(r"\brm\s+{FLAGS}(--\s+)?(\$HOME|\$\{{HOME\}})/?(\*)?{TRAILING_FLAGS}$"),
+                false,
+            )
+            .expect("hardcoded regex should compile"),
+            // Recursive deletion of current directory - "rm -rf .", "rm -rf ./"
+            CompiledRegex::new(
+                &format!(r"\brm\s+{FLAGS}(--\s+)?\./?\*?{TRAILING_FLAGS}$"),
+                false,
+            )
+            .expect("hardcoded regex should compile"),
+            // Recursive deletion of parent directory - "rm -rf ..", "rm -rf ../"
+            CompiledRegex::new(
+                &format!(r"\brm\s+{FLAGS}(--\s+)?\.\./?\*?{TRAILING_FLAGS}$"),
+                false,
+            )
+            .expect("hardcoded regex should compile"),
+        ],
     }
+});
+
+/// Checks if input matches any hardcoded security rules that cannot be bypassed.
+/// Returns the denial reason string if blocked, None otherwise.
+///
+/// `terminal_tool_name` should be the tool name used for the terminal tool
+/// (e.g. `"terminal"`). `extracted_commands` can optionally provide parsed
+/// sub-commands for chained command checking; callers with access to a shell
+/// parser should extract sub-commands and pass them here.
+pub fn check_hardcoded_security_rules(
+    tool_name: &str,
+    terminal_tool_name: &str,
+    input: &str,
+    extracted_commands: Option<&[String]>,
+) -> Option<String> {
+    if tool_name != terminal_tool_name {
+        return None;
+    }
+
+    let rules = &*HARDCODED_SECURITY_RULES;
+    let terminal_patterns = &rules.terminal_deny;
+
+    if matches_hardcoded_patterns(input, terminal_patterns) {
+        return Some(HARDCODED_SECURITY_DENIAL_MESSAGE.into());
+    }
+
+    if let Some(commands) = extracted_commands {
+        for command in commands {
+            if matches_hardcoded_patterns(command, terminal_patterns) {
+                return Some(HARDCODED_SECURITY_DENIAL_MESSAGE.into());
+            }
+        }
+    }
+
+    None
 }
 
-#[derive(Debug, PartialEq, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct AgentProfileContent {
-    pub name: Arc<str>,
-    #[serde(default)]
-    pub tools: IndexMap<Arc<str>, bool>,
-    /// Whether all context servers are enabled by default.
-    pub enable_all_context_servers: Option<bool>,
-    #[serde(default)]
-    pub context_servers: IndexMap<Arc<str>, ContextServerPresetContent>,
+fn matches_hardcoded_patterns(command: &str, patterns: &[CompiledRegex]) -> bool {
+    for pattern in patterns {
+        if pattern.is_match(command) {
+            return true;
+        }
+    }
+
+    for expanded in expand_rm_to_single_path_commands(command) {
+        for pattern in patterns {
+            if pattern.is_match(&expanded) {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
-#[derive(Debug, PartialEq, Clone, Default, Serialize, Deserialize, JsonSchema)]
-pub struct ContextServerPresetContent {
-    pub tools: IndexMap<Arc<str>, bool>,
+fn expand_rm_to_single_path_commands(command: &str) -> Vec<String> {
+    let trimmed = command.trim();
+
+    let first_token = trimmed.split_whitespace().next();
+    if !first_token.is_some_and(|t| t.eq_ignore_ascii_case("rm")) {
+        return vec![];
+    }
+
+    let parts: Vec<&str> = trimmed.split_whitespace().collect();
+    let mut flags = Vec::new();
+    let mut paths = Vec::new();
+    let mut past_double_dash = false;
+
+    for part in parts.iter().skip(1) {
+        if !past_double_dash && *part == "--" {
+            past_double_dash = true;
+            flags.push(*part);
+            continue;
+        }
+        if !past_double_dash && part.starts_with('-') {
+            flags.push(*part);
+        } else {
+            paths.push(*part);
+        }
+    }
+
+    let flags_str = if flags.is_empty() {
+        String::new()
+    } else {
+        format!("{} ", flags.join(" "))
+    };
+
+    let mut results = Vec::new();
+    for path in &paths {
+        if path.starts_with('$') {
+            let home_prefix = if path.starts_with("${HOME}") {
+                Some("${HOME}")
+            } else if path.starts_with("$HOME") {
+                Some("$HOME")
+            } else {
+                None
+            };
+
+            if let Some(prefix) = home_prefix {
+                let suffix = &path[prefix.len()..];
+                if suffix.is_empty() {
+                    results.push(format!("rm {flags_str}{path}"));
+                } else if suffix.starts_with('/') {
+                    let normalized_suffix = normalize_path(suffix);
+                    let reconstructed = if normalized_suffix == "/" {
+                        prefix.to_string()
+                    } else {
+                        format!("{prefix}{normalized_suffix}")
+                    };
+                    results.push(format!("rm {flags_str}{reconstructed}"));
+                } else {
+                    results.push(format!("rm {flags_str}{path}"));
+                }
+            } else {
+                results.push(format!("rm {flags_str}{path}"));
+            }
+            continue;
+        }
+
+        let mut normalized = normalize_path(path);
+        if normalized.is_empty() && !Path::new(path).has_root() {
+            normalized = ".".to_string();
+        }
+
+        results.push(format!("rm {flags_str}{normalized}"));
+    }
+
+    results
+}
+
+pub fn normalize_path(raw: &str) -> String {
+    let is_absolute = Path::new(raw).has_root();
+    let mut components: Vec<&str> = Vec::new();
+    for component in Path::new(raw).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if components.last() == Some(&"..") {
+                    components.push("..");
+                } else if !components.is_empty() {
+                    components.pop();
+                } else if !is_absolute {
+                    components.push("..");
+                }
+            }
+            Component::Normal(segment) => {
+                if let Some(s) = segment.to_str() {
+                    components.push(s);
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+    let joined = components.join("/");
+    if is_absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    }
 }
 
 impl Settings for AgentSettings {
-    const KEY: Option<&'static str> = Some("agent");
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        let agent = content.agent.clone().unwrap();
+        Self {
+            enabled: agent.enabled.unwrap(),
+            button: agent.button.unwrap(),
+            dock: agent.dock.unwrap(),
+            default_width: px(agent.default_width.unwrap()),
+            default_height: px(agent.default_height.unwrap()),
+            default_model: Some(agent.default_model.unwrap()),
+            inline_assistant_model: agent.inline_assistant_model,
+            inline_assistant_use_streaming_tools: agent
+                .inline_assistant_use_streaming_tools
+                .unwrap_or(true),
+            commit_message_model: agent.commit_message_model,
+            thread_summary_model: agent.thread_summary_model,
+            inline_alternatives: agent.inline_alternatives.unwrap_or_default(),
+            favorite_models: agent.favorite_models,
+            default_profile: AgentProfileId(agent.default_profile.unwrap()),
+            default_view: agent.default_view.unwrap(),
+            profiles: agent
+                .profiles
+                .unwrap()
+                .into_iter()
+                .map(|(key, val)| (AgentProfileId(key), val.into()))
+                .collect(),
 
-    const FALLBACK_KEY: Option<&'static str> = Some("assistant");
-
-    const PRESERVED_KEYS: Option<&'static [&'static str]> = Some(&["version"]);
-
-    type FileContent = AgentSettingsContent;
-
-    fn load(
-        sources: SettingsSources<Self::FileContent>,
-        _: &mut gpui::App,
-    ) -> anyhow::Result<Self> {
-        let mut settings = AgentSettings::default();
-
-        for value in sources.defaults_and_customizations() {
-            merge(&mut settings.enabled, value.enabled);
-            merge(&mut settings.button, value.button);
-            merge(&mut settings.dock, value.dock);
-            merge(
-                &mut settings.default_width,
-                value.default_width.map(Into::into),
-            );
-            merge(
-                &mut settings.default_height,
-                value.default_height.map(Into::into),
-            );
-            settings.default_model = value
-                .default_model
-                .clone()
-                .or(settings.default_model.take());
-            settings.inline_assistant_model = value
-                .inline_assistant_model
-                .clone()
-                .or(settings.inline_assistant_model.take());
-            settings.commit_message_model = value
-                .clone()
-                .commit_message_model
-                .or(settings.commit_message_model.take());
-            settings.thread_summary_model = value
-                .clone()
-                .thread_summary_model
-                .or(settings.thread_summary_model.take());
-            merge(
-                &mut settings.inline_alternatives,
-                value.inline_alternatives.clone(),
-            );
-            merge(
-                &mut settings.always_allow_tool_actions,
-                value.always_allow_tool_actions,
-            );
-            merge(
-                &mut settings.notify_when_agent_waiting,
-                value.notify_when_agent_waiting,
-            );
-            merge(
-                &mut settings.play_sound_when_agent_done,
-                value.play_sound_when_agent_done,
-            );
-            merge(&mut settings.stream_edits, value.stream_edits);
-            merge(&mut settings.single_file_review, value.single_file_review);
-            merge(&mut settings.default_profile, value.default_profile.clone());
-            merge(&mut settings.default_view, value.default_view);
-            merge(
-                &mut settings.preferred_completion_mode,
-                value.preferred_completion_mode,
-            );
-            merge(&mut settings.enable_feedback, value.enable_feedback);
-            merge(&mut settings.expand_edit_card, value.expand_edit_card);
-            merge(
-                &mut settings.expand_terminal_card,
-                value.expand_terminal_card,
-            );
-
-            settings
-                .model_parameters
-                .extend_from_slice(&value.model_parameters);
-
-            if let Some(profiles) = value.profiles.as_ref() {
-                settings
-                    .profiles
-                    .extend(profiles.into_iter().map(|(id, profile)| {
-                        (
-                            id.clone(),
-                            AgentProfileSettings {
-                                name: profile.name.clone().into(),
-                                tools: profile.tools.clone(),
-                                enable_all_context_servers: profile
-                                    .enable_all_context_servers
-                                    .unwrap_or_default(),
-                                context_servers: profile
-                                    .context_servers
-                                    .iter()
-                                    .map(|(context_server_id, preset)| {
-                                        (
-                                            context_server_id.clone(),
-                                            ContextServerPreset {
-                                                tools: preset.tools.clone(),
-                                            },
-                                        )
-                                    })
-                                    .collect(),
-                            },
-                        )
-                    }));
-            }
-        }
-
-        Ok(settings)
-    }
-
-    fn import_from_vscode(vscode: &settings::VsCodeSettings, current: &mut Self::FileContent) {
-        if let Some(b) = vscode
-            .read_value("chat.agent.enabled")
-            .and_then(|b| b.as_bool())
-        {
-            current.enabled = Some(b);
-            current.button = Some(b);
+            notify_when_agent_waiting: agent.notify_when_agent_waiting.unwrap(),
+            play_sound_when_agent_done: agent.play_sound_when_agent_done.unwrap(),
+            single_file_review: agent.single_file_review.unwrap(),
+            model_parameters: agent.model_parameters,
+            enable_feedback: agent.enable_feedback.unwrap(),
+            expand_edit_card: agent.expand_edit_card.unwrap(),
+            expand_terminal_card: agent.expand_terminal_card.unwrap(),
+            cancel_generation_on_terminal_stop: agent.cancel_generation_on_terminal_stop.unwrap(),
+            use_modifier_to_send: agent.use_modifier_to_send.unwrap(),
+            message_editor_min_lines: agent.message_editor_min_lines.unwrap(),
+            show_turn_stats: agent.show_turn_stats.unwrap(),
+            tool_permissions: compile_tool_permissions(agent.tool_permissions),
         }
     }
 }
 
-fn merge<T>(target: &mut T, value: Option<T>) {
-    if let Some(value) = value {
-        *target = value;
+fn compile_tool_permissions(content: Option<settings::ToolPermissionsContent>) -> ToolPermissions {
+    let Some(content) = content else {
+        return ToolPermissions::default();
+    };
+
+    let tools = content
+        .tools
+        .into_iter()
+        .map(|(tool_name, rules_content)| {
+            let mut invalid_patterns = Vec::new();
+
+            let (always_allow, allow_errors) = compile_regex_rules(
+                rules_content.always_allow.map(|v| v.0).unwrap_or_default(),
+                "always_allow",
+            );
+            invalid_patterns.extend(allow_errors);
+
+            let (always_deny, deny_errors) = compile_regex_rules(
+                rules_content.always_deny.map(|v| v.0).unwrap_or_default(),
+                "always_deny",
+            );
+            invalid_patterns.extend(deny_errors);
+
+            let (always_confirm, confirm_errors) = compile_regex_rules(
+                rules_content
+                    .always_confirm
+                    .map(|v| v.0)
+                    .unwrap_or_default(),
+                "always_confirm",
+            );
+            invalid_patterns.extend(confirm_errors);
+
+            // Log invalid patterns for debugging. Users will see an error when they
+            // attempt to use a tool with invalid patterns in their settings.
+            for invalid in &invalid_patterns {
+                log::error!(
+                    "Invalid regex pattern in tool_permissions for '{}' tool ({}): '{}' - {}",
+                    tool_name,
+                    invalid.rule_type,
+                    invalid.pattern,
+                    invalid.error,
+                );
+            }
+
+            let rules = ToolRules {
+                // Preserve tool-specific default; None means fall back to global default at decision time
+                default: rules_content.default,
+                always_allow,
+                always_deny,
+                always_confirm,
+                invalid_patterns,
+            };
+            (tool_name, rules)
+        })
+        .collect();
+
+    ToolPermissions {
+        default: content.default.unwrap_or_default(),
+        tools,
+    }
+}
+
+fn compile_regex_rules(
+    rules: Vec<settings::ToolRegexRule>,
+    rule_type: &str,
+) -> (Vec<CompiledRegex>, Vec<InvalidRegexPattern>) {
+    let mut compiled = Vec::new();
+    let mut errors = Vec::new();
+
+    for rule in rules {
+        if rule.pattern.is_empty() {
+            errors.push(InvalidRegexPattern {
+                pattern: rule.pattern,
+                rule_type: rule_type.to_string(),
+                error: "empty regex patterns are not allowed".to_string(),
+            });
+            continue;
+        }
+        let case_sensitive = rule.case_sensitive.unwrap_or(false);
+        match CompiledRegex::try_new(&rule.pattern, case_sensitive) {
+            Ok(regex) => compiled.push(regex),
+            Err(error) => {
+                errors.push(InvalidRegexPattern {
+                    pattern: rule.pattern,
+                    rule_type: rule_type.to_string(),
+                    error: error.to_string(),
+                });
+            }
+        }
+    }
+
+    (compiled, errors)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use settings::ToolPermissionMode;
+    use settings::ToolPermissionsContent;
+
+    #[test]
+    fn test_compiled_regex_case_insensitive() {
+        let regex = CompiledRegex::new("rm\\s+-rf", false).unwrap();
+        assert!(regex.is_match("rm -rf /"));
+        assert!(regex.is_match("RM -RF /"));
+        assert!(regex.is_match("Rm -Rf /"));
+    }
+
+    #[test]
+    fn test_compiled_regex_case_sensitive() {
+        let regex = CompiledRegex::new("DROP\\s+TABLE", true).unwrap();
+        assert!(regex.is_match("DROP TABLE users"));
+        assert!(!regex.is_match("drop table users"));
+    }
+
+    #[test]
+    fn test_invalid_regex_returns_none() {
+        let result = CompiledRegex::new("[invalid(regex", false);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_tool_permissions_parsing() {
+        let json = json!({
+            "tools": {
+                "terminal": {
+                    "default": "allow",
+                    "always_deny": [
+                        { "pattern": "rm\\s+-rf" }
+                    ],
+                    "always_allow": [
+                        { "pattern": "^git\\s" }
+                    ]
+                }
+            }
+        });
+
+        let content: ToolPermissionsContent = serde_json::from_value(json).unwrap();
+        let permissions = compile_tool_permissions(Some(content));
+
+        let terminal_rules = permissions.tools.get("terminal").unwrap();
+        assert_eq!(terminal_rules.default, Some(ToolPermissionMode::Allow));
+        assert_eq!(terminal_rules.always_deny.len(), 1);
+        assert_eq!(terminal_rules.always_allow.len(), 1);
+        assert!(terminal_rules.always_deny[0].is_match("rm -rf /"));
+        assert!(terminal_rules.always_allow[0].is_match("git status"));
+    }
+
+    #[test]
+    fn test_tool_rules_default() {
+        let json = json!({
+            "tools": {
+                "edit_file": {
+                    "default": "deny"
+                }
+            }
+        });
+
+        let content: ToolPermissionsContent = serde_json::from_value(json).unwrap();
+        let permissions = compile_tool_permissions(Some(content));
+
+        let rules = permissions.tools.get("edit_file").unwrap();
+        assert_eq!(rules.default, Some(ToolPermissionMode::Deny));
+    }
+
+    #[test]
+    fn test_tool_permissions_empty() {
+        let permissions = compile_tool_permissions(None);
+        assert!(permissions.tools.is_empty());
+        assert_eq!(permissions.default, ToolPermissionMode::Confirm);
+    }
+
+    #[test]
+    fn test_tool_rules_default_returns_confirm() {
+        let default_rules = ToolRules::default();
+        assert_eq!(default_rules.default, None);
+        assert!(default_rules.always_allow.is_empty());
+        assert!(default_rules.always_deny.is_empty());
+        assert!(default_rules.always_confirm.is_empty());
+    }
+
+    #[test]
+    fn test_tool_permissions_with_multiple_tools() {
+        let json = json!({
+            "tools": {
+                "terminal": {
+                    "default": "allow",
+                    "always_deny": [{ "pattern": "rm\\s+-rf" }]
+                },
+                "edit_file": {
+                    "default": "confirm",
+                    "always_deny": [{ "pattern": "\\.env$" }]
+                },
+                "delete_path": {
+                    "default": "deny"
+                }
+            }
+        });
+
+        let content: ToolPermissionsContent = serde_json::from_value(json).unwrap();
+        let permissions = compile_tool_permissions(Some(content));
+
+        assert_eq!(permissions.tools.len(), 3);
+
+        let terminal = permissions.tools.get("terminal").unwrap();
+        assert_eq!(terminal.default, Some(ToolPermissionMode::Allow));
+        assert_eq!(terminal.always_deny.len(), 1);
+
+        let edit_file = permissions.tools.get("edit_file").unwrap();
+        assert_eq!(edit_file.default, Some(ToolPermissionMode::Confirm));
+        assert!(edit_file.always_deny[0].is_match("secrets.env"));
+
+        let delete_path = permissions.tools.get("delete_path").unwrap();
+        assert_eq!(delete_path.default, Some(ToolPermissionMode::Deny));
+    }
+
+    #[test]
+    fn test_tool_permissions_with_all_rule_types() {
+        let json = json!({
+            "tools": {
+                "terminal": {
+                    "always_deny": [{ "pattern": "rm\\s+-rf" }],
+                    "always_confirm": [{ "pattern": "sudo\\s" }],
+                    "always_allow": [{ "pattern": "^git\\s+status" }]
+                }
+            }
+        });
+
+        let content: ToolPermissionsContent = serde_json::from_value(json).unwrap();
+        let permissions = compile_tool_permissions(Some(content));
+
+        let terminal = permissions.tools.get("terminal").unwrap();
+        assert_eq!(terminal.always_deny.len(), 1);
+        assert_eq!(terminal.always_confirm.len(), 1);
+        assert_eq!(terminal.always_allow.len(), 1);
+
+        assert!(terminal.always_deny[0].is_match("rm -rf /"));
+        assert!(terminal.always_confirm[0].is_match("sudo apt install"));
+        assert!(terminal.always_allow[0].is_match("git status"));
+    }
+
+    #[test]
+    fn test_invalid_regex_is_tracked_and_valid_ones_still_compile() {
+        let json = json!({
+            "tools": {
+                "terminal": {
+                    "always_deny": [
+                        { "pattern": "[invalid(regex" },
+                        { "pattern": "valid_pattern" }
+                    ],
+                    "always_allow": [
+                        { "pattern": "[another_bad" }
+                    ]
+                }
+            }
+        });
+
+        let content: ToolPermissionsContent = serde_json::from_value(json).unwrap();
+        let permissions = compile_tool_permissions(Some(content));
+
+        let terminal = permissions.tools.get("terminal").unwrap();
+
+        // Valid patterns should still be compiled
+        assert_eq!(terminal.always_deny.len(), 1);
+        assert!(terminal.always_deny[0].is_match("valid_pattern"));
+
+        // Invalid patterns should be tracked (order depends on processing order)
+        assert_eq!(terminal.invalid_patterns.len(), 2);
+
+        let deny_invalid = terminal
+            .invalid_patterns
+            .iter()
+            .find(|p| p.rule_type == "always_deny")
+            .expect("should have invalid pattern from always_deny");
+        assert_eq!(deny_invalid.pattern, "[invalid(regex");
+        assert!(!deny_invalid.error.is_empty());
+
+        let allow_invalid = terminal
+            .invalid_patterns
+            .iter()
+            .find(|p| p.rule_type == "always_allow")
+            .expect("should have invalid pattern from always_allow");
+        assert_eq!(allow_invalid.pattern, "[another_bad");
+
+        // ToolPermissions helper methods should work
+        assert!(permissions.has_invalid_patterns());
+        assert_eq!(permissions.invalid_patterns().len(), 2);
+    }
+
+    #[test]
+    fn test_deny_takes_precedence_over_allow_and_confirm() {
+        let json = json!({
+            "tools": {
+                "terminal": {
+                    "default": "allow",
+                    "always_deny": [{ "pattern": "dangerous" }],
+                    "always_confirm": [{ "pattern": "dangerous" }],
+                    "always_allow": [{ "pattern": "dangerous" }]
+                }
+            }
+        });
+
+        let content: ToolPermissionsContent = serde_json::from_value(json).unwrap();
+        let permissions = compile_tool_permissions(Some(content));
+        let terminal = permissions.tools.get("terminal").unwrap();
+
+        assert!(
+            terminal.always_deny[0].is_match("run dangerous command"),
+            "Deny rule should match"
+        );
+        assert!(
+            terminal.always_allow[0].is_match("run dangerous command"),
+            "Allow rule should also match (but deny takes precedence at evaluation time)"
+        );
+        assert!(
+            terminal.always_confirm[0].is_match("run dangerous command"),
+            "Confirm rule should also match (but deny takes precedence at evaluation time)"
+        );
+    }
+
+    #[test]
+    fn test_confirm_takes_precedence_over_allow() {
+        let json = json!({
+            "tools": {
+                "terminal": {
+                    "default": "allow",
+                    "always_confirm": [{ "pattern": "risky" }],
+                    "always_allow": [{ "pattern": "risky" }]
+                }
+            }
+        });
+
+        let content: ToolPermissionsContent = serde_json::from_value(json).unwrap();
+        let permissions = compile_tool_permissions(Some(content));
+        let terminal = permissions.tools.get("terminal").unwrap();
+
+        assert!(
+            terminal.always_confirm[0].is_match("do risky thing"),
+            "Confirm rule should match"
+        );
+        assert!(
+            terminal.always_allow[0].is_match("do risky thing"),
+            "Allow rule should also match (but confirm takes precedence at evaluation time)"
+        );
+    }
+
+    #[test]
+    fn test_regex_matches_anywhere_in_string_not_just_anchored() {
+        let json = json!({
+            "tools": {
+                "terminal": {
+                    "always_deny": [
+                        { "pattern": "rm\\s+-rf" },
+                        { "pattern": "/etc/passwd" }
+                    ]
+                }
+            }
+        });
+
+        let content: ToolPermissionsContent = serde_json::from_value(json).unwrap();
+        let permissions = compile_tool_permissions(Some(content));
+        let terminal = permissions.tools.get("terminal").unwrap();
+
+        assert!(
+            terminal.always_deny[0].is_match("echo hello && rm -rf /"),
+            "Should match rm -rf in the middle of a command chain"
+        );
+        assert!(
+            terminal.always_deny[0].is_match("cd /tmp; rm -rf *"),
+            "Should match rm -rf after semicolon"
+        );
+        assert!(
+            terminal.always_deny[1].is_match("cat /etc/passwd | grep root"),
+            "Should match /etc/passwd in a pipeline"
+        );
+        assert!(
+            terminal.always_deny[1].is_match("vim /etc/passwd"),
+            "Should match /etc/passwd as argument"
+        );
+    }
+
+    #[test]
+    fn test_fork_bomb_pattern_matches() {
+        let fork_bomb_regex = CompiledRegex::new(r":\(\)\{\s*:\|:&\s*\};:", false).unwrap();
+        assert!(
+            fork_bomb_regex.is_match(":(){ :|:& };:"),
+            "Should match the classic fork bomb"
+        );
+        assert!(
+            fork_bomb_regex.is_match(":(){ :|:&};:"),
+            "Should match fork bomb without spaces"
+        );
+    }
+
+    #[test]
+    fn test_compiled_regex_stores_case_sensitivity() {
+        let case_sensitive = CompiledRegex::new("test", true).unwrap();
+        let case_insensitive = CompiledRegex::new("test", false).unwrap();
+
+        assert!(case_sensitive.case_sensitive);
+        assert!(!case_insensitive.case_sensitive);
+    }
+
+    #[test]
+    fn test_invalid_regex_is_skipped_not_fail() {
+        let json = json!({
+            "tools": {
+                "terminal": {
+                    "always_deny": [
+                        { "pattern": "[invalid(regex" },
+                        { "pattern": "valid_pattern" }
+                    ]
+                }
+            }
+        });
+
+        let content: ToolPermissionsContent = serde_json::from_value(json).unwrap();
+        let permissions = compile_tool_permissions(Some(content));
+
+        let terminal = permissions.tools.get("terminal").unwrap();
+        assert_eq!(terminal.always_deny.len(), 1);
+        assert!(terminal.always_deny[0].is_match("valid_pattern"));
+    }
+
+    #[test]
+    fn test_unconfigured_tool_not_in_permissions() {
+        let json = json!({
+            "tools": {
+                "terminal": {
+                    "default": "allow"
+                }
+            }
+        });
+
+        let content: ToolPermissionsContent = serde_json::from_value(json).unwrap();
+        let permissions = compile_tool_permissions(Some(content));
+
+        assert!(permissions.tools.contains_key("terminal"));
+        assert!(!permissions.tools.contains_key("edit_file"));
+        assert!(!permissions.tools.contains_key("fetch"));
+    }
+
+    #[test]
+    fn test_always_allow_pattern_only_matches_specified_commands() {
+        // Reproduces user-reported bug: when always_allow has pattern "^echo\s",
+        // only "echo hello" should be allowed, not "git status".
+        //
+        // User config:
+        //   always_allow_tool_actions: false
+        //   tool_permissions.tools.terminal.always_allow: [{ pattern: "^echo\\s" }]
+        let json = json!({
+            "tools": {
+                "terminal": {
+                    "always_allow": [
+                        { "pattern": "^echo\\s" }
+                    ]
+                }
+            }
+        });
+
+        let content: ToolPermissionsContent = serde_json::from_value(json).unwrap();
+        let permissions = compile_tool_permissions(Some(content));
+
+        let terminal = permissions.tools.get("terminal").unwrap();
+
+        // Verify the pattern was compiled
+        assert_eq!(
+            terminal.always_allow.len(),
+            1,
+            "Should have one always_allow pattern"
+        );
+
+        // Verify the pattern matches "echo hello"
+        assert!(
+            terminal.always_allow[0].is_match("echo hello"),
+            "Pattern ^echo\\s should match 'echo hello'"
+        );
+
+        // Verify the pattern does NOT match "git status"
+        assert!(
+            !terminal.always_allow[0].is_match("git status"),
+            "Pattern ^echo\\s should NOT match 'git status'"
+        );
+
+        // Verify the pattern does NOT match "echoHello" (no space)
+        assert!(
+            !terminal.always_allow[0].is_match("echoHello"),
+            "Pattern ^echo\\s should NOT match 'echoHello' (requires whitespace)"
+        );
+
+        assert_eq!(
+            terminal.default, None,
+            "default should be None when not specified"
+        );
+    }
+
+    #[test]
+    fn test_empty_regex_pattern_is_invalid() {
+        let json = json!({
+            "tools": {
+                "terminal": {
+                    "always_allow": [
+                        { "pattern": "" }
+                    ],
+                    "always_deny": [
+                        { "case_sensitive": true }
+                    ],
+                    "always_confirm": [
+                        { "pattern": "" },
+                        { "pattern": "valid_pattern" }
+                    ]
+                }
+            }
+        });
+
+        let content: ToolPermissionsContent = serde_json::from_value(json).unwrap();
+        let permissions = compile_tool_permissions(Some(content));
+
+        let terminal = permissions.tools.get("terminal").unwrap();
+
+        assert_eq!(terminal.always_allow.len(), 0);
+        assert_eq!(terminal.always_deny.len(), 0);
+        assert_eq!(terminal.always_confirm.len(), 1);
+        assert!(terminal.always_confirm[0].is_match("valid_pattern"));
+
+        assert_eq!(terminal.invalid_patterns.len(), 3);
+        for invalid in &terminal.invalid_patterns {
+            assert_eq!(invalid.pattern, "");
+            assert!(invalid.error.contains("empty"));
+        }
+    }
+
+    #[test]
+    fn test_default_json_tool_permissions_parse() {
+        let default_json = include_str!("../../../assets/settings/default.json");
+        let value: serde_json_lenient::Value = serde_json_lenient::from_str(default_json).unwrap();
+        let agent = value
+            .get("agent")
+            .expect("default.json should have 'agent' key");
+        let tool_permissions_value = agent
+            .get("tool_permissions")
+            .expect("agent should have 'tool_permissions' key");
+
+        let content: ToolPermissionsContent =
+            serde_json_lenient::from_value(tool_permissions_value.clone()).unwrap();
+        let permissions = compile_tool_permissions(Some(content));
+
+        assert_eq!(permissions.default, ToolPermissionMode::Confirm);
+
+        assert!(
+            permissions.tools.is_empty(),
+            "default.json should not have any active tool-specific rules, found: {:?}",
+            permissions.tools.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_tool_permissions_explicit_global_default() {
+        let json_allow = json!({
+            "default": "allow"
+        });
+        let content: ToolPermissionsContent = serde_json::from_value(json_allow).unwrap();
+        let permissions = compile_tool_permissions(Some(content));
+        assert_eq!(permissions.default, ToolPermissionMode::Allow);
+
+        let json_deny = json!({
+            "default": "deny"
+        });
+        let content: ToolPermissionsContent = serde_json::from_value(json_deny).unwrap();
+        let permissions = compile_tool_permissions(Some(content));
+        assert_eq!(permissions.default, ToolPermissionMode::Deny);
     }
 }

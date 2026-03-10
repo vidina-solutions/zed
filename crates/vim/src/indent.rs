@@ -5,6 +5,8 @@ use editor::{Bias, Editor, display_map::ToDisplayPoint};
 use gpui::actions;
 use gpui::{Context, Window};
 use language::SelectionGoal;
+use settings::Settings;
+use vim_mode_setting::HelixModeSetting;
 
 #[derive(PartialEq, Eq)]
 pub(crate) enum IndentDirection {
@@ -31,13 +33,15 @@ pub(crate) fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
         let count = Vim::take_count(cx).unwrap_or(1);
         Vim::take_forced_motion(cx);
         vim.store_visual_marks(window, cx);
-        vim.update_editor(window, cx, |vim, editor, window, cx| {
+        vim.update_editor(cx, |vim, editor, cx| {
             editor.transact(window, cx, |editor, window, cx| {
                 let original_positions = vim.save_selection_starts(editor, cx);
                 for _ in 0..count {
                     editor.indent(&Default::default(), window, cx);
                 }
-                vim.restore_selection_cursors(editor, window, cx, original_positions);
+                if !HelixModeSetting::get_global(cx).0 {
+                    vim.restore_selection_cursors(editor, window, cx, original_positions);
+                }
             });
         });
         if vim.mode.is_visual() {
@@ -50,13 +54,15 @@ pub(crate) fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
         let count = Vim::take_count(cx).unwrap_or(1);
         Vim::take_forced_motion(cx);
         vim.store_visual_marks(window, cx);
-        vim.update_editor(window, cx, |vim, editor, window, cx| {
+        vim.update_editor(cx, |vim, editor, cx| {
             editor.transact(window, cx, |editor, window, cx| {
                 let original_positions = vim.save_selection_starts(editor, cx);
                 for _ in 0..count {
                     editor.outdent(&Default::default(), window, cx);
                 }
-                vim.restore_selection_cursors(editor, window, cx, original_positions);
+                if !HelixModeSetting::get_global(cx).0 {
+                    vim.restore_selection_cursors(editor, window, cx, original_positions);
+                }
             });
         });
         if vim.mode.is_visual() {
@@ -69,7 +75,7 @@ pub(crate) fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
         let count = Vim::take_count(cx).unwrap_or(1);
         Vim::take_forced_motion(cx);
         vim.store_visual_marks(window, cx);
-        vim.update_editor(window, cx, |vim, editor, window, cx| {
+        vim.update_editor(cx, |vim, editor, cx| {
             editor.transact(window, cx, |editor, window, cx| {
                 let original_positions = vim.save_selection_starts(editor, cx);
                 for _ in 0..count {
@@ -95,12 +101,12 @@ impl Vim {
         cx: &mut Context<Self>,
     ) {
         self.stop_recording(cx);
-        self.update_editor(window, cx, |_, editor, window, cx| {
-            let text_layout_details = editor.text_layout_details(window);
+        self.update_editor(cx, |_, editor, cx| {
+            let text_layout_details = editor.text_layout_details(window, cx);
             editor.transact(window, cx, |editor, window, cx| {
                 let mut selection_starts: HashMap<_, _> = Default::default();
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         let anchor = map.display_point_to_anchor(selection.head(), Bias::Right);
                         selection_starts.insert(selection.id, anchor);
                         motion.expand_selection(
@@ -118,7 +124,7 @@ impl Vim {
                     IndentDirection::Auto => editor.autoindent(&Default::default(), window, cx),
                 }
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         let anchor = selection_starts.remove(&selection.id).unwrap();
                         selection.collapse_to(anchor.to_display_point(map), SelectionGoal::None);
                     });
@@ -137,11 +143,11 @@ impl Vim {
         cx: &mut Context<Self>,
     ) {
         self.stop_recording(cx);
-        self.update_editor(window, cx, |_, editor, window, cx| {
+        self.update_editor(cx, |_, editor, cx| {
             editor.transact(window, cx, |editor, window, cx| {
                 let mut original_positions: HashMap<_, _> = Default::default();
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         let anchor = map.display_point_to_anchor(selection.head(), Bias::Right);
                         original_positions.insert(selection.id, anchor);
                         object.expand_selection(map, selection, around, times);
@@ -153,7 +159,7 @@ impl Vim {
                     IndentDirection::Auto => editor.autoindent(&Default::default(), window, cx),
                 }
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         let anchor = original_positions.remove(&selection.id).unwrap();
                         selection.collapse_to(anchor.to_display_point(map), SelectionGoal::None);
                     });
@@ -181,6 +187,20 @@ mod test {
         cx.shared_state()
             .await
             .assert_eq("«    hello\n ˇ»   world\n");
+    }
+
+    #[gpui::test]
+    async fn test_indent_hx(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.enable_helix();
+
+        cx.set_state("«Hello\nWorldˇ»\n", Mode::HelixNormal);
+
+        cx.simulate_keystrokes(">");
+        cx.assert_state("    «Hello\n    Worldˇ»\n", Mode::HelixNormal);
+
+        cx.simulate_keystrokes("<");
+        cx.assert_state("«Hello\nWorldˇ»\n", Mode::HelixNormal);
     }
 
     #[gpui::test]

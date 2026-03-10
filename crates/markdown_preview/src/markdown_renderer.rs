@@ -1,42 +1,187 @@
-use crate::markdown_elements::{
-    HeadingLevel, Link, MarkdownParagraph, MarkdownParagraphChunk, ParsedMarkdown,
-    ParsedMarkdownBlockQuote, ParsedMarkdownCodeBlock, ParsedMarkdownElement,
-    ParsedMarkdownHeading, ParsedMarkdownListItem, ParsedMarkdownListItemType, ParsedMarkdownTable,
-    ParsedMarkdownTableAlignment, ParsedMarkdownTableRow,
+use crate::{
+    markdown_elements::{
+        HeadingLevel, Image, Link, MarkdownParagraph, MarkdownParagraphChunk, ParsedMarkdown,
+        ParsedMarkdownBlockQuote, ParsedMarkdownCodeBlock, ParsedMarkdownElement,
+        ParsedMarkdownHeading, ParsedMarkdownListItem, ParsedMarkdownListItemType,
+        ParsedMarkdownMermaidDiagram, ParsedMarkdownMermaidDiagramContents, ParsedMarkdownTable,
+        ParsedMarkdownTableAlignment, ParsedMarkdownTableRow,
+    },
+    markdown_preview_view::MarkdownPreviewView,
 };
+use collections::HashMap;
 use fs::normalize_path;
 use gpui::{
-    AbsoluteLength, AnyElement, App, AppContext as _, ClipboardItem, Context, DefiniteLength, Div,
+    AbsoluteLength, Animation, AnimationExt, AnyElement, App, AppContext as _, Context, Div,
     Element, ElementId, Entity, HighlightStyle, Hsla, ImageSource, InteractiveText, IntoElement,
-    Keystroke, Length, Modifiers, ParentElement, Render, Resource, SharedString, Styled,
-    StyledText, TextStyle, WeakEntity, Window, div, img, rems,
+    Keystroke, Modifiers, ParentElement, Render, RenderImage, Resource, SharedString, Styled,
+    StyledText, Task, TextStyle, WeakEntity, Window, div, img, pulsating_between, rems,
 };
 use settings::Settings;
 use std::{
     ops::{Mul, Range},
-    sync::Arc,
+    sync::{Arc, OnceLock},
+    time::Duration,
     vec,
 };
 use theme::{ActiveTheme, SyntaxTheme, ThemeSettings};
-use ui::{
-    ButtonCommon, Clickable, Color, FluentBuilder, IconButton, IconName, IconSize,
-    InteractiveElement, Label, LabelCommon, LabelSize, LinkPreview, Pixels, Rems,
-    StatefulInteractiveElement, StyledExt, StyledImage, ToggleState, Tooltip, VisibleOnHover,
-    h_flex, relative, tooltip_container, v_flex,
-};
+use ui::{CopyButton, LinkPreview, ToggleState, prelude::*, tooltip_container};
 use workspace::{OpenOptions, OpenVisible, Workspace};
 
-type CheckboxClickedCallback = Arc<Box<dyn Fn(bool, Range<usize>, &mut Window, &mut App)>>;
+pub struct CheckboxClickedEvent {
+    pub checked: bool,
+    pub source_range: Range<usize>,
+}
 
+impl CheckboxClickedEvent {
+    pub fn source_range(&self) -> Range<usize> {
+        self.source_range.clone()
+    }
+
+    pub fn checked(&self) -> bool {
+        self.checked
+    }
+}
+
+type CheckboxClickedCallback = Arc<Box<dyn Fn(&CheckboxClickedEvent, &mut Window, &mut App)>>;
+
+type MermaidDiagramCache = HashMap<ParsedMarkdownMermaidDiagramContents, CachedMermaidDiagram>;
+
+#[derive(Default)]
+pub(crate) struct MermaidState {
+    cache: MermaidDiagramCache,
+    order: Vec<ParsedMarkdownMermaidDiagramContents>,
+}
+
+impl MermaidState {
+    fn get_fallback_image(
+        idx: usize,
+        old_order: &[ParsedMarkdownMermaidDiagramContents],
+        new_order_len: usize,
+        cache: &MermaidDiagramCache,
+    ) -> Option<Arc<RenderImage>> {
+        // When the diagram count changes e.g. addition or removal, positional matching
+        // is unreliable since a new diagram at index i likely doesn't correspond to the
+        // old diagram at index i. We only allow fallbacks when counts match, which covers
+        // the common case of editing a diagram in-place.
+        //
+        // Swapping two diagrams would briefly show the stale fallback, but that's an edge
+        // case we don't handle.
+        if old_order.len() != new_order_len {
+            return None;
+        }
+        old_order.get(idx).and_then(|old_content| {
+            cache.get(old_content).and_then(|old_cached| {
+                old_cached
+                    .render_image
+                    .get()
+                    .and_then(|result| result.as_ref().ok().cloned())
+                    // Chain fallbacks for rapid edits.
+                    .or_else(|| old_cached.fallback_image.clone())
+            })
+        })
+    }
+
+    pub(crate) fn update(
+        &mut self,
+        parsed: &ParsedMarkdown,
+        cx: &mut Context<MarkdownPreviewView>,
+    ) {
+        use crate::markdown_elements::ParsedMarkdownElement;
+        use std::collections::HashSet;
+
+        let mut new_order = Vec::new();
+        for element in parsed.children.iter() {
+            if let ParsedMarkdownElement::MermaidDiagram(mermaid_diagram) = element {
+                new_order.push(mermaid_diagram.contents.clone());
+            }
+        }
+
+        for (idx, new_content) in new_order.iter().enumerate() {
+            if !self.cache.contains_key(new_content) {
+                let fallback =
+                    Self::get_fallback_image(idx, &self.order, new_order.len(), &self.cache);
+                self.cache.insert(
+                    new_content.clone(),
+                    CachedMermaidDiagram::new(new_content.clone(), fallback, cx),
+                );
+            }
+        }
+
+        let new_order_set: HashSet<_> = new_order.iter().cloned().collect();
+        self.cache
+            .retain(|content, _| new_order_set.contains(content));
+        self.order = new_order;
+    }
+}
+
+pub(crate) struct CachedMermaidDiagram {
+    pub(crate) render_image: Arc<OnceLock<anyhow::Result<Arc<RenderImage>>>>,
+    pub(crate) fallback_image: Option<Arc<RenderImage>>,
+    _task: Task<()>,
+}
+
+impl CachedMermaidDiagram {
+    pub(crate) fn new(
+        contents: ParsedMarkdownMermaidDiagramContents,
+        fallback_image: Option<Arc<RenderImage>>,
+        cx: &mut Context<MarkdownPreviewView>,
+    ) -> Self {
+        let result = Arc::new(OnceLock::<anyhow::Result<Arc<RenderImage>>>::new());
+        let result_clone = result.clone();
+        let svg_renderer = cx.svg_renderer();
+
+        let _task = cx.spawn(async move |this, cx| {
+            let value = cx
+                .background_spawn(async move {
+                    let svg_string = mermaid_rs_renderer::render(&contents.contents)?;
+                    let scale = contents.scale as f32 / 100.0;
+                    svg_renderer
+                        .render_single_frame(svg_string.as_bytes(), scale, true)
+                        .map_err(|e| anyhow::anyhow!("{}", e))
+                })
+                .await;
+            let _ = result_clone.set(value);
+            this.update(cx, |_, cx| {
+                cx.notify();
+            })
+            .ok();
+        });
+
+        Self {
+            render_image: result,
+            fallback_image,
+            _task,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_test(
+        render_image: Option<Arc<RenderImage>>,
+        fallback_image: Option<Arc<RenderImage>>,
+    ) -> Self {
+        let result = Arc::new(OnceLock::new());
+        if let Some(img) = render_image {
+            let _ = result.set(Ok(img));
+        }
+        Self {
+            render_image: result,
+            fallback_image,
+            _task: Task::ready(()),
+        }
+    }
+}
 #[derive(Clone)]
-pub struct RenderContext {
+pub struct RenderContext<'a> {
     workspace: Option<WeakEntity<Workspace>>,
     next_id: usize,
     buffer_font_family: SharedString,
     buffer_text_style: TextStyle,
     text_style: TextStyle,
     border_color: Hsla,
+    title_bar_background_color: Hsla,
+    panel_background_color: Hsla,
     text_color: Hsla,
+    link_color: Hsla,
     window_rem_size: Pixels,
     text_muted_color: Hsla,
     code_block_background_color: Hsla,
@@ -44,20 +189,25 @@ pub struct RenderContext {
     syntax_theme: Arc<SyntaxTheme>,
     indent: usize,
     checkbox_clicked_callback: Option<CheckboxClickedCallback>,
+    is_last_child: bool,
+    mermaid_state: &'a MermaidState,
 }
 
-impl RenderContext {
-    pub fn new(
+impl<'a> RenderContext<'a> {
+    pub(crate) fn new(
         workspace: Option<WeakEntity<Workspace>>,
+        mermaid_state: &'a MermaidState,
         window: &mut Window,
         cx: &mut App,
-    ) -> RenderContext {
+    ) -> Self {
         let theme = cx.theme().clone();
 
         let settings = ThemeSettings::get_global(cx);
         let buffer_font_family = settings.buffer_font.family.clone();
+        let buffer_font_features = settings.buffer_font.features.clone();
         let mut buffer_text_style = window.text_style();
         buffer_text_style.font_family = buffer_font_family.clone();
+        buffer_text_style.font_features = buffer_font_features;
         buffer_text_style.font_size = AbsoluteLength::from(settings.buffer_font_size(cx));
 
         RenderContext {
@@ -69,18 +219,23 @@ impl RenderContext {
             text_style: window.text_style(),
             syntax_theme: theme.syntax().clone(),
             border_color: theme.colors().border,
+            title_bar_background_color: theme.colors().title_bar_background,
+            panel_background_color: theme.colors().panel_background,
             text_color: theme.colors().text,
+            link_color: theme.colors().text_accent,
             window_rem_size: window.rem_size(),
             text_muted_color: theme.colors().text_muted,
             code_block_background_color: theme.colors().surface_background,
             code_span_background_color: theme.colors().editor_document_highlight_read_background,
             checkbox_clicked_callback: None,
+            is_last_child: false,
+            mermaid_state,
         }
     }
 
     pub fn with_checkbox_clicked_callback(
         mut self,
-        callback: impl Fn(bool, Range<usize>, &mut Window, &mut App) + 'static,
+        callback: impl Fn(&CheckboxClickedEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.checkbox_clicked_callback = Some(Arc::new(Box::new(callback)));
         self
@@ -96,11 +251,10 @@ impl RenderContext {
     /// buffer font size changes. The callees of this function should be reimplemented to use real
     /// relative sizing once that is implemented in GPUI
     pub fn scaled_rems(&self, rems: f32) -> Rems {
-        return self
-            .buffer_text_style
+        self.buffer_text_style
             .font_size
             .to_rems(self.window_rem_size)
-            .mul(rems);
+            .mul(rems)
     }
 
     /// This ensures that children inside of block quotes
@@ -117,11 +271,24 @@ impl RenderContext {
     /// We give padding between "This is a block quote."
     /// and "And this is the next paragraph."
     fn with_common_p(&self, element: Div) -> Div {
-        if self.indent > 0 {
+        if self.indent > 0 && !self.is_last_child {
             element.pb(self.scaled_rems(0.75))
         } else {
             element
         }
+    }
+
+    /// The is used to indicate that the current element is the last child or not of its parent.
+    ///
+    /// Then we can avoid adding padding to the bottom of the last child.
+    fn with_last_child<R>(&mut self, is_last: bool, render: R) -> AnyElement
+    where
+        R: FnOnce(&mut Self) -> AnyElement,
+    {
+        self.is_last_child = is_last;
+        let element = render(self);
+        self.is_last_child = false;
+        element
     }
 }
 
@@ -131,7 +298,8 @@ pub fn render_parsed_markdown(
     window: &mut Window,
     cx: &mut App,
 ) -> Div {
-    let mut cx = RenderContext::new(workspace, window, cx);
+    let cache = Default::default();
+    let mut cx = RenderContext::new(workspace, &cache, window, cx);
 
     v_flex().gap_3().children(
         parsed
@@ -149,7 +317,9 @@ pub fn render_markdown_block(block: &ParsedMarkdownElement, cx: &mut RenderConte
         Table(table) => render_markdown_table(table, cx),
         BlockQuote(block_quote) => render_markdown_block_quote(block_quote, cx),
         CodeBlock(code_block) => render_markdown_code_block(code_block, cx),
+        MermaidDiagram(mermaid) => render_mermaid_diagram(mermaid, cx),
         HorizontalRule(_) => render_markdown_rule(cx),
+        Image(image) => render_markdown_image(image, cx),
     }
 }
 
@@ -197,12 +367,11 @@ fn render_markdown_list_item(
     cx: &mut RenderContext,
 ) -> AnyElement {
     use ParsedMarkdownListItemType::*;
-
-    let padding = cx.scaled_rems((parsed.depth - 1) as f32);
+    let depth = parsed.depth.saturating_sub(1) as usize;
 
     let bullet = match &parsed.item_type {
-        Ordered(order) => format!("{}.", order).into_any_element(),
-        Unordered => "•".into_any_element(),
+        Ordered(order) => list_item_prefix(*order as usize, true, depth).into_any_element(),
+        Unordered => list_item_prefix(1, false, depth).into_any_element(),
         Task(checked, range) => div()
             .id(cx.next_id(range))
             .mt(cx.scaled_rems(3.0 / 16.0))
@@ -229,7 +398,14 @@ fn render_markdown_list_item(
                                 };
 
                                 if window.modifiers().secondary() {
-                                    callback(checked, range.clone(), window, cx);
+                                    callback(
+                                        &CheckboxClickedEvent {
+                                            checked,
+                                            source_range: range.clone(),
+                                        },
+                                        window,
+                                        cx,
+                                    );
                                 }
                             }
                         })
@@ -251,11 +427,16 @@ fn render_markdown_list_item(
         .collect();
 
     let item = h_flex()
-        .pl(DefiniteLength::Absolute(AbsoluteLength::Rems(padding)))
+        .when(!parsed.nested, |this| this.pl(cx.scaled_rems(depth as f32)))
+        .when(parsed.nested && depth > 0, |this| this.ml_neg_1p5())
         .items_start()
         .children(vec![
             bullet,
-            div().children(contents).pr(cx.scaled_rems(1.0)).w_full(),
+            v_flex()
+                .children(contents)
+                .when(!parsed.nested, |this| this.gap(cx.scaled_rems(1.0)))
+                .pr(cx.scaled_rems(1.0))
+                .w_full(),
         ]);
 
     cx.with_common_p(item).into_any()
@@ -276,7 +457,7 @@ struct MarkdownCheckbox {
     style: ui::ToggleStyle,
     tooltip: Option<Box<dyn Fn(&mut Window, &mut App) -> gpui::AnyView>>,
     label: Option<SharedString>,
-    render_cx: RenderContext,
+    base_rem: Rems,
 }
 
 impl MarkdownCheckbox {
@@ -292,7 +473,7 @@ impl MarkdownCheckbox {
             tooltip: None,
             label: None,
             placeholder: false,
-            render_cx,
+            base_rem: render_cx.scaled_rems(1.0),
         }
     }
 
@@ -335,7 +516,7 @@ impl gpui::RenderOnce for MarkdownCheckbox {
         } else {
             Color::Selected
         };
-        let icon_size_small = IconSize::Custom(self.render_cx.scaled_rems(14. / 16.)); // was IconSize::Small
+        let icon_size_small = IconSize::Custom(self.base_rem.mul(14. / 16.)); // was IconSize::Small
         let icon = match self.toggle_state {
             ToggleState::Selected => {
                 if self.placeholder {
@@ -360,7 +541,7 @@ impl gpui::RenderOnce for MarkdownCheckbox {
         let border_color = self.border_color(cx);
         let hover_border_color = border_color.alpha(0.7);
 
-        let size = self.render_cx.scaled_rems(1.25); // was Self::container_size(); (20px)
+        let size = self.base_rem.mul(1.25); // was Self::container_size(); (20px)
 
         let checkbox = h_flex()
             .id(self.id.clone())
@@ -374,9 +555,9 @@ impl gpui::RenderOnce for MarkdownCheckbox {
                     .flex_none()
                     .justify_center()
                     .items_center()
-                    .m(self.render_cx.scaled_rems(0.25)) // was .m_1
-                    .size(self.render_cx.scaled_rems(1.0)) // was .size_4
-                    .rounded(self.render_cx.scaled_rems(0.125)) // was .rounded_xs
+                    .m(self.base_rem.mul(0.25)) // was .m_1
+                    .size(self.base_rem.mul(1.0)) // was .size_4
+                    .rounded(self.base_rem.mul(0.125)) // was .rounded_xs
                     .border_1()
                     .bg(bg_color)
                     .border_color(border_color)
@@ -393,7 +574,7 @@ impl gpui::RenderOnce for MarkdownCheckbox {
                                 .flex_none()
                                 .rounded_full()
                                 .bg(color.color(cx).alpha(0.5))
-                                .size(self.render_cx.scaled_rems(0.25)), // was .size_1
+                                .size(self.base_rem.mul(0.25)), // was .size_1
                         )
                     })
                     .children(icon),
@@ -422,112 +603,114 @@ impl gpui::RenderOnce for MarkdownCheckbox {
     }
 }
 
-fn paragraph_len(paragraphs: &MarkdownParagraph) -> usize {
-    paragraphs
-        .iter()
-        .map(|paragraph| match paragraph {
-            MarkdownParagraphChunk::Text(text) => text.contents.len(),
-            // TODO: Scale column width based on image size
-            MarkdownParagraphChunk::Image(_) => 1,
-        })
-        .sum()
+fn calculate_table_columns_count(rows: &Vec<ParsedMarkdownTableRow>) -> usize {
+    let mut actual_column_count = 0;
+    for row in rows {
+        actual_column_count = actual_column_count.max(
+            row.columns
+                .iter()
+                .map(|column| column.col_span)
+                .sum::<usize>(),
+        );
+    }
+    actual_column_count
 }
 
 fn render_markdown_table(parsed: &ParsedMarkdownTable, cx: &mut RenderContext) -> AnyElement {
-    let mut max_lengths: Vec<usize> = vec![0; parsed.header.children.len()];
+    let actual_header_column_count = calculate_table_columns_count(&parsed.header);
+    let actual_body_column_count = calculate_table_columns_count(&parsed.body);
+    let max_column_count = std::cmp::max(actual_header_column_count, actual_body_column_count);
 
-    for (index, cell) in parsed.header.children.iter().enumerate() {
-        let length = paragraph_len(&cell);
-        max_lengths[index] = length;
-    }
+    let total_rows = parsed.header.len() + parsed.body.len();
 
-    for row in &parsed.body {
-        for (index, cell) in row.children.iter().enumerate() {
-            let length = paragraph_len(&cell);
+    // Track which grid cells are occupied by spanning cells
+    let mut grid_occupied = vec![vec![false; max_column_count]; total_rows];
 
-            if length > max_lengths[index] {
-                max_lengths[index] = length;
+    let mut cells = Vec::with_capacity(total_rows * max_column_count);
+
+    for (row_idx, row) in parsed.header.iter().chain(parsed.body.iter()).enumerate() {
+        let mut col_idx = 0;
+
+        for cell in row.columns.iter() {
+            // Skip columns occupied by row-spanning cells from previous rows
+            while col_idx < max_column_count && grid_occupied[row_idx][col_idx] {
+                col_idx += 1;
             }
+
+            if col_idx >= max_column_count {
+                break;
+            }
+
+            let container = match cell.alignment {
+                ParsedMarkdownTableAlignment::Left | ParsedMarkdownTableAlignment::None => div(),
+                ParsedMarkdownTableAlignment::Center => v_flex().items_center(),
+                ParsedMarkdownTableAlignment::Right => v_flex().items_end(),
+            };
+
+            let cell_element = container
+                .col_span(cell.col_span.min(max_column_count - col_idx) as u16)
+                .row_span(cell.row_span.min(total_rows - row_idx) as u16)
+                .children(render_markdown_text(&cell.children, cx))
+                .px_2()
+                .py_1()
+                .when(col_idx > 0, |this| this.border_l_1())
+                .when(row_idx > 0, |this| this.border_t_1())
+                .border_color(cx.border_color)
+                .when(cell.is_header, |this| {
+                    this.bg(cx.title_bar_background_color)
+                })
+                .when(cell.row_span > 1, |this| this.justify_center())
+                .when(row_idx % 2 == 1, |this| this.bg(cx.panel_background_color));
+
+            cells.push(cell_element);
+
+            // Mark grid positions as occupied for row-spanning cells
+            for r in 0..cell.row_span {
+                for c in 0..cell.col_span {
+                    if row_idx + r < total_rows && col_idx + c < max_column_count {
+                        grid_occupied[row_idx + r][col_idx + c] = true;
+                    }
+                }
+            }
+
+            col_idx += cell.col_span;
+        }
+
+        // Fill remaining columns with empty cells if needed
+        while col_idx < max_column_count {
+            if grid_occupied[row_idx][col_idx] {
+                col_idx += 1;
+                continue;
+            }
+
+            let empty_cell = div()
+                .when(col_idx > 0, |this| this.border_l_1())
+                .when(row_idx > 0, |this| this.border_t_1())
+                .border_color(cx.border_color)
+                .when(row_idx % 2 == 1, |this| this.bg(cx.panel_background_color));
+
+            cells.push(empty_cell);
+            col_idx += 1;
         }
     }
 
-    let total_max_length: usize = max_lengths.iter().sum();
-    let max_column_widths: Vec<f32> = max_lengths
-        .iter()
-        .map(|&length| length as f32 / total_max_length as f32)
-        .collect();
-
-    let header = render_markdown_table_row(
-        &parsed.header,
-        &parsed.column_alignments,
-        &max_column_widths,
-        true,
-        cx,
-    );
-
-    let body: Vec<AnyElement> = parsed
-        .body
-        .iter()
-        .map(|row| {
-            render_markdown_table_row(
-                row,
-                &parsed.column_alignments,
-                &max_column_widths,
-                false,
-                cx,
-            )
+    cx.with_common_p(v_flex().items_start())
+        .when_some(parsed.caption.as_ref(), |this, caption| {
+            this.children(render_markdown_text(caption, cx))
         })
-        .collect();
-
-    cx.with_common_p(v_flex())
-        .w_full()
-        .child(header)
-        .children(body)
+        .border_1()
+        .border_color(cx.border_color)
+        .rounded_sm()
+        .overflow_hidden()
+        .child(
+            div()
+                .min_w_0()
+                .w_full()
+                .grid()
+                .grid_cols(max_column_count as u16)
+                .children(cells),
+        )
         .into_any()
-}
-
-fn render_markdown_table_row(
-    parsed: &ParsedMarkdownTableRow,
-    alignments: &Vec<ParsedMarkdownTableAlignment>,
-    max_column_widths: &Vec<f32>,
-    is_header: bool,
-    cx: &mut RenderContext,
-) -> AnyElement {
-    let mut items = vec![];
-
-    for (index, cell) in parsed.children.iter().enumerate() {
-        let alignment = alignments
-            .get(index)
-            .copied()
-            .unwrap_or(ParsedMarkdownTableAlignment::None);
-
-        let contents = render_markdown_text(cell, cx);
-
-        let container = match alignment {
-            ParsedMarkdownTableAlignment::Left | ParsedMarkdownTableAlignment::None => div(),
-            ParsedMarkdownTableAlignment::Center => v_flex().items_center(),
-            ParsedMarkdownTableAlignment::Right => v_flex().items_end(),
-        };
-
-        let max_width = max_column_widths.get(index).unwrap_or(&0.0);
-        let mut cell = container
-            .w(Length::Definite(relative(*max_width)))
-            .h_full()
-            .children(contents)
-            .px_2()
-            .py_1()
-            .border_color(cx.border_color);
-
-        if is_header {
-            cell = cell.border_2()
-        } else {
-            cell = cell.border_1()
-        }
-
-        items.push(cell);
-    }
-
-    h_flex().children(items).into_any_element()
 }
 
 fn render_markdown_block_quote(
@@ -539,7 +722,12 @@ fn render_markdown_block_quote(
     let children: Vec<AnyElement> = parsed
         .children
         .iter()
-        .map(|child| render_markdown_block(child, cx))
+        .enumerate()
+        .map(|(ix, child)| {
+            cx.with_last_child(ix + 1 == parsed.children.len(), |cx| {
+                render_markdown_block(child, cx)
+            })
+        })
         .collect();
 
     cx.indent -= 1;
@@ -572,19 +760,18 @@ fn render_markdown_code_block(
         StyledText::new(parsed.contents.clone())
     };
 
-    let copy_block_button = IconButton::new("copy-code", IconName::Copy)
-        .icon_size(IconSize::Small)
-        .on_click({
-            let contents = parsed.contents.clone();
-            move |_, _window, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(contents.to_string()));
-            }
-        })
-        .tooltip(Tooltip::text("Copy code block"))
+    let copy_block_button = CopyButton::new("copy-codeblock", parsed.contents.clone())
+        .tooltip_label("Copy Codeblock")
         .visible_on_hover("markdown-block");
 
+    let font = gpui::Font {
+        family: cx.buffer_font_family.clone(),
+        features: cx.buffer_text_style.font_features.clone(),
+        ..Default::default()
+    };
+
     cx.with_common_p(div())
-        .font_family(cx.buffer_font_family.clone())
+        .font(font)
         .px_3()
         .py_3()
         .bg(cx.code_block_background_color)
@@ -601,6 +788,89 @@ fn render_markdown_code_block(
         .into_any()
 }
 
+fn render_mermaid_diagram(
+    parsed: &ParsedMarkdownMermaidDiagram,
+    cx: &mut RenderContext,
+) -> AnyElement {
+    let cached = cx.mermaid_state.cache.get(&parsed.contents);
+
+    if let Some(result) = cached.and_then(|c| c.render_image.get()) {
+        match result {
+            Ok(render_image) => cx
+                .with_common_p(div())
+                .px_3()
+                .py_3()
+                .bg(cx.code_block_background_color)
+                .rounded_sm()
+                .child(
+                    div().w_full().child(
+                        img(ImageSource::Render(render_image.clone()))
+                            .max_w_full()
+                            .with_fallback(|| {
+                                div()
+                                    .child(Label::new("Failed to load mermaid diagram"))
+                                    .into_any_element()
+                            }),
+                    ),
+                )
+                .into_any(),
+            Err(_) => cx
+                .with_common_p(div())
+                .px_3()
+                .py_3()
+                .bg(cx.code_block_background_color)
+                .rounded_sm()
+                .child(StyledText::new(parsed.contents.contents.clone()))
+                .into_any(),
+        }
+    } else if let Some(fallback) = cached.and_then(|c| c.fallback_image.as_ref()) {
+        cx.with_common_p(div())
+            .px_3()
+            .py_3()
+            .bg(cx.code_block_background_color)
+            .rounded_sm()
+            .child(
+                div()
+                    .w_full()
+                    .child(
+                        img(ImageSource::Render(fallback.clone()))
+                            .max_w_full()
+                            .with_fallback(|| {
+                                div()
+                                    .child(Label::new("Failed to load mermaid diagram"))
+                                    .into_any_element()
+                            }),
+                    )
+                    .with_animation(
+                        "mermaid-fallback-pulse",
+                        Animation::new(Duration::from_secs(2))
+                            .repeat()
+                            .with_easing(pulsating_between(0.6, 1.0)),
+                        |el, delta| el.opacity(delta),
+                    ),
+            )
+            .into_any()
+    } else {
+        cx.with_common_p(div())
+            .px_3()
+            .py_3()
+            .bg(cx.code_block_background_color)
+            .rounded_sm()
+            .child(
+                Label::new("Rendering mermaid diagram...")
+                    .color(Color::Muted)
+                    .with_animation(
+                        "mermaid-loading-pulse",
+                        Animation::new(Duration::from_secs(2))
+                            .repeat()
+                            .with_easing(pulsating_between(0.4, 0.8)),
+                        |label, delta| label.alpha(delta),
+                    ),
+            )
+            .into_any()
+    }
+}
+
 fn render_markdown_paragraph(parsed: &MarkdownParagraph, cx: &mut RenderContext) -> AnyElement {
     cx.with_common_p(div())
         .children(render_markdown_text(parsed, cx))
@@ -610,12 +880,13 @@ fn render_markdown_paragraph(parsed: &MarkdownParagraph, cx: &mut RenderContext)
 }
 
 fn render_markdown_text(parsed_new: &MarkdownParagraph, cx: &mut RenderContext) -> Vec<AnyElement> {
-    let mut any_element = vec![];
+    let mut any_element = Vec::with_capacity(parsed_new.len());
     // these values are cloned in-order satisfy borrow checker
     let syntax_theme = cx.syntax_theme.clone();
     let workspace_clone = cx.workspace.clone();
     let code_span_bg_color = cx.code_span_background_color;
     let text_style = cx.text_style.clone();
+    let link_color = cx.link_color;
 
     for parsed_region in parsed_new {
         match parsed_region {
@@ -628,25 +899,31 @@ fn render_markdown_text(parsed_new: &MarkdownParagraph, cx: &mut RenderContext) 
                             .to_highlight_style(&syntax_theme)
                             .map(|style| (range.clone(), style))
                     }),
-                    parsed.regions.iter().zip(&parsed.region_ranges).filter_map(
-                        |(region, range)| {
-                            if region.code {
-                                Some((
-                                    range.clone(),
-                                    HighlightStyle {
-                                        background_color: Some(code_span_bg_color),
-                                        ..Default::default()
-                                    },
-                                ))
-                            } else {
-                                None
-                            }
-                        },
-                    ),
+                    parsed.regions.iter().filter_map(|(range, region)| {
+                        if region.code {
+                            Some((
+                                range.clone(),
+                                HighlightStyle {
+                                    background_color: Some(code_span_bg_color),
+                                    ..Default::default()
+                                },
+                            ))
+                        } else if region.link.is_some() {
+                            Some((
+                                range.clone(),
+                                HighlightStyle {
+                                    color: Some(link_color),
+                                    ..Default::default()
+                                },
+                            ))
+                        } else {
+                            None
+                        }
+                    }),
                 );
                 let mut links = Vec::new();
                 let mut link_ranges = Vec::new();
-                for (range, region) in parsed.region_ranges.iter().zip(&parsed.regions) {
+                for (range, region) in parsed.regions.iter() {
                     if let Some(link) = region.link.clone() {
                         links.push(link);
                         link_ranges.push(range.clone());
@@ -701,65 +978,7 @@ fn render_markdown_text(parsed_new: &MarkdownParagraph, cx: &mut RenderContext) 
             }
 
             MarkdownParagraphChunk::Image(image) => {
-                let image_resource = match image.link.clone() {
-                    Link::Web { url } => Resource::Uri(url.into()),
-                    Link::Path { path, .. } => Resource::Path(Arc::from(path)),
-                };
-
-                let element_id = cx.next_id(&image.source_range);
-
-                let image_element = div()
-                    .id(element_id)
-                    .cursor_pointer()
-                    .child(
-                        img(ImageSource::Resource(image_resource))
-                            .max_w_full()
-                            .with_fallback({
-                                let alt_text = image.alt_text.clone();
-                                move || div().children(alt_text.clone()).into_any_element()
-                            }),
-                    )
-                    .tooltip({
-                        let link = image.link.clone();
-                        move |_, cx| {
-                            InteractiveMarkdownElementTooltip::new(
-                                Some(link.to_string()),
-                                "open image",
-                                cx,
-                            )
-                            .into()
-                        }
-                    })
-                    .on_click({
-                        let workspace = workspace_clone.clone();
-                        let link = image.link.clone();
-                        move |_, window, cx| {
-                            if window.modifiers().secondary() {
-                                match &link {
-                                    Link::Web { url } => cx.open_url(url),
-                                    Link::Path { path, .. } => {
-                                        if let Some(workspace) = &workspace {
-                                            _ = workspace.update(cx, |workspace, cx| {
-                                                workspace
-                                                    .open_abs_path(
-                                                        path.clone(),
-                                                        OpenOptions {
-                                                            visible: Some(OpenVisible::None),
-                                                            ..Default::default()
-                                                        },
-                                                        window,
-                                                        cx,
-                                                    )
-                                                    .detach();
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    })
-                    .into_any();
-                any_element.push(image_element);
+                any_element.push(render_markdown_image(image, cx));
             }
         }
     }
@@ -772,25 +991,93 @@ fn render_markdown_rule(cx: &mut RenderContext) -> AnyElement {
     div().py(cx.scaled_rems(0.5)).child(rule).into_any()
 }
 
+fn render_markdown_image(image: &Image, cx: &mut RenderContext) -> AnyElement {
+    let image_resource = match image.link.clone() {
+        Link::Web { url } => Resource::Uri(url.into()),
+        Link::Path { path, .. } => Resource::Path(Arc::from(path)),
+    };
+
+    let element_id = cx.next_id(&image.source_range);
+    let workspace = cx.workspace.clone();
+
+    div()
+        .id(element_id)
+        .cursor_pointer()
+        .child(
+            img(ImageSource::Resource(image_resource))
+                .max_w_full()
+                .with_fallback({
+                    let alt_text = image.alt_text.clone();
+                    move || div().children(alt_text.clone()).into_any_element()
+                })
+                .when_some(image.height, |this, height| this.h(height))
+                .when_some(image.width, |this, width| this.w(width)),
+        )
+        .tooltip({
+            let link = image.link.clone();
+            let alt_text = image.alt_text.clone();
+            move |_, cx| {
+                InteractiveMarkdownElementTooltip::new(
+                    Some(alt_text.clone().unwrap_or(link.to_string().into())),
+                    "open image",
+                    cx,
+                )
+                .into()
+            }
+        })
+        .on_click({
+            let link = image.link.clone();
+            move |_, window, cx| {
+                if window.modifiers().secondary() {
+                    match &link {
+                        Link::Web { url } => cx.open_url(url),
+                        Link::Path { path, .. } => {
+                            if let Some(workspace) = &workspace {
+                                _ = workspace.update(cx, |workspace, cx| {
+                                    workspace
+                                        .open_abs_path(
+                                            path.clone(),
+                                            OpenOptions {
+                                                visible: Some(OpenVisible::None),
+                                                ..Default::default()
+                                            },
+                                            window,
+                                            cx,
+                                        )
+                                        .detach();
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .into_any()
+}
+
 struct InteractiveMarkdownElementTooltip {
     tooltip_text: Option<SharedString>,
-    action_text: String,
+    action_text: SharedString,
 }
 
 impl InteractiveMarkdownElementTooltip {
-    pub fn new(tooltip_text: Option<String>, action_text: &str, cx: &mut App) -> Entity<Self> {
+    pub fn new(
+        tooltip_text: Option<SharedString>,
+        action_text: impl Into<SharedString>,
+        cx: &mut App,
+    ) -> Entity<Self> {
         let tooltip_text = tooltip_text.map(|t| util::truncate_and_trailoff(&t, 50).into());
 
         cx.new(|_cx| Self {
             tooltip_text,
-            action_text: action_text.to_string(),
+            action_text: action_text.into(),
         })
     }
 }
 
 impl Render for InteractiveMarkdownElementTooltip {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        tooltip_container(window, cx, |el, _, _| {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        tooltip_container(cx, |el, _| {
             let secondary_modifier = Keystroke {
                 modifiers: Modifiers::secondary_key(),
                 ..Default::default()
@@ -812,5 +1099,400 @@ impl Render for InteractiveMarkdownElementTooltip {
                     ),
             )
         })
+    }
+}
+
+/// Returns the prefix for a list item.
+fn list_item_prefix(order: usize, ordered: bool, depth: usize) -> String {
+    let ix = order.saturating_sub(1);
+    const NUMBERED_PREFIXES_1: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const NUMBERED_PREFIXES_2: &str = "abcdefghijklmnopqrstuvwxyz";
+    const BULLETS: [&str; 5] = ["•", "◦", "▪", "‣", "⁃"];
+
+    if ordered {
+        match depth {
+            0 => format!("{}. ", order),
+            1 => format!(
+                "{}. ",
+                NUMBERED_PREFIXES_1
+                    .chars()
+                    .nth(ix % NUMBERED_PREFIXES_1.len())
+                    .unwrap()
+            ),
+            _ => format!(
+                "{}. ",
+                NUMBERED_PREFIXES_2
+                    .chars()
+                    .nth(ix % NUMBERED_PREFIXES_2.len())
+                    .unwrap()
+            ),
+        }
+    } else {
+        let depth = depth.min(BULLETS.len() - 1);
+        let bullet = BULLETS[depth];
+        return format!("{} ", bullet);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::markdown_elements::ParsedMarkdownMermaidDiagramContents;
+    use crate::markdown_elements::ParsedMarkdownTableColumn;
+    use crate::markdown_elements::ParsedMarkdownText;
+
+    fn text(text: &str) -> MarkdownParagraphChunk {
+        MarkdownParagraphChunk::Text(ParsedMarkdownText {
+            source_range: 0..text.len(),
+            contents: SharedString::new(text),
+            highlights: Default::default(),
+            regions: Default::default(),
+        })
+    }
+
+    fn column(
+        col_span: usize,
+        row_span: usize,
+        children: Vec<MarkdownParagraphChunk>,
+    ) -> ParsedMarkdownTableColumn {
+        ParsedMarkdownTableColumn {
+            col_span,
+            row_span,
+            is_header: false,
+            children,
+            alignment: ParsedMarkdownTableAlignment::None,
+        }
+    }
+
+    fn column_with_row_span(
+        col_span: usize,
+        row_span: usize,
+        children: Vec<MarkdownParagraphChunk>,
+    ) -> ParsedMarkdownTableColumn {
+        ParsedMarkdownTableColumn {
+            col_span,
+            row_span,
+            is_header: false,
+            children,
+            alignment: ParsedMarkdownTableAlignment::None,
+        }
+    }
+
+    #[test]
+    fn test_calculate_table_columns_count() {
+        assert_eq!(0, calculate_table_columns_count(&vec![]));
+
+        assert_eq!(
+            1,
+            calculate_table_columns_count(&vec![ParsedMarkdownTableRow::with_columns(vec![
+                column(1, 1, vec![text("column1")])
+            ])])
+        );
+
+        assert_eq!(
+            2,
+            calculate_table_columns_count(&vec![ParsedMarkdownTableRow::with_columns(vec![
+                column(1, 1, vec![text("column1")]),
+                column(1, 1, vec![text("column2")]),
+            ])])
+        );
+
+        assert_eq!(
+            2,
+            calculate_table_columns_count(&vec![ParsedMarkdownTableRow::with_columns(vec![
+                column(2, 1, vec![text("column1")])
+            ])])
+        );
+
+        assert_eq!(
+            3,
+            calculate_table_columns_count(&vec![ParsedMarkdownTableRow::with_columns(vec![
+                column(1, 1, vec![text("column1")]),
+                column(2, 1, vec![text("column2")]),
+            ])])
+        );
+
+        assert_eq!(
+            2,
+            calculate_table_columns_count(&vec![
+                ParsedMarkdownTableRow::with_columns(vec![
+                    column(1, 1, vec![text("column1")]),
+                    column(1, 1, vec![text("column2")]),
+                ]),
+                ParsedMarkdownTableRow::with_columns(vec![column(1, 1, vec![text("column1")]),])
+            ])
+        );
+
+        assert_eq!(
+            3,
+            calculate_table_columns_count(&vec![
+                ParsedMarkdownTableRow::with_columns(vec![
+                    column(1, 1, vec![text("column1")]),
+                    column(1, 1, vec![text("column2")]),
+                ]),
+                ParsedMarkdownTableRow::with_columns(vec![column(3, 3, vec![text("column1")]),])
+            ])
+        );
+    }
+
+    #[test]
+    fn test_row_span_support() {
+        assert_eq!(
+            3,
+            calculate_table_columns_count(&vec![
+                ParsedMarkdownTableRow::with_columns(vec![
+                    column_with_row_span(1, 2, vec![text("spans 2 rows")]),
+                    column(1, 1, vec![text("column2")]),
+                    column(1, 1, vec![text("column3")]),
+                ]),
+                ParsedMarkdownTableRow::with_columns(vec![
+                    // First column is covered by row span from above
+                    column(1, 1, vec![text("column2 row2")]),
+                    column(1, 1, vec![text("column3 row2")]),
+                ])
+            ])
+        );
+
+        assert_eq!(
+            4,
+            calculate_table_columns_count(&vec![
+                ParsedMarkdownTableRow::with_columns(vec![
+                    column_with_row_span(1, 3, vec![text("spans 3 rows")]),
+                    column_with_row_span(2, 1, vec![text("spans 2 cols")]),
+                    column(1, 1, vec![text("column4")]),
+                ]),
+                ParsedMarkdownTableRow::with_columns(vec![
+                    // First column covered by row span
+                    column(1, 1, vec![text("column2")]),
+                    column(1, 1, vec![text("column3")]),
+                    column(1, 1, vec![text("column4")]),
+                ]),
+                ParsedMarkdownTableRow::with_columns(vec![
+                    // First column still covered by row span
+                    column(3, 1, vec![text("spans 3 cols")]),
+                ])
+            ])
+        );
+    }
+
+    #[test]
+    fn test_list_item_prefix() {
+        assert_eq!(list_item_prefix(1, true, 0), "1. ");
+        assert_eq!(list_item_prefix(2, true, 0), "2. ");
+        assert_eq!(list_item_prefix(3, true, 0), "3. ");
+        assert_eq!(list_item_prefix(11, true, 0), "11. ");
+        assert_eq!(list_item_prefix(1, true, 1), "A. ");
+        assert_eq!(list_item_prefix(2, true, 1), "B. ");
+        assert_eq!(list_item_prefix(3, true, 1), "C. ");
+        assert_eq!(list_item_prefix(1, true, 2), "a. ");
+        assert_eq!(list_item_prefix(2, true, 2), "b. ");
+        assert_eq!(list_item_prefix(7, true, 2), "g. ");
+        assert_eq!(list_item_prefix(1, true, 1), "A. ");
+        assert_eq!(list_item_prefix(1, true, 2), "a. ");
+        assert_eq!(list_item_prefix(1, false, 0), "• ");
+        assert_eq!(list_item_prefix(1, false, 1), "◦ ");
+        assert_eq!(list_item_prefix(1, false, 2), "▪ ");
+        assert_eq!(list_item_prefix(1, false, 3), "‣ ");
+        assert_eq!(list_item_prefix(1, false, 4), "⁃ ");
+    }
+
+    fn mermaid_contents(s: &str) -> ParsedMarkdownMermaidDiagramContents {
+        ParsedMarkdownMermaidDiagramContents {
+            contents: SharedString::from(s.to_string()),
+            scale: 1,
+        }
+    }
+
+    fn mermaid_sequence(diagrams: &[&str]) -> Vec<ParsedMarkdownMermaidDiagramContents> {
+        diagrams
+            .iter()
+            .map(|diagram| mermaid_contents(diagram))
+            .collect()
+    }
+
+    fn mermaid_fallback(
+        new_diagram: &str,
+        new_full_order: &[ParsedMarkdownMermaidDiagramContents],
+        old_full_order: &[ParsedMarkdownMermaidDiagramContents],
+        cache: &MermaidDiagramCache,
+    ) -> Option<Arc<RenderImage>> {
+        let new_content = mermaid_contents(new_diagram);
+        let idx = new_full_order
+            .iter()
+            .position(|content| content == &new_content)?;
+        MermaidState::get_fallback_image(idx, old_full_order, new_full_order.len(), cache)
+    }
+
+    fn mock_render_image() -> Arc<RenderImage> {
+        Arc::new(RenderImage::new(Vec::new()))
+    }
+
+    #[test]
+    fn test_mermaid_fallback_on_edit() {
+        let old_full_order = mermaid_sequence(&["graph A", "graph B", "graph C"]);
+        let new_full_order = mermaid_sequence(&["graph A", "graph B modified", "graph C"]);
+
+        let svg_b = mock_render_image();
+        let mut cache: MermaidDiagramCache = HashMap::default();
+        cache.insert(
+            mermaid_contents("graph A"),
+            CachedMermaidDiagram::new_for_test(Some(mock_render_image()), None),
+        );
+        cache.insert(
+            mermaid_contents("graph B"),
+            CachedMermaidDiagram::new_for_test(Some(svg_b.clone()), None),
+        );
+        cache.insert(
+            mermaid_contents("graph C"),
+            CachedMermaidDiagram::new_for_test(Some(mock_render_image()), None),
+        );
+
+        let fallback =
+            mermaid_fallback("graph B modified", &new_full_order, &old_full_order, &cache);
+
+        assert!(
+            fallback.is_some(),
+            "Should use old diagram as fallback when editing"
+        );
+        assert!(
+            Arc::ptr_eq(&fallback.unwrap(), &svg_b),
+            "Fallback should be the old diagram's SVG"
+        );
+    }
+
+    #[test]
+    fn test_mermaid_no_fallback_on_add_in_middle() {
+        let old_full_order = mermaid_sequence(&["graph A", "graph C"]);
+        let new_full_order = mermaid_sequence(&["graph A", "graph NEW", "graph C"]);
+
+        let mut cache: MermaidDiagramCache = HashMap::default();
+        cache.insert(
+            mermaid_contents("graph A"),
+            CachedMermaidDiagram::new_for_test(Some(mock_render_image()), None),
+        );
+        cache.insert(
+            mermaid_contents("graph C"),
+            CachedMermaidDiagram::new_for_test(Some(mock_render_image()), None),
+        );
+
+        let fallback = mermaid_fallback("graph NEW", &new_full_order, &old_full_order, &cache);
+
+        assert!(
+            fallback.is_none(),
+            "Should NOT use fallback when adding new diagram"
+        );
+    }
+
+    #[test]
+    fn test_mermaid_fallback_chains_on_rapid_edits() {
+        let old_full_order = mermaid_sequence(&["graph A", "graph B modified", "graph C"]);
+        let new_full_order = mermaid_sequence(&["graph A", "graph B modified again", "graph C"]);
+
+        let original_svg = mock_render_image();
+        let mut cache: MermaidDiagramCache = HashMap::default();
+        cache.insert(
+            mermaid_contents("graph A"),
+            CachedMermaidDiagram::new_for_test(Some(mock_render_image()), None),
+        );
+        cache.insert(
+            mermaid_contents("graph B modified"),
+            // Still rendering, but has fallback from original "graph B"
+            CachedMermaidDiagram::new_for_test(None, Some(original_svg.clone())),
+        );
+        cache.insert(
+            mermaid_contents("graph C"),
+            CachedMermaidDiagram::new_for_test(Some(mock_render_image()), None),
+        );
+
+        let fallback = mermaid_fallback(
+            "graph B modified again",
+            &new_full_order,
+            &old_full_order,
+            &cache,
+        );
+
+        assert!(
+            fallback.is_some(),
+            "Should chain fallback when previous render not complete"
+        );
+        assert!(
+            Arc::ptr_eq(&fallback.unwrap(), &original_svg),
+            "Fallback should chain through to the original SVG"
+        );
+    }
+
+    #[test]
+    fn test_mermaid_no_fallback_when_no_old_diagram_at_index() {
+        let old_full_order = mermaid_sequence(&["graph A"]);
+        let new_full_order = mermaid_sequence(&["graph A", "graph B"]);
+
+        let mut cache: MermaidDiagramCache = HashMap::default();
+        cache.insert(
+            mermaid_contents("graph A"),
+            CachedMermaidDiagram::new_for_test(Some(mock_render_image()), None),
+        );
+
+        let fallback = mermaid_fallback("graph B", &new_full_order, &old_full_order, &cache);
+
+        assert!(
+            fallback.is_none(),
+            "Should NOT have fallback when adding diagram at end"
+        );
+    }
+
+    #[test]
+    fn test_mermaid_fallback_with_duplicate_blocks_edit_first() {
+        let old_full_order = mermaid_sequence(&["graph A", "graph A", "graph B"]);
+        let new_full_order = mermaid_sequence(&["graph A edited", "graph A", "graph B"]);
+
+        let svg_a = mock_render_image();
+        let mut cache: MermaidDiagramCache = HashMap::default();
+        cache.insert(
+            mermaid_contents("graph A"),
+            CachedMermaidDiagram::new_for_test(Some(svg_a.clone()), None),
+        );
+        cache.insert(
+            mermaid_contents("graph B"),
+            CachedMermaidDiagram::new_for_test(Some(mock_render_image()), None),
+        );
+
+        let fallback = mermaid_fallback("graph A edited", &new_full_order, &old_full_order, &cache);
+
+        assert!(
+            fallback.is_some(),
+            "Should use old diagram as fallback when editing one of duplicate blocks"
+        );
+        assert!(
+            Arc::ptr_eq(&fallback.unwrap(), &svg_a),
+            "Fallback should be the old duplicate diagram's image"
+        );
+    }
+
+    #[test]
+    fn test_mermaid_fallback_with_duplicate_blocks_edit_second() {
+        let old_full_order = mermaid_sequence(&["graph A", "graph A", "graph B"]);
+        let new_full_order = mermaid_sequence(&["graph A", "graph A edited", "graph B"]);
+
+        let svg_a = mock_render_image();
+        let mut cache: MermaidDiagramCache = HashMap::default();
+        cache.insert(
+            mermaid_contents("graph A"),
+            CachedMermaidDiagram::new_for_test(Some(svg_a.clone()), None),
+        );
+        cache.insert(
+            mermaid_contents("graph B"),
+            CachedMermaidDiagram::new_for_test(Some(mock_render_image()), None),
+        );
+
+        let fallback = mermaid_fallback("graph A edited", &new_full_order, &old_full_order, &cache);
+
+        assert!(
+            fallback.is_some(),
+            "Should use old diagram as fallback when editing the second duplicate block"
+        );
+        assert!(
+            Arc::ptr_eq(&fallback.unwrap(), &svg_a),
+            "Fallback should be the old duplicate diagram's image"
+        );
     }
 }

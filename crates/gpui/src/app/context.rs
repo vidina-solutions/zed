@@ -1,28 +1,39 @@
 use crate::{
     AnyView, AnyWindowHandle, AppContext, AsyncApp, DispatchPhase, Effect, EntityId, EventEmitter,
-    FocusHandle, FocusOutEvent, Focusable, Global, KeystrokeObserver, Reservation, SubscriberSet,
-    Subscription, Task, WeakEntity, WeakFocusHandle, Window, WindowHandle,
+    FocusHandle, FocusOutEvent, Focusable, Global, KeystrokeObserver, Priority, Reservation,
+    SubscriberSet, Subscription, Task, WeakEntity, WeakFocusHandle, Window, WindowHandle,
 };
 use anyhow::Result;
-use derive_more::{Deref, DerefMut};
 use futures::FutureExt;
+use gpui_util::Deferred;
 use std::{
     any::{Any, TypeId},
     borrow::{Borrow, BorrowMut},
     future::Future,
+    ops,
     sync::Arc,
 };
-use util::Deferred;
 
 use super::{App, AsyncWindowContext, Entity, KeystrokeEvent};
 
 /// The app context, with specialized behavior for the given entity.
-#[derive(Deref, DerefMut)]
 pub struct Context<'a, T> {
-    #[deref]
-    #[deref_mut]
     app: &'a mut App,
     entity_state: WeakEntity<T>,
+}
+
+impl<'a, T> ops::Deref for Context<'a, T> {
+    type Target = App;
+
+    fn deref(&self) -> &Self::Target {
+        self.app
+    }
+}
+
+impl<'a, T> ops::DerefMut for Context<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.app
+    }
 }
 
 impl<'a, T: 'static> Context<'a, T> {
@@ -66,6 +77,20 @@ impl<'a, T: 'static> Context<'a, T> {
             } else {
                 false
             }
+        })
+    }
+
+    /// Observe changes to ourselves
+    pub fn observe_self(
+        &mut self,
+        mut on_event: impl FnMut(&mut T, &mut Context<T>) + 'static,
+    ) -> Subscription
+    where
+        T: 'static,
+    {
+        let this = self.entity();
+        self.app.observe(&this, move |this, cx| {
+            this.update(cx, |this, cx| on_event(this, cx))
         })
     }
 
@@ -164,6 +189,20 @@ impl<'a, T: 'static> Context<'a, T> {
         subscription
     }
 
+    /// Register a callback to be invoked when the application is about to restart.
+    pub fn on_app_restart(
+        &self,
+        mut on_restart: impl FnMut(&mut T, &mut App) + 'static,
+    ) -> Subscription
+    where
+        T: 'static,
+    {
+        let handle = self.weak_entity();
+        self.app.on_app_restart(move |cx| {
+            handle.update(cx, |entity, cx| on_restart(entity, cx)).ok();
+        })
+    }
+
     /// Arrange for the given function to be invoked whenever the application is quit.
     /// The future returned from this callback will be polled for up to [crate::SHUTDOWN_TIMEOUT] until the app fully quits.
     pub fn on_app_quit<Fut>(
@@ -175,20 +214,15 @@ impl<'a, T: 'static> Context<'a, T> {
         T: 'static,
     {
         let handle = self.weak_entity();
-        let (subscription, activate) = self.app.quit_observers.insert(
-            (),
-            Box::new(move |cx| {
-                let future = handle.update(cx, |entity, cx| on_quit(entity, cx)).ok();
-                async move {
-                    if let Some(future) = future {
-                        future.await;
-                    }
+        self.app.on_app_quit(move |cx| {
+            let future = handle.update(cx, |entity, cx| on_quit(entity, cx)).ok();
+            async move {
+                if let Some(future) = future {
+                    future.await;
                 }
-                .boxed_local()
-            }),
-        );
-        activate();
-        subscription
+            }
+            .boxed_local()
+        })
     }
 
     /// Tell GPUI that this entity has changed and observers of it should be notified.
@@ -244,14 +278,14 @@ impl<'a, T: 'static> Context<'a, T> {
     ) -> Deferred<impl FnOnce()> {
         let this = self.weak_entity();
         let mut cx = self.to_async();
-        util::defer(move || {
+        gpui_util::defer(move || {
             this.update(&mut cx, f).ok();
         })
     }
 
     /// Focus the given view in the given window. View type is required to implement Focusable.
     pub fn focus_view<W: Focusable>(&mut self, view: &Entity<W>, window: &mut Window) {
-        window.focus(&view.focus_handle(self));
+        window.focus(&view.focus_handle(self), self);
     }
 
     /// Sets a given callback to be run on the next frame.
@@ -463,7 +497,7 @@ impl<'a, T: 'static> Context<'a, T> {
 
         let view = self.weak_entity();
         inner(
-            &mut self.keystroke_observers,
+            &self.keystroke_observers,
             Box::new(move |event, window, cx| {
                 if let Some(view) = view.upgrade() {
                     view.update(cx, |view, cx| f(view, event, window, cx));
@@ -601,16 +635,16 @@ impl<'a, T: 'static> Context<'a, T> {
         let (subscription, activate) =
             window.new_focus_listener(Box::new(move |event, window, cx| {
                 view.update(cx, |view, cx| {
-                    if let Some(blurred_id) = event.previous_focus_path.last().copied() {
-                        if event.is_focus_out(focus_id) {
-                            let event = FocusOutEvent {
-                                blurred: WeakFocusHandle {
-                                    id: blurred_id,
-                                    handles: Arc::downgrade(&cx.focus_handles),
-                                },
-                            };
-                            listener(view, event, window, cx)
-                        }
+                    if let Some(blurred_id) = event.previous_focus_path.last().copied()
+                        && event.is_focus_out(focus_id)
+                    {
+                        let event = FocusOutEvent {
+                            blurred: WeakFocusHandle {
+                                id: blurred_id,
+                                handles: Arc::downgrade(&cx.focus_handles),
+                            },
+                        };
+                        listener(view, event, window, cx)
                     }
                 })
                 .is_ok()
@@ -633,6 +667,25 @@ impl<'a, T: 'static> Context<'a, T> {
         window.spawn(self, async move |cx| f(view, cx).await)
     }
 
+    /// Schedule a future to be run asynchronously with the given priority.
+    /// The given callback is invoked with a [`WeakEntity<V>`] to avoid leaking the entity for a long-running process.
+    /// It's also given an [`AsyncWindowContext`], which can be used to access the state of the entity across await points.
+    /// The returned future will be polled on the main thread.
+    #[track_caller]
+    pub fn spawn_in_with_priority<AsyncFn, R>(
+        &self,
+        priority: Priority,
+        window: &Window,
+        f: AsyncFn,
+    ) -> Task<R>
+    where
+        R: 'static,
+        AsyncFn: AsyncFnOnce(WeakEntity<T>, &mut AsyncWindowContext) -> R + 'static,
+    {
+        let view = self.weak_entity();
+        window.spawn_with_priority(priority, self, async move |cx| f(view, cx).await)
+    }
+
     /// Register a callback to be invoked when the given global state changes.
     pub fn observe_global_in<G: Global>(
         &mut self,
@@ -644,11 +697,19 @@ impl<'a, T: 'static> Context<'a, T> {
         let (subscription, activate) = self.global_observers.insert(
             TypeId::of::<G>(),
             Box::new(move |cx| {
-                window_handle
-                    .update(cx, |_, window, cx| {
-                        view.update(cx, |view, cx| f(view, window, cx)).is_ok()
-                    })
-                    .unwrap_or(false)
+                // If the entity has been dropped, remove this observer.
+                if view.upgrade().is_none() {
+                    return false;
+                }
+                // If the window is unavailable (e.g. temporarily taken during a
+                // nested update, or already closed), skip this notification but
+                // keep the observer alive so it can fire on future changes.
+                let Ok(entity_alive) = window_handle.update(cx, |_, window, cx| {
+                    view.update(cx, |view, cx| f(view, window, cx)).is_ok()
+                }) else {
+                    return true;
+                };
+                entity_alive
             }),
         );
         self.defer(move |_| activate());
@@ -679,7 +740,7 @@ impl<'a, T: 'static> Context<'a, T> {
     {
         let view = self.entity();
         window.defer(self, move |window, cx| {
-            view.read(cx).focus_handle(cx).focus(window)
+            view.read(cx).focus_handle(cx).focus(window, cx)
         })
     }
 }
@@ -691,33 +752,39 @@ impl<T> Context<'_, T> {
         T: EventEmitter<Evt>,
         Evt: 'static,
     {
+        let event = self
+            .event_arena
+            .alloc(|| event)
+            .map(|it| it as &mut dyn Any);
         self.app.pending_effects.push_back(Effect::Emit {
             emitter: self.entity_state.entity_id,
             event_type: TypeId::of::<Evt>(),
-            event: Box::new(event),
+            event,
         });
     }
 }
 
 impl<T> AppContext for Context<'_, T> {
-    type Result<U> = U;
-
+    #[inline]
     fn new<U: 'static>(&mut self, build_entity: impl FnOnce(&mut Context<U>) -> U) -> Entity<U> {
         self.app.new(build_entity)
     }
 
+    #[inline]
     fn reserve_entity<U: 'static>(&mut self) -> Reservation<U> {
         self.app.reserve_entity()
     }
 
+    #[inline]
     fn insert_entity<U: 'static>(
         &mut self,
         reservation: Reservation<U>,
         build_entity: impl FnOnce(&mut Context<U>) -> U,
-    ) -> Self::Result<Entity<U>> {
+    ) -> Entity<U> {
         self.app.insert_entity(reservation, build_entity)
     }
 
+    #[inline]
     fn update_entity<U: 'static, R>(
         &mut self,
         handle: &Entity<U>,
@@ -726,17 +793,23 @@ impl<T> AppContext for Context<'_, T> {
         self.app.update_entity(handle, update)
     }
 
-    fn read_entity<U, R>(
-        &self,
-        handle: &Entity<U>,
-        read: impl FnOnce(&U, &App) -> R,
-    ) -> Self::Result<R>
+    #[inline]
+    fn as_mut<'a, E>(&'a mut self, handle: &Entity<E>) -> super::GpuiBorrow<'a, E>
+    where
+        E: 'static,
+    {
+        self.app.as_mut(handle)
+    }
+
+    #[inline]
+    fn read_entity<U, R>(&self, handle: &Entity<U>, read: impl FnOnce(&U, &App) -> R) -> R
     where
         U: 'static,
     {
         self.app.read_entity(handle, read)
     }
 
+    #[inline]
     fn update_window<R, F>(&mut self, window: AnyWindowHandle, update: F) -> Result<R>
     where
         F: FnOnce(AnyView, &mut Window, &mut App) -> R,
@@ -744,6 +817,7 @@ impl<T> AppContext for Context<'_, T> {
         self.app.update_window(window, update)
     }
 
+    #[inline]
     fn read_window<U, R>(
         &self,
         window: &WindowHandle<U>,
@@ -755,6 +829,7 @@ impl<T> AppContext for Context<'_, T> {
         self.app.read_window(window, read)
     }
 
+    #[inline]
     fn background_spawn<R>(&self, future: impl Future<Output = R> + Send + 'static) -> Task<R>
     where
         R: Send + 'static,
@@ -762,7 +837,8 @@ impl<T> AppContext for Context<'_, T> {
         self.app.background_executor.spawn(future)
     }
 
-    fn read_global<G, R>(&self, callback: impl FnOnce(&G, &App) -> R) -> Self::Result<R>
+    #[inline]
+    fn read_global<G, R>(&self, callback: impl FnOnce(&G, &App) -> R) -> R
     where
         G: Global,
     {

@@ -1,8 +1,10 @@
 use gpui::{
-    FontStyle, FontWeight, HighlightStyle, SharedString, StrikethroughStyle, UnderlineStyle, px,
+    DefiniteLength, FontStyle, FontWeight, HighlightStyle, SharedString, StrikethroughStyle,
+    UnderlineStyle, px,
 };
 use language::HighlightId;
 use std::{fmt::Display, ops::Range, path::PathBuf};
+use urlencoding;
 
 #[derive(Debug)]
 #[cfg_attr(test, derive(PartialEq))]
@@ -12,9 +14,11 @@ pub enum ParsedMarkdownElement {
     Table(ParsedMarkdownTable),
     BlockQuote(ParsedMarkdownBlockQuote),
     CodeBlock(ParsedMarkdownCodeBlock),
+    MermaidDiagram(ParsedMarkdownMermaidDiagram),
     /// A paragraph of text and other inline elements.
     Paragraph(MarkdownParagraph),
     HorizontalRule(Range<usize>),
+    Image(Image),
 }
 
 impl ParsedMarkdownElement {
@@ -25,11 +29,13 @@ impl ParsedMarkdownElement {
             Self::Table(table) => table.source_range.clone(),
             Self::BlockQuote(block_quote) => block_quote.source_range.clone(),
             Self::CodeBlock(code_block) => code_block.source_range.clone(),
+            Self::MermaidDiagram(mermaid) => mermaid.source_range.clone(),
             Self::Paragraph(text) => match text.get(0)? {
                 MarkdownParagraphChunk::Text(t) => t.source_range.clone(),
                 MarkdownParagraphChunk::Image(image) => image.source_range.clone(),
             },
             Self::HorizontalRule(range) => range.clone(),
+            Self::Image(image) => image.source_range.clone(),
         })
     }
 
@@ -61,6 +67,8 @@ pub struct ParsedMarkdownListItem {
     pub depth: u16,
     pub item_type: ParsedMarkdownListItemType,
     pub content: Vec<ParsedMarkdownElement>,
+    /// Whether we can expect nested list items inside of this items `content`.
+    pub nested: bool,
 }
 
 #[derive(Debug)]
@@ -78,6 +86,19 @@ pub struct ParsedMarkdownCodeBlock {
     pub language: Option<String>,
     pub contents: SharedString,
     pub highlights: Option<Vec<(Range<usize>, HighlightId)>>,
+}
+
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq))]
+pub struct ParsedMarkdownMermaidDiagram {
+    pub source_range: Range<usize>,
+    pub contents: ParsedMarkdownMermaidDiagramContents,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ParsedMarkdownMermaidDiagramContents {
+    pub contents: SharedString,
+    pub scale: u32,
 }
 
 #[derive(Debug)]
@@ -101,15 +122,15 @@ pub enum HeadingLevel {
 #[derive(Debug)]
 pub struct ParsedMarkdownTable {
     pub source_range: Range<usize>,
-    pub header: ParsedMarkdownTableRow,
+    pub header: Vec<ParsedMarkdownTableRow>,
     pub body: Vec<ParsedMarkdownTableRow>,
-    pub column_alignments: Vec<ParsedMarkdownTableAlignment>,
+    pub caption: Option<MarkdownParagraph>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 #[cfg_attr(test, derive(PartialEq))]
 pub enum ParsedMarkdownTableAlignment {
-    /// Default text alignment.
+    #[default]
     None,
     Left,
     Center,
@@ -118,8 +139,18 @@ pub enum ParsedMarkdownTableAlignment {
 
 #[derive(Debug)]
 #[cfg_attr(test, derive(PartialEq))]
+pub struct ParsedMarkdownTableColumn {
+    pub col_span: usize,
+    pub row_span: usize,
+    pub is_header: bool,
+    pub children: MarkdownParagraph,
+    pub alignment: ParsedMarkdownTableAlignment,
+}
+
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct ParsedMarkdownTableRow {
-    pub children: Vec<MarkdownParagraph>,
+    pub columns: Vec<ParsedMarkdownTableColumn>,
 }
 
 impl Default for ParsedMarkdownTableRow {
@@ -131,12 +162,12 @@ impl Default for ParsedMarkdownTableRow {
 impl ParsedMarkdownTableRow {
     pub fn new() -> Self {
         Self {
-            children: Vec::new(),
+            columns: Vec::new(),
         }
     }
 
-    pub fn with_children(children: Vec<MarkdownParagraph>) -> Self {
-        Self { children }
+    pub fn with_columns(columns: Vec<ParsedMarkdownTableColumn>) -> Self {
+        Self { columns }
     }
 }
 
@@ -152,13 +183,11 @@ pub struct ParsedMarkdownText {
     /// Where the text is located in the source Markdown document.
     pub source_range: Range<usize>,
     /// The text content stripped of any formatting symbols.
-    pub contents: String,
+    pub contents: SharedString,
     /// The list of highlights contained in the Markdown document.
     pub highlights: Vec<(Range<usize>, MarkdownHighlight)>,
-    /// The regions of the various ranges in the Markdown document.
-    pub region_ranges: Vec<Range<usize>>,
     /// The regions of the Markdown document.
-    pub regions: Vec<ParsedRegion>,
+    pub regions: Vec<(Range<usize>, ParsedRegion)>,
 }
 
 /// A run of highlighted Markdown text.
@@ -199,6 +228,17 @@ impl MarkdownHighlight {
                     highlight.font_weight = Some(style.weight);
                 }
 
+                if style.link {
+                    highlight.underline = Some(UnderlineStyle {
+                        thickness: px(1.),
+                        ..Default::default()
+                    });
+                }
+
+                if style.oblique {
+                    highlight.font_style = Some(FontStyle::Oblique)
+                }
+
                 Some(highlight)
             }
 
@@ -218,6 +258,10 @@ pub struct MarkdownHighlightStyle {
     pub strikethrough: bool,
     /// The weight of the text.
     pub weight: FontWeight,
+    /// Whether the text should be stylized as link.
+    pub link: bool,
+    // Whether the text should be obliqued.
+    pub oblique: bool,
 }
 
 /// A parsed region in a Markdown document.
@@ -254,7 +298,12 @@ impl Link {
             return Some(Link::Web { url: text });
         }
 
-        let path = PathBuf::from(&text);
+        // URL decode the text to handle spaces and other special characters
+        let decoded_text = urlencoding::decode(&text)
+            .map(|s| s.into_owned())
+            .unwrap_or(text);
+
+        let path = PathBuf::from(&decoded_text);
         if path.is_absolute() && path.exists() {
             return Some(Link::Path {
                 display_path: path.clone(),
@@ -264,7 +313,7 @@ impl Link {
 
         if let Some(file_location_directory) = file_location_directory {
             let display_path = path;
-            let path = file_location_directory.join(text);
+            let path = file_location_directory.join(decoded_text);
             if path.exists() {
                 return Some(Link::Path { display_path, path });
             }
@@ -290,6 +339,8 @@ pub struct Image {
     pub link: Link,
     pub source_range: Range<usize>,
     pub alt_text: Option<SharedString>,
+    pub width: Option<DefiniteLength>,
+    pub height: Option<DefiniteLength>,
 }
 
 impl Image {
@@ -303,10 +354,20 @@ impl Image {
             source_range,
             link,
             alt_text: None,
+            width: None,
+            height: None,
         })
     }
 
     pub fn set_alt_text(&mut self, alt_text: SharedString) {
         self.alt_text = Some(alt_text);
+    }
+
+    pub fn set_width(&mut self, width: DefiniteLength) {
+        self.width = Some(width);
+    }
+
+    pub fn set_height(&mut self, height: DefiniteLength) {
+        self.height = Some(height);
     }
 }

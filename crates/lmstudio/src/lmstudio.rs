@@ -1,4 +1,4 @@
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use futures::{AsyncBufReadExt, AsyncReadExt, StreamExt, io::BufReader, stream::BoxStream};
 use http_client::{AsyncBody, HttpClient, Method, Request as HttpRequest, http};
 use serde::{Deserialize, Serialize};
@@ -86,11 +86,12 @@ impl Model {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(rename_all = "lowercase")]
 pub enum ToolChoice {
     Auto,
     Required,
     None,
+    #[serde(untagged)]
     Other(ToolDefinition),
 }
 
@@ -276,10 +277,15 @@ impl Capabilities {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+pub struct LmStudioError {
+    pub message: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(untagged)]
 pub enum ResponseStreamResult {
     Ok(ResponseStreamEvent),
-    Err { error: String },
+    Err { error: LmStudioError },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -348,13 +354,18 @@ pub struct ResponseMessageDelta {
 pub async fn complete(
     client: &dyn HttpClient,
     api_url: &str,
+    api_key: Option<&str>,
     request: ChatCompletionRequest,
 ) -> Result<ChatResponse> {
     let uri = format!("{api_url}/chat/completions");
-    let request_builder = HttpRequest::builder()
+    let mut request_builder = HttpRequest::builder()
         .method(Method::POST)
         .uri(uri)
         .header("Content-Type", "application/json");
+
+    if let Some(api_key) = api_key {
+        request_builder = request_builder.header("Authorization", format!("Bearer {}", api_key));
+    }
 
     let serialized_request = serde_json::to_string(&request)?;
     let request = request_builder.body(AsyncBody::from(serialized_request))?;
@@ -380,19 +391,23 @@ pub async fn complete(
 pub async fn stream_chat_completion(
     client: &dyn HttpClient,
     api_url: &str,
+    api_key: Option<&str>,
     request: ChatCompletionRequest,
 ) -> Result<BoxStream<'static, Result<ResponseStreamEvent>>> {
     let uri = format!("{api_url}/chat/completions");
-    let request_builder = http::Request::builder()
+    let mut request_builder = http::Request::builder()
         .method(Method::POST)
         .uri(uri)
         .header("Content-Type", "application/json");
+
+    if let Some(api_key) = api_key {
+        request_builder = request_builder.header("Authorization", format!("Bearer {}", api_key));
+    }
 
     let request = request_builder.body(AsyncBody::from(serde_json::to_string(&request)?))?;
     let mut response = client.send(request).await?;
     if response.status().is_success() {
         let reader = BufReader::new(response.into_body());
-
         Ok(reader
             .lines()
             .filter_map(|line| async move {
@@ -402,18 +417,16 @@ pub async fn stream_chat_completion(
                         if line == "[DONE]" {
                             None
                         } else {
-                            let result = serde_json::from_str(&line)
-                                .context("Unable to parse chat completions response");
-                            if let Err(ref e) = result {
-                                eprintln!("Error parsing line: {e}\nLine content: '{line}'");
+                            match serde_json::from_str(line) {
+                                Ok(ResponseStreamResult::Ok(response)) => Some(Ok(response)),
+                                Ok(ResponseStreamResult::Err { error, .. }) => {
+                                    Some(Err(anyhow!(error.message)))
+                                }
+                                Err(error) => Some(Err(anyhow!(error))),
                             }
-                            Some(result)
                         }
                     }
-                    Err(e) => {
-                        eprintln!("Error reading line: {e}");
-                        Some(Err(e.into()))
-                    }
+                    Err(error) => Some(Err(anyhow!(error))),
                 }
             })
             .boxed())
@@ -431,13 +444,18 @@ pub async fn stream_chat_completion(
 pub async fn get_models(
     client: &dyn HttpClient,
     api_url: &str,
+    api_key: Option<&str>,
     _: Option<Duration>,
 ) -> Result<Vec<ModelEntry>> {
     let uri = format!("{api_url}/models");
-    let request_builder = HttpRequest::builder()
+    let mut request_builder = HttpRequest::builder()
         .method(Method::GET)
         .uri(uri)
         .header("Accept", "application/json");
+
+    if let Some(api_key) = api_key {
+        request_builder = request_builder.header("Authorization", format!("Bearer {}", api_key));
+    }
 
     let request = request_builder.body(AsyncBody::default())?;
 

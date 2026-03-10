@@ -3,11 +3,11 @@ use std::path::Path;
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use dap::{DapLocator, DebugRequest, adapters::DebugAdapterName};
-use gpui::SharedString;
+use gpui::{BackgroundExecutor, SharedString};
 
 use task::{DebugScenario, SpawnInTerminal, TaskTemplate, VariableName};
 
-pub(crate) struct PythonLocator;
+pub struct PythonLocator;
 
 #[async_trait]
 impl DapLocator for PythonLocator {
@@ -28,20 +28,12 @@ impl DapLocator for PythonLocator {
         let valid_program = build_config.command.starts_with("$ZED_")
             || Path::new(&build_config.command)
                 .file_name()
-                .map_or(false, |name| {
-                    name.to_str().is_some_and(|path| path.starts_with("python"))
-                });
+                .is_some_and(|name| name.to_str().is_some_and(|path| path.starts_with("python")));
         if !valid_program || build_config.args.iter().any(|arg| arg == "-c") {
             // We cannot debug selections.
             return None;
         }
-        let command = if build_config.command
-            == VariableName::Custom("PYTHON_ACTIVE_ZED_TOOLCHAIN".into()).template_value()
-        {
-            VariableName::Custom("PYTHON_ACTIVE_ZED_TOOLCHAIN_RAW".into()).template_value()
-        } else {
-            build_config.command.clone()
-        };
+        let command = build_config.command.clone();
         let module_specifier_position = build_config
             .args
             .iter()
@@ -59,10 +51,8 @@ impl DapLocator for PythonLocator {
         let program_position = mod_name
             .is_none()
             .then(|| {
-                build_config
-                    .args
-                    .iter()
-                    .position(|arg| *arg == "\"$ZED_FILE\"")
+                let zed_file = VariableName::File.template_value_with_whitespace();
+                build_config.args.iter().position(|arg| *arg == zed_file)
             })
             .flatten();
         let args = if let Some(position) = program_position {
@@ -100,7 +90,7 @@ impl DapLocator for PythonLocator {
         })
     }
 
-    async fn run(&self, _: SpawnInTerminal) -> Result<DebugRequest> {
+    async fn run(&self, _: SpawnInTerminal, _executor: BackgroundExecutor) -> Result<DebugRequest> {
         bail!("Python locator should not require DapLocator::run to be ran");
     }
 }

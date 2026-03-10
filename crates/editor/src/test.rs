@@ -5,7 +5,7 @@ use std::{rc::Rc, sync::LazyLock};
 
 pub use crate::rust_analyzer_ext::expand_macro_recursively;
 use crate::{
-    DisplayPoint, Editor, EditorMode, FoldPlaceholder, MultiBuffer, SelectionEffects,
+    DisplayPoint, Editor, EditorMode, FoldPlaceholder, MultiBuffer, SelectionEffects, Size,
     display_map::{
         Block, BlockPlacement, CustomBlockId, DisplayMap, DisplayRow, DisplaySnapshot,
         ToDisplayPoint,
@@ -16,11 +16,11 @@ use gpui::{
     AppContext as _, Context, Entity, EntityId, Font, FontFeatures, FontStyle, FontWeight, Pixels,
     VisualTestContext, Window, font, size,
 };
-use multi_buffer::ToPoint;
+use multi_buffer::{MultiBufferOffset, ToPoint};
 use pretty_assertions::assert_eq;
 use project::{Project, project_settings::DiagnosticSeverity};
-use ui::{App, BorrowAppContext, px};
-use util::test::{marked_text_offsets, marked_text_ranges};
+use ui::{App, BorrowAppContext, IntoElement, px};
+use util::test::{generate_marked_text, marked_text_offsets, marked_text_ranges};
 
 #[cfg(test)]
 #[ctor::ctor]
@@ -53,7 +53,7 @@ pub fn marked_display_snapshot(
     let (unmarked_text, markers) = marked_text_offsets(text);
 
     let font = Font {
-        family: "Zed Plex Mono".into(),
+        family: ".ZedMono".into(),
         features: FontFeatures::default(),
         fallbacks: None,
         weight: FontWeight::default(),
@@ -78,7 +78,7 @@ pub fn marked_display_snapshot(
     let snapshot = display_map.update(cx, |map, cx| map.snapshot(cx));
     let markers = markers
         .into_iter()
-        .map(|offset| offset.to_display_point(&snapshot))
+        .map(|offset| MultiBufferOffset(offset).to_display_point(&snapshot))
         .collect();
 
     (snapshot, markers)
@@ -94,7 +94,11 @@ pub fn select_ranges(
     let (unmarked_text, text_ranges) = marked_text_ranges(marked_text, true);
     assert_eq!(editor.text(cx), unmarked_text);
     editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-        s.select_ranges(text_ranges)
+        s.select_ranges(
+            text_ranges
+                .into_iter()
+                .map(|range| MultiBufferOffset(range.start)..MultiBufferOffset(range.end)),
+        )
     });
 }
 
@@ -104,17 +108,21 @@ pub fn assert_text_with_selections(
     marked_text: &str,
     cx: &mut Context<Editor>,
 ) {
-    let (unmarked_text, text_ranges) = marked_text_ranges(marked_text, true);
+    let (unmarked_text, _text_ranges) = marked_text_ranges(marked_text, true);
     assert_eq!(editor.text(cx), unmarked_text, "text doesn't match");
-    assert_eq!(
-        editor.selections.ranges(cx),
-        text_ranges,
-        "selections don't match",
+    let actual = generate_marked_text(
+        &editor.text(cx),
+        &editor
+            .selections
+            .ranges::<MultiBufferOffset>(&editor.display_snapshot(cx))
+            .into_iter()
+            .map(|range| range.start.0..range.end.0)
+            .collect::<Vec<_>>(),
+        marked_text.contains("«"),
     );
+    assert_eq!(actual, marked_text, "Selections don't match");
 }
 
-// RA thinks this is dead code even though it is used in a whole lot of tests
-#[allow(dead_code)]
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn build_editor(
     buffer: Entity<MultiBuffer>,
@@ -166,11 +174,26 @@ pub fn block_content_for_tests(
 }
 
 pub fn editor_content_with_blocks(editor: &Entity<Editor>, cx: &mut VisualTestContext) -> String {
-    cx.draw(
-        gpui::Point::default(),
-        size(px(3000.0), px(3000.0)),
-        |_, _| editor.clone(),
-    );
+    editor_content_with_blocks_and_width(editor, px(3000.), cx)
+}
+
+pub fn editor_content_with_blocks_and_width(
+    editor: &Entity<Editor>,
+    width: Pixels,
+    cx: &mut VisualTestContext,
+) -> String {
+    editor_content_with_blocks_and_size(editor, size(width, px(3000.0)), cx)
+}
+
+pub fn editor_content_with_blocks_and_size(
+    editor: &Entity<Editor>,
+    draw_size: Size<Pixels>,
+    cx: &mut VisualTestContext,
+) -> String {
+    cx.simulate_resize(draw_size);
+    cx.draw(gpui::Point::default(), draw_size, |_, _| {
+        editor.clone().into_any_element()
+    });
     let (snapshot, mut lines, blocks) = editor.update_in(cx, |editor, window, cx| {
         let snapshot = editor.snapshot(window, cx);
         let text = editor.display_text(cx);
@@ -184,12 +207,12 @@ pub fn editor_content_with_blocks(editor: &Entity<Editor>, cx: &mut VisualTestCo
     for (row, block) in blocks {
         match block {
             Block::Custom(custom_block) => {
-                if let BlockPlacement::Near(x) = &custom_block.placement {
-                    if snapshot.intersects_fold(x.to_point(&snapshot.buffer_snapshot)) {
-                        continue;
-                    }
+                if let BlockPlacement::Near(x) = &custom_block.placement
+                    && snapshot.intersects_fold(x.to_point(&snapshot.buffer_snapshot()))
+                {
+                    continue;
                 };
-                let content = block_content_for_tests(&editor, custom_block.id, cx)
+                let content = block_content_for_tests(editor, custom_block.id, cx)
                     .expect("block content not found");
                 // 2: "related info 1 for diagnostic 0"
                 if let Some(height) = custom_block.height {
@@ -215,43 +238,61 @@ pub fn editor_content_with_blocks(editor: &Entity<Editor>, cx: &mut VisualTestCo
                 first_excerpt,
                 height,
             } => {
+                while lines.len() <= row.0 as usize {
+                    lines.push(String::new());
+                }
                 lines[row.0 as usize].push_str(&cx.update(|_, cx| {
                     format!(
                         "§ {}",
                         first_excerpt
                             .buffer
                             .file()
-                            .unwrap()
-                            .file_name(cx)
-                            .to_string_lossy()
+                            .map(|file| file.file_name(cx))
+                            .unwrap_or("<no file>")
                     )
                 }));
                 for row in row.0 + 1..row.0 + height {
+                    while lines.len() <= row as usize {
+                        lines.push(String::new());
+                    }
                     lines[row as usize].push_str("§ -----");
                 }
             }
-            Block::ExcerptBoundary {
-                excerpt,
-                height,
-                starts_new_buffer,
-            } => {
-                if starts_new_buffer {
-                    lines[row.0 as usize].push_str(&cx.update(|_, cx| {
-                        format!(
-                            "§ {}",
-                            excerpt
-                                .buffer
-                                .file()
-                                .unwrap()
-                                .file_name(cx)
-                                .to_string_lossy()
-                        )
-                    }));
-                } else {
-                    lines[row.0 as usize].push_str("§ -----")
-                }
-                for row in row.0 + 1..row.0 + height {
+            Block::ExcerptBoundary { height, .. } => {
+                for row in row.0..row.0 + height {
+                    while lines.len() <= row as usize {
+                        lines.push(String::new());
+                    }
                     lines[row as usize].push_str("§ -----");
+                }
+            }
+            Block::BufferHeader { excerpt, height } => {
+                while lines.len() <= row.0 as usize {
+                    lines.push(String::new());
+                }
+                lines[row.0 as usize].push_str(&cx.update(|_, cx| {
+                    format!(
+                        "§ {}",
+                        excerpt
+                            .buffer
+                            .file()
+                            .map(|file| file.file_name(cx))
+                            .unwrap_or("<no file>")
+                    )
+                }));
+                for row in row.0 + 1..row.0 + height {
+                    while lines.len() <= row as usize {
+                        lines.push(String::new());
+                    }
+                    lines[row as usize].push_str("§ -----");
+                }
+            }
+            Block::Spacer { height, .. } => {
+                for row in row.0..row.0 + height {
+                    while lines.len() <= row as usize {
+                        lines.push(String::new());
+                    }
+                    lines[row as usize].push_str("§ spacer");
                 }
             }
         }

@@ -31,13 +31,13 @@ impl Vim {
         cx: &mut Context<Self>,
     ) {
         self.stop_recording(cx);
-        self.update_editor(window, cx, |_, editor, window, cx| {
+        self.update_editor(cx, |_, editor, cx| {
             editor.set_clip_at_line_ends(false, cx);
-            let text_layout_details = editor.text_layout_details(window);
+            let text_layout_details = editor.text_layout_details(window, cx);
             editor.transact(window, cx, |editor, window, cx| {
                 let mut selection_starts: HashMap<_, _> = Default::default();
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         let anchor = map.display_point_to_anchor(selection.head(), Bias::Left);
                         selection_starts.insert(selection.id, anchor);
                         motion.expand_selection(
@@ -67,7 +67,7 @@ impl Vim {
                     }
                 }
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         let anchor = selection_starts.remove(&selection.id).unwrap();
                         selection.collapse_to(anchor.to_display_point(map), SelectionGoal::None);
                     });
@@ -87,12 +87,12 @@ impl Vim {
         cx: &mut Context<Self>,
     ) {
         self.stop_recording(cx);
-        self.update_editor(window, cx, |_, editor, window, cx| {
+        self.update_editor(cx, |_, editor, cx| {
             editor.transact(window, cx, |editor, window, cx| {
                 editor.set_clip_at_line_ends(false, cx);
                 let mut original_positions: HashMap<_, _> = Default::default();
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         object.expand_selection(map, selection, around, times);
                         original_positions.insert(
                             selection.id,
@@ -118,7 +118,7 @@ impl Vim {
                     }
                 }
                 editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                    s.move_with(|map, selection| {
+                    s.move_with(&mut |map, selection| {
                         let anchor = original_positions.remove(&selection.id).unwrap();
                         selection.collapse_to(anchor.to_display_point(map), SelectionGoal::None);
                     });
@@ -195,11 +195,11 @@ impl Vim {
         let count = Vim::take_count(cx).unwrap_or(1) as u32;
         Vim::take_forced_motion(cx);
 
-        self.update_editor(window, cx, |vim, editor, window, cx| {
+        self.update_editor(cx, |vim, editor, cx| {
             let mut ranges = Vec::new();
             let mut cursor_positions = Vec::new();
             let snapshot = editor.buffer().read(cx).snapshot(cx);
-            for selection in editor.selections.all_adjusted(cx) {
+            for selection in editor.selections.all_adjusted(&editor.display_snapshot(cx)) {
                 match vim.mode {
                     Mode::Visual | Mode::VisualLine => {
                         ranges.push(selection.start..selection.end);
@@ -212,13 +212,12 @@ impl Vim {
                         }
                     }
 
-                    Mode::HelixNormal => {
+                    Mode::HelixNormal | Mode::HelixSelect => {
                         if selection.is_empty() {
-                            // Handle empty selection by operating on the whole word
-                            let (word_range, _) = snapshot.surrounding_word(selection.start, false);
-                            let word_start = snapshot.offset_to_point(word_range.start);
-                            let word_end = snapshot.offset_to_point(word_range.end);
-                            ranges.push(word_start..word_end);
+                            // Handle empty selection by operating on single character
+                            let start = selection.start;
+                            let end = snapshot.clip_point(start + Point::new(0, 1), Bias::Right);
+                            ranges.push(start..end);
                             cursor_positions.push(selection.start..selection.start);
                         } else {
                             ranges.push(selection.start..selection.end);
@@ -445,15 +444,26 @@ mod test {
         cx.simulate_keystrokes("~");
         cx.assert_state("«HELLO WORLDˇ»", Mode::HelixNormal);
 
-        // Cursor-only (empty) selection
+        // Cursor-only (empty) selection - switch case
         cx.set_state("The ˇquick brown", Mode::HelixNormal);
         cx.simulate_keystrokes("~");
-        cx.assert_state("The ˇQUICK brown", Mode::HelixNormal);
+        cx.assert_state("The ˇQuick brown", Mode::HelixNormal);
+        cx.simulate_keystrokes("~");
+        cx.assert_state("The ˇquick brown", Mode::HelixNormal);
+
+        // Cursor-only (empty) selection - switch to uppercase and lowercase explicitly
+        cx.set_state("The ˇquick brown", Mode::HelixNormal);
+        cx.simulate_keystrokes("alt-`");
+        cx.assert_state("The ˇQuick brown", Mode::HelixNormal);
+        cx.simulate_keystrokes("`");
+        cx.assert_state("The ˇquick brown", Mode::HelixNormal);
 
         // With `e` motion (which extends selection to end of word in Helix)
         cx.set_state("The ˇquick brown fox", Mode::HelixNormal);
         cx.simulate_keystrokes("e");
         cx.simulate_keystrokes("~");
         cx.assert_state("The «QUICKˇ» brown fox", Mode::HelixNormal);
+
+        // Cursor-only
     }
 }

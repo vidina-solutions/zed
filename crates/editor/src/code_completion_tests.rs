@@ -1,9 +1,10 @@
-use crate::{code_context_menus::CompletionsMenu, editor_settings::SnippetSortOrder};
+use crate::code_context_menus::CompletionsMenu;
 use fuzzy::{StringMatch, StringMatchCandidate};
 use gpui::TestAppContext;
 use language::CodeLabel;
 use lsp::{CompletionItem, CompletionItemKind, LanguageServerId};
 use project::{Completion, CompletionSource};
+use settings::SnippetSortOrder;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use text::Anchor;
@@ -94,7 +95,7 @@ async fn test_fuzzy_score(cx: &mut TestAppContext) {
             filter_and_sort_matches("set_text", &completions, SnippetSortOrder::Top, cx).await;
         assert_eq!(matches[0].string, "set_text");
         assert_eq!(matches[1].string, "set_text_style_refinement");
-        assert_eq!(matches[2].string, "set_context_menu_options");
+        assert_eq!(matches[2].string, "set_placeholder_text");
     }
 
     // fuzzy filter text over label, sort_text and sort_kind
@@ -216,6 +217,111 @@ async fn test_sort_positions(cx: &mut TestAppContext) {
     assert_eq!(matches[0].string, "rounded-full");
 }
 
+#[gpui::test]
+async fn test_fuzzy_over_sort_positions(cx: &mut TestAppContext) {
+    let completions = vec![
+        CompletionBuilder::variable("lsp_document_colors", None, "7fffffff"), // 0.29 fuzzy score
+        CompletionBuilder::function(
+            "language_servers_running_disk_based_diagnostics",
+            None,
+            "7fffffff",
+        ), // 0.168 fuzzy score
+        CompletionBuilder::function("code_lens", None, "7fffffff"),           // 3.2 fuzzy score
+        CompletionBuilder::variable("lsp_code_lens", None, "7fffffff"),       // 3.2 fuzzy score
+        CompletionBuilder::function("fetch_code_lens", None, "7fffffff"),     // 3.2 fuzzy score
+    ];
+
+    let matches =
+        filter_and_sort_matches("lens", &completions, SnippetSortOrder::default(), cx).await;
+
+    assert_eq!(matches[0].string, "code_lens");
+    assert_eq!(matches[1].string, "lsp_code_lens");
+    assert_eq!(matches[2].string, "fetch_code_lens");
+}
+
+#[gpui::test]
+async fn test_semver_label_sort_by_latest_version(cx: &mut TestAppContext) {
+    let mut versions = [
+        "10.4.112",
+        "10.4.22",
+        "10.4.2",
+        "10.4.20",
+        "10.4.21",
+        "10.4.12",
+        // Pre-release versions
+        "10.4.22-alpha",
+        "10.4.22-beta.1",
+        "10.4.22-rc.1",
+        // Build metadata versions
+        "10.4.21+build.123",
+        "10.4.20+20210327",
+    ];
+    versions.sort_by(|a, b| {
+        match (
+            semver::Version::parse(a).ok(),
+            semver::Version::parse(b).ok(),
+        ) {
+            (Some(a_ver), Some(b_ver)) => b_ver.cmp(&a_ver),
+            _ => std::cmp::Ordering::Equal,
+        }
+    });
+    let completions: Vec<_> = versions
+        .iter()
+        .enumerate()
+        .map(|(i, version)| {
+            // This sort text would come from the LSP
+            let sort_text = format!("{:08}", i);
+            CompletionBuilder::new(version, None, &sort_text, None)
+        })
+        .collect();
+
+    // Case 1: User types just the major and minor version
+    let matches =
+        filter_and_sort_matches("10.4.", &completions, SnippetSortOrder::default(), cx).await;
+    // Versions are ordered by recency (latest first)
+    let expected_versions = [
+        "10.4.112",
+        "10.4.22",
+        "10.4.22-rc.1",
+        "10.4.22-beta.1",
+        "10.4.22-alpha",
+        "10.4.21+build.123",
+        "10.4.21",
+        "10.4.20+20210327",
+        "10.4.20",
+        "10.4.12",
+        "10.4.2",
+    ];
+    for (match_item, expected) in matches.iter().zip(expected_versions.iter()) {
+        assert_eq!(match_item.string.as_ref() as &str, *expected);
+    }
+
+    // Case 2: User types the major, minor, and patch version
+    let matches =
+        filter_and_sort_matches("10.4.2", &completions, SnippetSortOrder::default(), cx).await;
+    let expected_versions = [
+        // Exact match comes first
+        "10.4.2",
+        // Ordered by recency with exact major, minor, and patch versions
+        "10.4.22",
+        "10.4.22-rc.1",
+        "10.4.22-beta.1",
+        "10.4.22-alpha",
+        "10.4.21+build.123",
+        "10.4.21",
+        "10.4.20+20210327",
+        "10.4.20",
+        // Versions with non-exact patch versions are ordered by fuzzy score
+        // Higher fuzzy score than 112 patch version since "2" appears before "1"
+        // in "12", making it rank higher than "112"
+        "10.4.12",
+        "10.4.112",
+    ];
+    for (match_item, expected) in matches.iter().zip(expected_versions.iter()) {
+        assert_eq!(match_item.string.as_ref() as &str, *expected);
+    }
+}
+
 async fn test_for_each_prefix<F>(
     target: &str,
     completions: &Vec<Completion>,
@@ -236,30 +342,55 @@ struct CompletionBuilder;
 
 impl CompletionBuilder {
     fn constant(label: &str, filter_text: Option<&str>, sort_text: &str) -> Completion {
-        Self::new(label, filter_text, sort_text, CompletionItemKind::CONSTANT)
+        Self::new(
+            label,
+            filter_text,
+            sort_text,
+            Some(CompletionItemKind::CONSTANT),
+        )
     }
 
     fn function(label: &str, filter_text: Option<&str>, sort_text: &str) -> Completion {
-        Self::new(label, filter_text, sort_text, CompletionItemKind::FUNCTION)
+        Self::new(
+            label,
+            filter_text,
+            sort_text,
+            Some(CompletionItemKind::FUNCTION),
+        )
     }
 
     fn method(label: &str, filter_text: Option<&str>, sort_text: &str) -> Completion {
-        Self::new(label, filter_text, sort_text, CompletionItemKind::METHOD)
+        Self::new(
+            label,
+            filter_text,
+            sort_text,
+            Some(CompletionItemKind::METHOD),
+        )
     }
 
     fn variable(label: &str, filter_text: Option<&str>, sort_text: &str) -> Completion {
-        Self::new(label, filter_text, sort_text, CompletionItemKind::VARIABLE)
+        Self::new(
+            label,
+            filter_text,
+            sort_text,
+            Some(CompletionItemKind::VARIABLE),
+        )
     }
 
     fn snippet(label: &str, filter_text: Option<&str>, sort_text: &str) -> Completion {
-        Self::new(label, filter_text, sort_text, CompletionItemKind::SNIPPET)
+        Self::new(
+            label,
+            filter_text,
+            sort_text,
+            Some(CompletionItemKind::SNIPPET),
+        )
     }
 
     fn new(
         label: &str,
         filter_text: Option<&str>,
         sort_text: &str,
-        kind: CompletionItemKind,
+        kind: Option<CompletionItemKind>,
     ) -> Completion {
         Completion {
             replace_range: Anchor::MIN..Anchor::MAX,
@@ -271,7 +402,7 @@ impl CompletionBuilder {
                 server_id: LanguageServerId(0),
                 lsp_completion: Box::new(CompletionItem {
                     label: label.to_string(),
-                    kind: Some(kind),
+                    kind: kind,
                     sort_text: Some(sort_text.to_string()),
                     filter_text: filter_text.map(|text| text.to_string()),
                     ..Default::default()
@@ -282,6 +413,8 @@ impl CompletionBuilder {
             icon_path: None,
             insert_text_mode: None,
             confirm: None,
+            match_start: None,
+            snippet_deduplication_key: None,
         }
     }
 }
@@ -295,7 +428,7 @@ async fn filter_and_sort_matches(
     let candidates: Arc<[StringMatchCandidate]> = completions
         .iter()
         .enumerate()
-        .map(|(id, completion)| StringMatchCandidate::new(id, &completion.label.filter_text()))
+        .map(|(id, completion)| StringMatchCandidate::new(id, completion.label.filter_text()))
         .collect();
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let background_executor = cx.executor();
@@ -309,5 +442,5 @@ async fn filter_and_sort_matches(
         background_executor,
     )
     .await;
-    CompletionsMenu::sort_string_matches(matches, Some(query), snippet_sort_order, &completions)
+    CompletionsMenu::sort_string_matches(matches, Some(query), snippet_sort_order, completions)
 }

@@ -1,16 +1,13 @@
 pub mod running;
 
-use crate::{StackTraceView, persistence::SerializedLayout, session::running::DebugTerminal};
+use crate::{persistence::SerializedLayout, session::running::DebugTerminal};
 use dap::client::SessionId;
-use gpui::{
-    App, Axis, Entity, EventEmitter, FocusHandle, Focusable, Subscription, Task, WeakEntity,
-};
+use gpui::{App, Axis, Entity, EventEmitter, FocusHandle, Focusable, Task, WeakEntity};
 use project::debugger::session::Session;
-use project::worktree_store::WorktreeStore;
+
 use project::{Project, debugger::session::SessionQuirks};
 use rpc::proto;
 use running::RunningState;
-use std::cell::OnceCell;
 use ui::prelude::*;
 use workspace::{
     CollaboratorId, FollowableItem, ViewId, Workspace,
@@ -21,16 +18,6 @@ pub struct DebugSession {
     remote_id: Option<workspace::ViewId>,
     pub(crate) running_state: Entity<RunningState>,
     pub(crate) quirks: SessionQuirks,
-    stack_trace_view: OnceCell<Entity<StackTraceView>>,
-    _worktree_store: WeakEntity<WorktreeStore>,
-    workspace: WeakEntity<Workspace>,
-    _subscriptions: [Subscription; 1],
-}
-
-#[derive(Debug)]
-pub enum DebugPanelItemEvent {
-    Close,
-    Stopped { go_to_stack_frame: bool },
 }
 
 impl DebugSession {
@@ -58,47 +45,15 @@ impl DebugSession {
         });
         let quirks = session.read(cx).quirks();
 
-        cx.new(|cx| Self {
-            _subscriptions: [cx.subscribe(&running_state, |_, _, _, cx| {
-                cx.notify();
-            })],
+        cx.new(|_| Self {
             remote_id: None,
             running_state,
             quirks,
-            stack_trace_view: OnceCell::new(),
-            _worktree_store: project.read(cx).worktree_store().downgrade(),
-            workspace,
         })
     }
 
     pub(crate) fn session_id(&self, cx: &App) -> SessionId {
         self.running_state.read(cx).session_id()
-    }
-
-    pub(crate) fn stack_trace_view(
-        &mut self,
-        project: &Entity<Project>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> &Entity<StackTraceView> {
-        let workspace = self.workspace.clone();
-        let running_state = self.running_state.clone();
-
-        self.stack_trace_view.get_or_init(|| {
-            let stackframe_list = running_state.read(cx).stack_frame_list().clone();
-
-            let stack_frame_view = cx.new(|cx| {
-                StackTraceView::new(
-                    workspace.clone(),
-                    project.clone(),
-                    stackframe_list,
-                    window,
-                    cx,
-                )
-            });
-
-            stack_frame_view
-        })
     }
 
     pub fn session(&self, cx: &App) -> Entity<Session> {
@@ -135,7 +90,7 @@ impl DebugSession {
     }
 }
 
-impl EventEmitter<DebugPanelItemEvent> for DebugSession {}
+impl EventEmitter<()> for DebugSession {}
 
 impl Focusable for DebugSession {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -144,7 +99,7 @@ impl Focusable for DebugSession {
 }
 
 impl Item for DebugSession {
-    type Event = DebugPanelItemEvent;
+    type Event = ();
     fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
         "Debugger".into()
     }
@@ -155,7 +110,7 @@ impl FollowableItem for DebugSession {
         self.remote_id
     }
 
-    fn to_state_proto(&self, _window: &Window, _cx: &App) -> Option<proto::view::Variant> {
+    fn to_state_proto(&self, _window: &mut Window, _cx: &mut App) -> Option<proto::view::Variant> {
         None
     }
 
@@ -173,8 +128,8 @@ impl FollowableItem for DebugSession {
         &self,
         _event: &Self::Event,
         _update: &mut Option<proto::update_view::Variant>,
-        _window: &Window,
-        _cx: &App,
+        _window: &mut Window,
+        _cx: &mut App,
     ) -> bool {
         // update.get_or_insert_with(|| proto::update_view::Variant::DebugPanel(Default::default()));
 

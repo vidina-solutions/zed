@@ -7,7 +7,7 @@ const DEFS_PATH: &str = "#/$defs/";
 ///
 /// This asserts that JsonSchema::schema_name() + "2" does not exist because this indicates that
 /// there are multiple types that use this name, and unfortunately schemars APIs do not support
-/// resolving this ambiguity - see https://github.com/GREsau/schemars/issues/449
+/// resolving this ambiguity - see <https://github.com/GREsau/schemars/issues/449>
 ///
 /// This takes a closure for `schema` because some settings types are not available on the remote
 /// server, and so will crash when attempting to access e.g. GlobalThemeRegistry.
@@ -15,13 +15,11 @@ pub fn replace_subschema<T: JsonSchema>(
     generator: &mut schemars::SchemaGenerator,
     schema: impl Fn() -> schemars::Schema,
 ) -> schemars::Schema {
-    // fallback on just using the schema name, which could collide.
     let schema_name = T::schema_name();
     let definitions = generator.definitions_mut();
     assert!(!definitions.contains_key(&format!("{schema_name}2")));
-    if definitions.contains_key(schema_name.as_ref()) {
-        definitions.insert(schema_name.to_string(), schema().to_value());
-    }
+    assert!(definitions.contains_key(schema_name.as_ref()));
+    definitions.insert(schema_name.to_string(), schema().to_value());
     schemars::Schema::new_ref(format!("{DEFS_PATH}{schema_name}"))
 }
 
@@ -45,14 +43,30 @@ pub struct DefaultDenyUnknownFields;
 
 impl schemars::transform::Transform for DefaultDenyUnknownFields {
     fn transform(&mut self, schema: &mut schemars::Schema) {
-        if let Some(object) = schema.as_object_mut() {
-            if object.contains_key("properties")
-                && !object.contains_key("additionalProperties")
-                && !object.contains_key("unevaluatedProperties")
-            {
-                object.insert("additionalProperties".to_string(), false.into());
-            }
+        if let Some(object) = schema.as_object_mut()
+            && object.contains_key("properties")
+            && !object.contains_key("additionalProperties")
+            && !object.contains_key("unevaluatedProperties")
+        {
+            object.insert("additionalProperties".to_string(), false.into());
         }
         transform_subschemas(self, schema);
+    }
+}
+
+/// Defaults `allowTrailingCommas` to `true`, for use with `json-language-server`.
+/// This can be applied to any schema that will be treated as `jsonc`.
+///
+/// Note that this is non-recursive and only applied to the root schema.
+#[derive(Clone)]
+pub struct AllowTrailingCommas;
+
+impl schemars::transform::Transform for AllowTrailingCommas {
+    fn transform(&mut self, schema: &mut schemars::Schema) {
+        if let Some(object) = schema.as_object_mut()
+            && !object.contains_key("allowTrailingCommas")
+        {
+            object.insert("allowTrailingCommas".to_string(), true.into());
+        }
     }
 }

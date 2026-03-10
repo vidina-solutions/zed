@@ -2,55 +2,50 @@ mod app_menu;
 mod keyboard;
 mod keystroke;
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
-mod linux;
-
-#[cfg(target_os = "macos")]
-mod mac;
-
-#[cfg(any(
-    all(
-        any(target_os = "linux", target_os = "freebsd"),
-        any(feature = "x11", feature = "wayland")
-    ),
-    target_os = "windows",
-    feature = "macos-blade"
-))]
-mod blade;
+#[cfg(all(target_os = "linux", feature = "wayland"))]
+#[expect(missing_docs)]
+pub mod layer_shell;
 
 #[cfg(any(test, feature = "test-support"))]
 mod test;
 
-#[cfg(target_os = "windows")]
-mod windows;
+#[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
+mod visual_test;
 
 #[cfg(all(
     feature = "screen-capture",
-    any(
-        target_os = "windows",
-        all(
-            any(target_os = "linux", target_os = "freebsd"),
-            any(feature = "wayland", feature = "x11"),
-        )
-    )
+    any(target_os = "windows", target_os = "linux", target_os = "freebsd",)
 ))]
-pub(crate) mod scap_screen_capture;
+pub mod scap_screen_capture;
+
+#[cfg(all(
+    any(target_os = "windows", target_os = "linux"),
+    feature = "screen-capture"
+))]
+pub(crate) type PlatformScreenCaptureFrame = scap::frame::Frame;
+#[cfg(not(feature = "screen-capture"))]
+pub(crate) type PlatformScreenCaptureFrame = ();
+#[cfg(all(target_os = "macos", feature = "screen-capture"))]
+pub(crate) type PlatformScreenCaptureFrame = core_video::image_buffer::CVImageBuffer;
 
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Font, FontId, FontMetrics, FontRun,
     ForegroundExecutor, GlyphId, GpuSpecs, ImageSource, Keymap, LineLayout, Pixels, PlatformInput,
-    Point, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, ScaledPixels, Scene,
-    ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer, SvgSize, Task, TaskLabel, Window,
-    WindowControlArea, hash, point, px, size,
+    Point, Priority, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene,
+    ShapedGlyph, ShapedRun, SharedString, Size, SvgRenderer, SystemWindowTab, Task,
+    ThreadTaskTimings, Window, WindowControlArea, hash, point, px, size,
 };
 use anyhow::Result;
 use async_task::Runnable;
 use futures::channel::oneshot;
+#[cfg(any(test, feature = "test-support"))]
+use image::RgbaImage;
 use image::codecs::gif::GifDecoder;
 use image::{AnimationDecoder as _, Frame};
-use parking::Unparker;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use scheduler::Instant;
+pub use scheduler::RunnableMeta;
 use schemars::JsonSchema;
 use seahash::SeaHasher;
 use serde::{Deserialize, Serialize};
@@ -59,7 +54,7 @@ use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::io::Cursor;
 use std::ops;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::{
     fmt::{self, Debug},
     ops::Range,
@@ -74,56 +69,17 @@ pub use app_menu::*;
 pub use keyboard::*;
 pub use keystroke::*;
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
-pub(crate) use linux::*;
-#[cfg(target_os = "macos")]
-pub(crate) use mac::*;
-pub use semantic_version::SemanticVersion;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use test::*;
-#[cfg(target_os = "windows")]
-pub(crate) use windows::*;
 
 #[cfg(any(test, feature = "test-support"))]
-pub use test::{TestDispatcher, TestScreenCaptureSource};
+pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream};
 
-/// Returns a background executor for the current platform.
-pub fn background_executor() -> BackgroundExecutor {
-    current_platform(true).background_executor()
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn current_platform(headless: bool) -> Rc<dyn Platform> {
-    Rc::new(MacPlatform::new(headless))
-}
-
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
-pub(crate) fn current_platform(headless: bool) -> Rc<dyn Platform> {
-    #[cfg(feature = "x11")]
-    use anyhow::Context as _;
-
-    if headless {
-        return Rc::new(HeadlessClient::new());
-    }
-
-    match guess_compositor() {
-        #[cfg(feature = "wayland")]
-        "Wayland" => Rc::new(WaylandClient::new()),
-
-        #[cfg(feature = "x11")]
-        "X11" => Rc::new(
-            X11Client::new()
-                .context("Failed to initialize X11 client.")
-                .unwrap(),
-        ),
-
-        "Headless" => Rc::new(HeadlessClient::new()),
-        _ => unreachable!(),
-    }
-}
+#[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
+pub use visual_test::VisualTestPlatform;
 
 /// Return which compositor we're guessing we'll use.
-/// Does not attempt to connect to the given compositor
+/// Does not attempt to connect to the given compositor.
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 #[inline]
 pub fn guess_compositor() -> &'static str {
@@ -153,16 +109,8 @@ pub fn guess_compositor() -> &'static str {
     }
 }
 
-#[cfg(target_os = "windows")]
-pub(crate) fn current_platform(_headless: bool) -> Rc<dyn Platform> {
-    Rc::new(
-        WindowsPlatform::new()
-            .inspect_err(|err| show_error("Failed to launch", err.to_string()))
-            .unwrap(),
-    )
-}
-
-pub(crate) trait Platform: 'static {
+#[expect(missing_docs)]
+pub trait Platform: 'static {
     fn background_executor(&self) -> BackgroundExecutor;
     fn foreground_executor(&self) -> ForegroundExecutor;
     fn text_system(&self) -> Arc<dyn PlatformTextSystem>;
@@ -182,20 +130,13 @@ pub(crate) trait Platform: 'static {
         None
     }
 
-    #[cfg(feature = "screen-capture")]
-    fn is_screen_capture_supported(&self) -> bool;
-    #[cfg(not(feature = "screen-capture"))]
     fn is_screen_capture_supported(&self) -> bool {
         false
     }
-    #[cfg(feature = "screen-capture")]
+
     fn screen_capture_sources(
         &self,
-    ) -> oneshot::Receiver<Result<Vec<Box<dyn ScreenCaptureSource>>>>;
-    #[cfg(not(feature = "screen-capture"))]
-    fn screen_capture_sources(
-        &self,
-    ) -> oneshot::Receiver<anyhow::Result<Vec<Box<dyn ScreenCaptureSource>>>> {
+    ) -> oneshot::Receiver<anyhow::Result<Vec<Rc<dyn ScreenCaptureSource>>>> {
         let (sources_tx, sources_rx) = oneshot::channel();
         sources_tx
             .send(Err(anyhow::anyhow!(
@@ -222,14 +163,17 @@ pub(crate) trait Platform: 'static {
         &self,
         options: PathPromptOptions,
     ) -> oneshot::Receiver<Result<Option<Vec<PathBuf>>>>;
-    fn prompt_for_new_path(&self, directory: &Path) -> oneshot::Receiver<Result<Option<PathBuf>>>;
+    fn prompt_for_new_path(
+        &self,
+        directory: &Path,
+        suggested_name: Option<&str>,
+    ) -> oneshot::Receiver<Result<Option<PathBuf>>>;
     fn can_select_mixed_files_and_dirs(&self) -> bool;
     fn reveal_path(&self, path: &Path);
     fn open_with_system(&self, path: &Path);
 
     fn on_quit(&self, callback: Box<dyn FnMut()>);
     fn on_reopen(&self, callback: Box<dyn FnMut()>);
-    fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>);
 
     fn set_menus(&self, menus: Vec<Menu>, keymap: &Keymap);
     fn get_menus(&self) -> Option<Vec<OwnedMenu>> {
@@ -243,13 +187,15 @@ pub(crate) trait Platform: 'static {
         &self,
         _menus: Vec<MenuItem>,
         _entries: Vec<SmallVec<[PathBuf; 2]>>,
-    ) -> Vec<SmallVec<[PathBuf; 2]>> {
-        Vec::new()
+    ) -> Task<Vec<SmallVec<[PathBuf; 2]>>> {
+        Task::ready(Vec::new())
     }
     fn on_app_menu_action(&self, callback: Box<dyn FnMut(&dyn Action)>);
     fn on_will_open_app_menu(&self, callback: Box<dyn FnMut()>);
     fn on_validate_app_menu_command(&self, callback: Box<dyn FnMut(&dyn Action) -> bool>);
-    fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout>;
+
+    fn thermal_state(&self) -> ThermalState;
+    fn on_thermal_state_change(&self, callback: Box<dyn FnMut()>);
 
     fn compositor_name(&self) -> &'static str {
         ""
@@ -260,20 +206,30 @@ pub(crate) trait Platform: 'static {
     fn set_cursor_style(&self, style: CursorStyle);
     fn should_auto_hide_scrollbars(&self) -> bool;
 
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    fn write_to_primary(&self, item: ClipboardItem);
+    fn read_from_clipboard(&self) -> Option<ClipboardItem>;
     fn write_to_clipboard(&self, item: ClipboardItem);
+
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn read_from_primary(&self) -> Option<ClipboardItem>;
-    fn read_from_clipboard(&self) -> Option<ClipboardItem>;
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn write_to_primary(&self, item: ClipboardItem);
+
+    #[cfg(target_os = "macos")]
+    fn read_from_find_pasteboard(&self) -> Option<ClipboardItem>;
+    #[cfg(target_os = "macos")]
+    fn write_to_find_pasteboard(&self, item: ClipboardItem);
 
     fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>>;
     fn read_credentials(&self, url: &str) -> Task<Result<Option<(String, Vec<u8>)>>>;
     fn delete_credentials(&self, url: &str) -> Task<Result<()>>;
+
+    fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout>;
+    fn keyboard_mapper(&self) -> Rc<dyn PlatformKeyboardMapper>;
+    fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>);
 }
 
 /// A handle to a platform's display, e.g. a monitor or laptop screen.
-pub trait PlatformDisplay: Send + Sync + Debug {
+pub trait PlatformDisplay: Debug {
     /// Get the ID for this display
     fn id(&self) -> DisplayId;
 
@@ -284,19 +240,55 @@ pub trait PlatformDisplay: Send + Sync + Debug {
     /// Get the bounds for this display
     fn bounds(&self) -> Bounds<Pixels>;
 
+    /// Get the visible bounds for this display, excluding taskbar/dock areas.
+    /// This is the usable area where windows can be placed without being obscured.
+    /// Defaults to the full display bounds if not overridden.
+    fn visible_bounds(&self) -> Bounds<Pixels> {
+        self.bounds()
+    }
+
     /// Get the default bounds for this display to place a window
     fn default_bounds(&self) -> Bounds<Pixels> {
-        let center = self.bounds().center();
-        let offset = DEFAULT_WINDOW_SIZE / 2.0;
+        let bounds = self.bounds();
+        let center = bounds.center();
+        let clipped_window_size = DEFAULT_WINDOW_SIZE.min(&bounds.size);
+
+        let offset = clipped_window_size / 2.0;
         let origin = point(center.x - offset.width, center.y - offset.height);
-        Bounds::new(origin, DEFAULT_WINDOW_SIZE)
+        Bounds::new(origin, clipped_window_size)
     }
+}
+
+/// Thermal state of the system
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThermalState {
+    /// System has no thermal constraints
+    Nominal,
+    /// System is slightly constrained, reduce discretionary work
+    Fair,
+    /// System is moderately constrained, reduce CPU/GPU intensive work
+    Serious,
+    /// System is critically constrained, minimize all resource usage
+    Critical,
+}
+
+/// Metadata for a given [ScreenCaptureSource]
+#[derive(Clone)]
+pub struct SourceMetadata {
+    /// Opaque identifier of this screen.
+    pub id: u64,
+    /// Human-readable label for this source.
+    pub label: Option<SharedString>,
+    /// Whether this source is the main display.
+    pub is_main: Option<bool>,
+    /// Video resolution of this source.
+    pub resolution: Size<DevicePixels>,
 }
 
 /// A source of on-screen video content that can be captured.
 pub trait ScreenCaptureSource {
-    /// Returns the video resolution of this source.
-    fn resolution(&self) -> Result<Size<DevicePixels>>;
+    /// Returns metadata for this source.
+    fn metadata(&self) -> Result<SourceMetadata>;
 
     /// Start capture video from this source, invoking the given callback
     /// with each frame.
@@ -308,7 +300,10 @@ pub trait ScreenCaptureSource {
 }
 
 /// A video stream captured from a screen.
-pub trait ScreenCaptureStream {}
+pub trait ScreenCaptureStream {
+    /// Returns metadata for this source.
+    fn metadata(&self) -> Result<SourceMetadata>;
+}
 
 /// A frame of video captured from a screen.
 pub struct ScreenCaptureFrame(pub PlatformScreenCaptureFrame);
@@ -316,6 +311,19 @@ pub struct ScreenCaptureFrame(pub PlatformScreenCaptureFrame);
 /// An opaque identifier for a hardware display
 #[derive(PartialEq, Eq, Hash, Copy, Clone)]
 pub struct DisplayId(pub(crate) u32);
+
+impl DisplayId {
+    /// Create a new `DisplayId` from a raw platform display identifier.
+    pub fn new(id: u32) -> Self {
+        Self(id)
+    }
+}
+
+impl From<u32> for DisplayId {
+    fn from(id: u32) -> Self {
+        Self(id)
+    }
+}
 
 impl From<DisplayId> for u32 {
     fn from(id: DisplayId) -> Self {
@@ -328,8 +336,6 @@ impl Debug for DisplayId {
         write!(f, "DisplayId({})", self.0)
     }
 }
-
-unsafe impl Send for DisplayId {}
 
 /// Which part of the window to resize
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -431,11 +437,16 @@ impl Tiling {
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
-pub(crate) struct RequestFrameOptions {
-    pub(crate) require_presentation: bool,
+#[expect(missing_docs)]
+pub struct RequestFrameOptions {
+    /// Whether a presentation is required.
+    pub require_presentation: bool,
+    /// Force refresh of all rendering states when true.
+    pub force_render: bool,
 }
 
-pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+#[expect(missing_docs)]
+pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
     fn is_maximized(&self) -> bool;
     fn window_bounds(&self) -> WindowBounds;
@@ -459,6 +470,7 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn activate(&self);
     fn is_active(&self) -> bool;
     fn is_hovered(&self) -> bool;
+    fn background_appearance(&self) -> WindowBackgroundAppearance;
     fn set_title(&mut self, title: &str);
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);
     fn minimize(&self);
@@ -478,14 +490,33 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn draw(&self, scene: &Scene);
     fn completed_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
+    fn is_subpixel_rendering_supported(&self) -> bool;
 
     // macOS specific methods
+    fn get_title(&self) -> String {
+        String::new()
+    }
+    fn tabbed_windows(&self) -> Option<Vec<SystemWindowTab>> {
+        None
+    }
+    fn tab_bar_visible(&self) -> bool {
+        false
+    }
     fn set_edited(&mut self, _edited: bool) {}
     fn show_character_palette(&self) {}
     fn titlebar_double_click(&self) {}
+    fn on_move_tab_to_new_window(&self, _callback: Box<dyn FnMut()>) {}
+    fn on_merge_all_windows(&self, _callback: Box<dyn FnMut()>) {}
+    fn on_select_previous_tab(&self, _callback: Box<dyn FnMut()>) {}
+    fn on_select_next_tab(&self, _callback: Box<dyn FnMut()>) {}
+    fn on_toggle_tab_bar(&self, _callback: Box<dyn FnMut()>) {}
+    fn merge_all_windows(&self) {}
+    fn move_tab_to_new_window(&self) {}
+    fn toggle_window_tab_overview(&self) {}
+    fn set_tabbing_identifier(&self, _identifier: Option<String>) {}
 
     #[cfg(target_os = "windows")]
-    fn get_raw_handle(&self) -> windows::HWND;
+    fn get_raw_handle(&self) -> windows::Win32::Foundation::HWND;
 
     // Linux specific methods
     fn inner_window_bounds(&self) -> WindowBounds {
@@ -508,26 +539,48 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn set_client_inset(&self, _inset: Pixels) {}
     fn gpu_specs(&self) -> Option<GpuSpecs>;
 
-    fn update_ime_position(&self, _bounds: Bounds<ScaledPixels>);
+    fn update_ime_position(&self, _bounds: Bounds<Pixels>);
 
     #[cfg(any(test, feature = "test-support"))]
     fn as_test(&mut self) -> Option<&mut TestWindow> {
         None
     }
+
+    /// Renders the given scene to a texture and returns the pixel data as an RGBA image.
+    /// This does not present the frame to screen - useful for visual testing where we want
+    /// to capture what would be rendered without displaying it or requiring the window to be visible.
+    #[cfg(any(test, feature = "test-support"))]
+    fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
+        anyhow::bail!("render_to_image not implemented for this platform")
+    }
 }
+
+/// Type alias for runnables with metadata.
+/// Previously an enum with a single variant, now simplified to a direct type alias.
+#[doc(hidden)]
+pub type RunnableVariant = Runnable<RunnableMeta>;
+
+#[doc(hidden)]
+pub type TimerResolutionGuard = gpui_util::Deferred<Box<dyn FnOnce() + Send>>;
 
 /// This type is public so that our test macro can generate and use it, but it should not
 /// be considered part of our public API.
 #[doc(hidden)]
 pub trait PlatformDispatcher: Send + Sync {
+    fn get_all_timings(&self) -> Vec<ThreadTaskTimings>;
+    fn get_current_thread_timings(&self) -> ThreadTaskTimings;
     fn is_main_thread(&self) -> bool;
-    fn dispatch(&self, runnable: Runnable, label: Option<TaskLabel>);
-    fn dispatch_on_main_thread(&self, runnable: Runnable);
-    fn dispatch_after(&self, duration: Duration, runnable: Runnable);
-    fn park(&self, timeout: Option<Duration>) -> bool;
-    fn unparker(&self) -> Unparker;
+    fn dispatch(&self, runnable: RunnableVariant, priority: Priority);
+    fn dispatch_on_main_thread(&self, runnable: RunnableVariant, priority: Priority);
+    fn dispatch_after(&self, duration: Duration, runnable: RunnableVariant);
+    fn spawn_realtime(&self, f: Box<dyn FnOnce() + Send>);
+
     fn now(&self) -> Instant {
         Instant::now()
+    }
+
+    fn increase_timer_resolution(&self) -> TimerResolutionGuard {
+        gpui_util::defer(Box::new(|| {}))
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -536,7 +589,8 @@ pub trait PlatformDispatcher: Send + Sync {
     }
 }
 
-pub(crate) trait PlatformTextSystem: Send + Sync {
+#[expect(missing_docs)]
+pub trait PlatformTextSystem: Send + Sync {
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()>;
     fn all_font_names(&self) -> Vec<String>;
     fn font_id(&self, descriptor: &Font) -> Result<FontId>;
@@ -551,10 +605,14 @@ pub(crate) trait PlatformTextSystem: Send + Sync {
         raster_bounds: Bounds<DevicePixels>,
     ) -> Result<(Size<DevicePixels>, Vec<u8>)>;
     fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout;
+    fn recommended_rendering_mode(&self, _font_id: FontId, _font_size: Pixels)
+    -> TextRenderingMode;
 }
 
-pub(crate) struct NoopTextSystem;
+#[expect(missing_docs)]
+pub struct NoopTextSystem;
 
+#[expect(missing_docs)]
 impl NoopTextSystem {
     #[allow(dead_code)]
     pub fn new() -> Self {
@@ -572,7 +630,7 @@ impl PlatformTextSystem for NoopTextSystem {
     }
 
     fn font_id(&self, _descriptor: &Font) -> Result<FontId> {
-        return Ok(FontId(1));
+        Ok(FontId(1))
     }
 
     fn font_metrics(&self, _font_id: FontId) -> FontMetrics {
@@ -653,7 +711,7 @@ impl PlatformTextSystem for NoopTextSystem {
             }
         }
         let mut runs = Vec::default();
-        if glyphs.len() > 0 {
+        if !glyphs.is_empty() {
             runs.push(ShapedRun {
                 font_id: FontId(0),
                 glyphs,
@@ -671,10 +729,55 @@ impl PlatformTextSystem for NoopTextSystem {
             len: text.len(),
         }
     }
+
+    fn recommended_rendering_mode(
+        &self,
+        _font_id: FontId,
+        _font_size: Pixels,
+    ) -> TextRenderingMode {
+        TextRenderingMode::Grayscale
+    }
+}
+
+// Adapted from https://github.com/microsoft/terminal/blob/1283c0f5b99a2961673249fa77c6b986efb5086c/src/renderer/atlas/dwrite.cpp
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+/// Compute gamma correction ratios for subpixel text rendering.
+#[allow(dead_code)]
+pub fn get_gamma_correction_ratios(gamma: f32) -> [f32; 4] {
+    const GAMMA_INCORRECT_TARGET_RATIOS: [[f32; 4]; 13] = [
+        [0.0000 / 4.0, 0.0000 / 4.0, 0.0000 / 4.0, 0.0000 / 4.0], // gamma = 1.0
+        [0.0166 / 4.0, -0.0807 / 4.0, 0.2227 / 4.0, -0.0751 / 4.0], // gamma = 1.1
+        [0.0350 / 4.0, -0.1760 / 4.0, 0.4325 / 4.0, -0.1370 / 4.0], // gamma = 1.2
+        [0.0543 / 4.0, -0.2821 / 4.0, 0.6302 / 4.0, -0.1876 / 4.0], // gamma = 1.3
+        [0.0739 / 4.0, -0.3963 / 4.0, 0.8167 / 4.0, -0.2287 / 4.0], // gamma = 1.4
+        [0.0933 / 4.0, -0.5161 / 4.0, 0.9926 / 4.0, -0.2616 / 4.0], // gamma = 1.5
+        [0.1121 / 4.0, -0.6395 / 4.0, 1.1588 / 4.0, -0.2877 / 4.0], // gamma = 1.6
+        [0.1300 / 4.0, -0.7649 / 4.0, 1.3159 / 4.0, -0.3080 / 4.0], // gamma = 1.7
+        [0.1469 / 4.0, -0.8911 / 4.0, 1.4644 / 4.0, -0.3234 / 4.0], // gamma = 1.8
+        [0.1627 / 4.0, -1.0170 / 4.0, 1.6051 / 4.0, -0.3347 / 4.0], // gamma = 1.9
+        [0.1773 / 4.0, -1.1420 / 4.0, 1.7385 / 4.0, -0.3426 / 4.0], // gamma = 2.0
+        [0.1908 / 4.0, -1.2652 / 4.0, 1.8650 / 4.0, -0.3476 / 4.0], // gamma = 2.1
+        [0.2031 / 4.0, -1.3864 / 4.0, 1.9851 / 4.0, -0.3501 / 4.0], // gamma = 2.2
+    ];
+
+    const NORM13: f32 = ((0x10000 as f64) / (255.0 * 255.0) * 4.0) as f32;
+    const NORM24: f32 = ((0x100 as f64) / (255.0) * 4.0) as f32;
+
+    let index = ((gamma * 10.0).round() as usize).clamp(10, 22) - 10;
+    let ratios = GAMMA_INCORRECT_TARGET_RATIOS[index];
+
+    [
+        ratios[0] * NORM13,
+        ratios[1] * NORM24,
+        ratios[2] * NORM13,
+        ratios[3] * NORM24,
+    ]
 }
 
 #[derive(PartialEq, Eq, Hash, Clone)]
-pub(crate) enum AtlasKey {
+#[expect(missing_docs)]
+pub enum AtlasKey {
     Glyph(RenderGlyphParams),
     Svg(RenderSvgParams),
     Image(RenderImageParams),
@@ -688,11 +791,14 @@ impl AtlasKey {
         ),
         allow(dead_code)
     )]
-    pub(crate) fn texture_kind(&self) -> AtlasTextureKind {
+    /// Returns the texture kind for this atlas key.
+    pub fn texture_kind(&self) -> AtlasTextureKind {
         match self {
             AtlasKey::Glyph(params) => {
                 if params.is_emoji {
                     AtlasTextureKind::Polychrome
+                } else if params.subpixel_rendering {
+                    AtlasTextureKind::Subpixel
                 } else {
                     AtlasTextureKind::Monochrome
                 }
@@ -721,7 +827,8 @@ impl From<RenderImageParams> for AtlasKey {
     }
 }
 
-pub(crate) trait PlatformAtlas: Send + Sync {
+#[expect(missing_docs)]
+pub trait PlatformAtlas {
     fn get_or_insert_with<'a>(
         &self,
         key: &AtlasKey,
@@ -730,9 +837,10 @@ pub(crate) trait PlatformAtlas: Send + Sync {
     fn remove(&self, key: &AtlasKey);
 }
 
-struct AtlasTextureList<T> {
-    textures: Vec<Option<T>>,
-    free_list: Vec<usize>,
+#[doc(hidden)]
+pub struct AtlasTextureList<T> {
+    pub textures: Vec<Option<T>>,
+    pub free_list: Vec<usize>,
 }
 
 impl<T> Default for AtlasTextureList<T> {
@@ -754,32 +862,40 @@ impl<T> ops::Index<usize> for AtlasTextureList<T> {
 
 impl<T> AtlasTextureList<T> {
     #[allow(unused)]
-    fn drain(&mut self) -> std::vec::Drain<'_, Option<T>> {
+    pub fn drain(&mut self) -> std::vec::Drain<'_, Option<T>> {
         self.free_list.clear();
         self.textures.drain(..)
     }
 
     #[allow(dead_code)]
-    fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut T> {
+    pub fn iter_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut T> {
         self.textures.iter_mut().flatten()
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[repr(C)]
-pub(crate) struct AtlasTile {
-    pub(crate) texture_id: AtlasTextureId,
-    pub(crate) tile_id: TileId,
-    pub(crate) padding: u32,
-    pub(crate) bounds: Bounds<DevicePixels>,
+#[expect(missing_docs)]
+pub struct AtlasTile {
+    /// The texture this tile belongs to.
+    pub texture_id: AtlasTextureId,
+    /// The unique ID of this tile within its texture.
+    pub tile_id: TileId,
+    /// Padding around the tile content in pixels.
+    pub padding: u32,
+    /// The bounds of this tile within the texture.
+    pub bounds: Bounds<DevicePixels>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(C)]
-pub(crate) struct AtlasTextureId {
+#[expect(missing_docs)]
+pub struct AtlasTextureId {
     // We use u32 instead of usize for Metal Shader Language compatibility
-    pub(crate) index: u32,
-    pub(crate) kind: AtlasTextureKind,
+    /// The index of this texture in the atlas.
+    pub index: u32,
+    /// The kind of content stored in this texture.
+    pub kind: AtlasTextureKind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -791,14 +907,17 @@ pub(crate) struct AtlasTextureId {
     ),
     allow(dead_code)
 )]
-pub(crate) enum AtlasTextureKind {
+#[expect(missing_docs)]
+pub enum AtlasTextureKind {
     Monochrome = 0,
     Polychrome = 1,
+    Subpixel = 2,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(C)]
-pub(crate) struct TileId(pub(crate) u32);
+#[expect(missing_docs)]
+pub struct TileId(pub u32);
 
 impl From<etagere::AllocId> for TileId {
     fn from(id: etagere::AllocId) -> Self {
@@ -812,11 +931,13 @@ impl From<TileId> for etagere::AllocId {
     }
 }
 
-pub(crate) struct PlatformInputHandler {
+#[expect(missing_docs)]
+pub struct PlatformInputHandler {
     cx: AsyncWindowContext,
     handler: Box<dyn InputHandler>,
 }
 
+#[expect(missing_docs)]
 #[cfg_attr(
     all(
         any(target_os = "linux", target_os = "freebsd"),
@@ -829,7 +950,7 @@ impl PlatformInputHandler {
         Self { cx, handler }
     }
 
-    fn selected_text_range(&mut self, ignore_disabled_input: bool) -> Option<UTF16Selection> {
+    pub fn selected_text_range(&mut self, ignore_disabled_input: bool) -> Option<UTF16Selection> {
         self.cx
             .update(|window, cx| {
                 self.handler
@@ -840,7 +961,7 @@ impl PlatformInputHandler {
     }
 
     #[cfg_attr(target_os = "windows", allow(dead_code))]
-    fn marked_text_range(&mut self) -> Option<Range<usize>> {
+    pub fn marked_text_range(&mut self) -> Option<Range<usize>> {
         self.cx
             .update(|window, cx| self.handler.marked_text_range(window, cx))
             .ok()
@@ -851,7 +972,7 @@ impl PlatformInputHandler {
         any(target_os = "linux", target_os = "freebsd", target_os = "windows"),
         allow(dead_code)
     )]
-    fn text_for_range(
+    pub fn text_for_range(
         &mut self,
         range_utf16: Range<usize>,
         adjusted: &mut Option<Range<usize>>,
@@ -865,7 +986,7 @@ impl PlatformInputHandler {
             .flatten()
     }
 
-    fn replace_text_in_range(&mut self, replacement_range: Option<Range<usize>>, text: &str) {
+    pub fn replace_text_in_range(&mut self, replacement_range: Option<Range<usize>>, text: &str) {
         self.cx
             .update(|window, cx| {
                 self.handler
@@ -894,13 +1015,13 @@ impl PlatformInputHandler {
     }
 
     #[cfg_attr(target_os = "windows", allow(dead_code))]
-    fn unmark_text(&mut self) {
+    pub fn unmark_text(&mut self) {
         self.cx
             .update(|window, cx| self.handler.unmark_text(window, cx))
             .ok();
     }
 
-    fn bounds_for_range(&mut self, range_utf16: Range<usize>) -> Option<Bounds<Pixels>> {
+    pub fn bounds_for_range(&mut self, range_utf16: Range<usize>) -> Option<Bounds<Pixels>> {
         self.cx
             .update(|window, cx| self.handler.bounds_for_range(range_utf16, window, cx))
             .ok()
@@ -908,11 +1029,11 @@ impl PlatformInputHandler {
     }
 
     #[allow(dead_code)]
-    fn apple_press_and_hold_enabled(&mut self) -> bool {
+    pub fn apple_press_and_hold_enabled(&mut self) -> bool {
         self.handler.apple_press_and_hold_enabled()
     }
 
-    pub(crate) fn dispatch_input(&mut self, input: &str, window: &mut Window, cx: &mut App) {
+    pub fn dispatch_input(&mut self, input: &str, window: &mut Window, cx: &mut App) {
         self.handler.replace_text_in_range(None, input, window, cx);
     }
 
@@ -935,6 +1056,18 @@ impl PlatformInputHandler {
             .update(|window, cx| self.handler.character_index_for_point(point, window, cx))
             .ok()
             .flatten()
+    }
+
+    #[allow(dead_code)]
+    pub fn accepts_text_input(&mut self, window: &mut Window, cx: &mut App) -> bool {
+        self.handler.accepts_text_input(window, cx)
+    }
+
+    #[allow(dead_code)]
+    pub fn query_accepts_text_input(&mut self) -> bool {
+        self.cx
+            .update(|window, cx| self.handler.accepts_text_input(window, cx))
+            .unwrap_or(true)
     }
 }
 
@@ -1044,6 +1177,11 @@ pub trait InputHandler: 'static {
     fn apple_press_and_hold_enabled(&mut self) -> bool {
         true
     }
+
+    /// Returns whether this handler is accepting text input to be inserted.
+    fn accepts_text_input(&mut self, _window: &mut Window, _cx: &mut App) -> bool {
+        true
+    }
 }
 
 /// The variables that can be configured when creating a new window
@@ -1069,6 +1207,12 @@ pub struct WindowOptions {
     /// Whether the window should be movable by the user
     pub is_movable: bool,
 
+    /// Whether the window should be resizable by the user
+    pub is_resizable: bool,
+
+    /// Whether the window should be minimized by the user
+    pub is_minimizable: bool,
+
     /// The display to create the window on, if this is None,
     /// the window will be created on the main display
     pub display_id: Option<DisplayId>,
@@ -1085,6 +1229,9 @@ pub struct WindowOptions {
     /// Whether to use client or server side decorations. Wayland only
     /// Note that this may be ignored.
     pub window_decorations: Option<WindowDecorations>,
+
+    /// Tab group name, allows opening the window as a native tab on macOS 10.12+. Windows with the same tabbing identifier will be grouped together.
+    pub tabbing_identifier: Option<String>,
 }
 
 /// The variables that can be configured when creating a new window
@@ -1096,7 +1243,8 @@ pub struct WindowOptions {
     ),
     allow(dead_code)
 )]
-pub(crate) struct WindowParams {
+#[allow(missing_docs)]
+pub struct WindowParams {
     pub bounds: Bounds<Pixels>,
 
     /// The titlebar configuration of the window
@@ -1111,6 +1259,14 @@ pub(crate) struct WindowParams {
     #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
     pub is_movable: bool,
 
+    /// Whether the window should be resizable by the user
+    #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
+    pub is_resizable: bool,
+
+    /// Whether the window should be minimized by the user
+    #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
+    pub is_minimizable: bool,
+
     #[cfg_attr(
         any(target_os = "linux", target_os = "freebsd", target_os = "windows"),
         allow(dead_code)
@@ -1124,6 +1280,8 @@ pub(crate) struct WindowParams {
     pub display_id: Option<DisplayId>,
 
     pub window_min_size: Option<Size<Pixels>>,
+    #[cfg(target_os = "macos")]
+    pub tabbing_identifier: Option<String>,
 }
 
 /// Represents the status of how a window should be opened.
@@ -1154,6 +1312,11 @@ impl WindowBounds {
             WindowBounds::Fullscreen(bounds) => *bounds,
         }
     }
+
+    /// Creates a new window bounds that centers the window on the screen.
+    pub fn centered(size: Size<Pixels>, cx: &App) -> Self {
+        WindowBounds::Windowed(Bounds::centered(None, size, cx))
+    }
 }
 
 impl Default for WindowOptions {
@@ -1169,11 +1332,14 @@ impl Default for WindowOptions {
             show: true,
             kind: WindowKind::Normal,
             is_movable: true,
+            is_resizable: true,
+            is_minimizable: true,
             display_id: None,
             window_background: WindowBackgroundAppearance::default(),
             app_id: None,
             window_min_size: None,
             window_decorations: None,
+            tabbing_identifier: None,
         }
     }
 }
@@ -1193,7 +1359,7 @@ pub struct TitlebarOptions {
 }
 
 /// The kind of window to create
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WindowKind {
     /// A normal application window
     Normal,
@@ -1201,17 +1367,30 @@ pub enum WindowKind {
     /// A window that appears above all other windows, usually used for alerts or popups
     /// use sparingly!
     PopUp,
+
+    /// A floating window that appears on top of its parent window
+    Floating,
+
+    /// A Wayland LayerShell window, used to draw overlays or backgrounds for applications such as
+    /// docks, notifications or wallpapers.
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    LayerShell(layer_shell::LayerShellOptions),
+
+    /// A window that appears on top of its parent window and blocks interaction with it
+    /// until the modal window is closed
+    Dialog,
 }
 
 /// The appearance of the window, as defined by the operating system.
 ///
 /// On macOS, this corresponds to named [`NSAppearance`](https://developer.apple.com/documentation/appkit/nsappearance)
 /// values.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum WindowAppearance {
     /// A light appearance.
     ///
     /// On macOS, this corresponds to the `aqua` appearance.
+    #[default]
     Light,
 
     /// A light appearance with vibrant colors.
@@ -1228,12 +1407,6 @@ pub enum WindowAppearance {
     ///
     /// On macOS, this corresponds to the `NSAppearanceNameVibrantDark` appearance.
     VibrantDark,
-}
-
-impl Default for WindowAppearance {
-    fn default() -> Self {
-        Self::Light
-    }
 }
 
 /// The appearance of the background of the window itself, when there is
@@ -1255,10 +1428,26 @@ pub enum WindowBackgroundAppearance {
     ///
     /// Not always supported.
     Blurred,
+    /// The Mica backdrop material, supported on Windows 11.
+    MicaBackdrop,
+    /// The Mica Alt backdrop material, supported on Windows 11.
+    MicaAltBackdrop,
+}
+
+/// The text rendering mode to use for drawing glyphs.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum TextRenderingMode {
+    /// Use the platform's default text rendering mode.
+    #[default]
+    PlatformDefault,
+    /// Use subpixel (ClearType-style) text rendering.
+    Subpixel,
+    /// Use grayscale text rendering.
+    Grayscale,
 }
 
 /// The options that can be configured for a file dialog prompt
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct PathPromptOptions {
     /// Should the prompt allow files to be selected?
     pub files: bool,
@@ -1266,6 +1455,8 @@ pub struct PathPromptOptions {
     pub directories: bool,
     /// Should the prompt allow multiple files to be selected?
     pub multiple: bool,
+    /// The prompt to show to a user when selecting a path
+    pub prompt: Option<SharedString>,
 }
 
 /// What kind of prompt styling to show
@@ -1308,8 +1499,9 @@ impl PromptButton {
         PromptButton::Cancel(label.into())
     }
 
+    /// Returns true if this button is a cancel button.
     #[allow(dead_code)]
-    pub(crate) fn is_cancel(&self) -> bool {
+    pub fn is_cancel(&self) -> bool {
         matches!(self, PromptButton::Cancel(_))
     }
 
@@ -1334,9 +1526,10 @@ impl From<&str> for PromptButton {
 }
 
 /// The style of the cursor (pointer)
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum CursorStyle {
     /// The default cursor
+    #[default]
     Arrow,
 
     /// A text input cursor
@@ -1423,16 +1616,11 @@ pub enum CursorStyle {
     None,
 }
 
-impl Default for CursorStyle {
-    fn default() -> Self {
-        Self::Arrow
-    }
-}
-
 /// A clipboard item that should be copied to the clipboard
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClipboardItem {
-    entries: Vec<ClipboardEntry>,
+    /// The entries in this clipboard item.
+    pub entries: Vec<ClipboardEntry>,
 }
 
 /// Either a ClipboardString or a ClipboardImage
@@ -1442,6 +1630,8 @@ pub enum ClipboardEntry {
     String(ClipboardString),
     /// An image entry
     Image(Image),
+    /// A file entry
+    ExternalPaths(crate::ExternalPaths),
 }
 
 impl ClipboardItem {
@@ -1482,16 +1672,29 @@ impl ClipboardItem {
     /// Returns None if there were no ClipboardString entries.
     pub fn text(&self) -> Option<String> {
         let mut answer = String::new();
-        let mut any_entries = false;
 
         for entry in self.entries.iter() {
             if let ClipboardEntry::String(ClipboardString { text, metadata: _ }) = entry {
-                answer.push_str(&text);
-                any_entries = true;
+                answer.push_str(text);
             }
         }
 
-        if any_entries { Some(answer) } else { None }
+        if answer.is_empty() {
+            for entry in self.entries.iter() {
+                if let ClipboardEntry::ExternalPaths(paths) = entry {
+                    for path in &paths.0 {
+                        use std::fmt::Write as _;
+                        _ = write!(answer, "{}", path.display());
+                    }
+                }
+            }
+        }
+
+        if !answer.is_empty() {
+            Some(answer)
+        } else {
+            None
+        }
     }
 
     /// If this item is one ClipboardEntry::String, returns its metadata.
@@ -1574,6 +1777,8 @@ pub enum ImageFormat {
     Bmp,
     /// .tif or .tiff
     Tiff,
+    /// .ico
+    Ico,
 }
 
 impl ImageFormat {
@@ -1587,6 +1792,7 @@ impl ImageFormat {
             ImageFormat::Svg => "image/svg+xml",
             ImageFormat::Bmp => "image/bmp",
             ImageFormat::Tiff => "image/tiff",
+            ImageFormat::Ico => "image/ico",
         }
     }
 
@@ -1600,6 +1806,7 @@ impl ImageFormat {
             "image/svg+xml" => Some(Self::Svg),
             "image/bmp" => Some(Self::Bmp),
             "image/tiff" | "image/tif" => Some(Self::Tiff),
+            "image/ico" => Some(Self::Ico),
             _ => None,
         }
     }
@@ -1613,7 +1820,7 @@ pub struct Image {
     /// The raw image bytes
     pub bytes: Vec<u8>,
     /// The unique ID for the image
-    id: u64,
+    pub id: u64,
 }
 
 impl Hash for Image {
@@ -1706,14 +1913,11 @@ impl Image {
             ImageFormat::Webp => frames_for_image(&self.bytes, image::ImageFormat::WebP)?,
             ImageFormat::Bmp => frames_for_image(&self.bytes, image::ImageFormat::Bmp)?,
             ImageFormat::Tiff => frames_for_image(&self.bytes, image::ImageFormat::Tiff)?,
+            ImageFormat::Ico => frames_for_image(&self.bytes, image::ImageFormat::Ico)?,
             ImageFormat::Svg => {
-                let pixmap = svg_renderer.render_pixmap(&self.bytes, SvgSize::ScaleFactor(1.0))?;
-
-                let buffer =
-                    image::ImageBuffer::from_raw(pixmap.width(), pixmap.height(), pixmap.take())
-                        .unwrap();
-
-                SmallVec::from_elem(Frame::new(buffer), 1)
+                return svg_renderer
+                    .render_single_frame(&self.bytes, 1.0, false)
+                    .map_err(Into::into);
             }
         };
 
@@ -1734,8 +1938,10 @@ impl Image {
 /// A clipboard item that should be copied to the clipboard
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClipboardString {
-    pub(crate) text: String,
-    pub(crate) metadata: Option<String>,
+    /// The text content.
+    pub text: String,
+    /// Optional metadata associated with this clipboard string.
+    pub metadata: Option<String>,
 }
 
 impl ClipboardString {
@@ -1775,7 +1981,8 @@ impl ClipboardString {
     }
 
     #[cfg_attr(any(target_os = "linux", target_os = "freebsd"), allow(dead_code))]
-    pub(crate) fn text_hash(text: &str) -> u64 {
+    /// Compute a hash of the given text for clipboard change detection.
+    pub fn text_hash(text: &str) -> u64 {
         let mut hasher = SeaHasher::new();
         text.hash(&mut hasher);
         hasher.finish()

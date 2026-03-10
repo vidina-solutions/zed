@@ -5,10 +5,12 @@ use gpui::{AppContext, Context, Entity, Task};
 use language::Buffer;
 use project::{TaskSourceKind, WorktreeId};
 use remote::ConnectionState;
-use task::{DebugScenario, ResolvedTask, SpawnInTerminal, TaskContext, TaskTemplate};
+use task::{
+    DebugScenario, ResolvedTask, SharedTaskContext, SpawnInTerminal, TaskContext, TaskTemplate,
+};
 use ui::Window;
 
-use crate::Workspace;
+use crate::{Toast, Workspace, notifications::NotificationId};
 
 impl Workspace {
     pub fn schedule_task(
@@ -20,7 +22,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self.project.read(cx).ssh_connection_state(cx) {
+        match self.project.read(cx).remote_connection_state(cx) {
             None | Some(ConnectionState::Connected) => {}
             Some(
                 ConnectionState::Connecting
@@ -73,8 +75,10 @@ impl Workspace {
 
         if let Some(terminal_provider) = self.terminal_provider.as_ref() {
             let task_status = terminal_provider.spawn(spawn_in_terminal, window, cx);
-            cx.background_spawn(async move {
-                match task_status.await {
+
+            let task = cx.spawn(async |w, cx| {
+                let res = cx.background_spawn(task_status).await;
+                match res {
                     Some(Ok(status)) => {
                         if status.success() {
                             log::debug!("Task spawn succeeded");
@@ -82,18 +86,24 @@ impl Workspace {
                             log::debug!("Task spawn failed, code: {:?}", status.code());
                         }
                     }
-                    Some(Err(e)) => log::error!("Task spawn failed: {e}"),
+                    Some(Err(e)) => {
+                        log::error!("Task spawn failed: {e:#}");
+                        _ = w.update(cx, |w, cx| {
+                            let id = NotificationId::unique::<ResolvedTask>();
+                            w.show_toast(Toast::new(id, format!("Task spawn failed: {e}")), cx);
+                        })
+                    }
                     None => log::debug!("Task spawn got cancelled"),
-                }
-            })
-            .detach();
+                };
+            });
+            self.scheduled_tasks.push(task);
         }
     }
 
     pub fn start_debug_session(
         &mut self,
         scenario: DebugScenario,
-        task_context: TaskContext,
+        task_context: SharedTaskContext,
         active_buffer: Option<Entity<Buffer>>,
         worktree_id: Option<WorktreeId>,
         window: &mut Window,
